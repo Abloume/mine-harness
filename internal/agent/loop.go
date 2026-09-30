@@ -143,6 +143,7 @@ type Agent struct {
 	tokenBudget int
 	verbose     bool // 打印每步，对应 harness 的 trace / 可观测概念
 	summarizer  Summarizer
+	approver    Approver // 审批决策器（nil = 未启用，fail-closed 见 Run）
 
 	guard *LoopGuard
 
@@ -170,6 +171,10 @@ func WithLoopGuard(g *LoopGuard) Option { return func(a *Agent) { a.guard = g } 
 // WithSummarizer 替换默认摘要压缩器（如换成调 LLM 的生成式摘要）。
 func WithSummarizer(s Summarizer) Option { return func(a *Agent) { a.summarizer = s } }
 
+// WithApprover 设置审批决策器（human-in-the-loop）。
+// 不传 = 未启用审批检查；工具若标记 RequiresApproval 会被默认拒绝（fail-closed）。
+func WithApprover(ap Approver) Option { return func(a *Agent) { a.approver = ap } }
+
 // NewAgent 构造一个 Agent，默认 maxSteps=10、budget=4096、verbose=false。
 func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 	a := &Agent{
@@ -190,7 +195,9 @@ func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 //
 // 这就是"agent loop"的核心，对应真实 harness 的一轮循环：
 //
-//	调模型 → 解析工具调用 → 循环检测 → 执行工具 → 回填结果 → 再调模型（直到结束）
+//	调模型 → 解析工具调用 → 循环检测 → 审批点 → 执行工具 → 回填结果 → 再调模型（直到结束）
+//
+// 审批点在循环检测之后、工具执行之前：先防"重复空转"，再防"越权动作"。
 func (a *Agent) Run(task string) RunResult {
 	a.history = append(a.history,
 		Message{Role: roleSystem, Content: "You are a helpful agent. 可以调用工具完成任务，拿到结果后给出最终回答。"},
@@ -237,6 +244,29 @@ func (a *Agent) Run(task string) RunResult {
 
 			if a.verbose {
 				log.Printf("[step %d] tool_call → %s(%s)", step, tc.Name, tc.Input)
+			}
+
+			// 2a-1.5 审批点（human-in-the-loop）：高风险工具先过闸门，再执行。
+			// 默认 fail-closed：工具标记 RequiresApproval 但没有 approver
+			// （或决策器拒绝）→ 不执行工具。
+			if a.registry.NeedsApproval(tc.Name) {
+				approved := a.approver != nil && a.approver.Approve(tc.Name, tc.Input)
+				if !approved {
+					if a.verbose {
+						log.Printf("[step %d] ⛔ 审批拒绝：%s(%s) 未执行", step, tc.Name, tc.Input)
+					}
+					// 拒绝结果以 tool 角色回填给模型（不是终止）：
+					// 模型看到"未授权"可以换路径、改参数或直接回答。
+					// 若模型反复请求同一动作，上方的循环检测会先警告再中止兜底。
+					a.history = append(a.history, Message{
+						Role:    roleTool,
+						Content: fmt.Sprintf("调用被拒绝：%s(%s)。用户未授权此操作，请改用其他方式完成目标，或直接给出当前可完成的部分。", tc.Name, tc.Input),
+					})
+					continue
+				}
+				if a.verbose {
+					log.Printf("[step %d] ✅ 审批通过：%s(%s)", step, tc.Name, tc.Input)
+				}
 			}
 
 			// 2a-2. 执行工具；失败不崩掉 loop，回填错误让模型自己决定，

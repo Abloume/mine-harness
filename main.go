@@ -1,5 +1,5 @@
-// mine-harness 入口：四个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩"。
-// 用法：go run . -demo normal | loop | soft | compact
+// mine-harness 入口：五个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点"。
+// 用法：go run . -demo normal | loop | soft | compact | approval
 package main
 
 import (
@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -22,6 +22,8 @@ func main() {
 		runDemoSoftStop(*verbose)
 	case "compact":
 		runDemoCompact(*verbose)
+	case "approval":
+		runDemoApproval(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -132,6 +134,46 @@ func runDemoCompact(verbose bool) {
 	// 预算 200：远小于历史增长速度，必然触发摘要压缩
 	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(8), agent.WithTokenBudget(200), agent.WithVerbose(verbose))
 	showResult(a.Run("分别查北京、上海、杭州、广州的天气并汇总"))
+}
+
+// runDemoApproval 演示审批点（human-in-the-loop）：
+// mock 模型先请求高风险工具 delete_file → 被策略拒绝 → 看到"未授权"回填后
+// 改走安全路径 get_weather → 完成。
+// 真实交互场景应换 agent.NewCLIApprover()（会阻塞读 stdin 等人工 y/n）；
+// 这里用脚本化决策器，方便自动化演示与测试。
+func runDemoApproval(verbose bool) {
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "get_weather",
+		Description: "查询指定城市的当前天气",
+		Execute: func(input string) (string, error) {
+			return `{"city":"北京","weather":"晴","temp":24}`, nil
+		},
+	})
+	reg.Register(agent.Tool{
+		Name:             "delete_file",
+		Description:      "删除指定文件（高风险操作，需审批）",
+		RequiresApproval: true,
+		Execute: func(input string) (string, error) {
+			return "file deleted", nil
+		},
+	})
+
+	// 脚本化决策器：delete_file 一律拒绝，其余放行。
+	// （真实场景换成 agent.NewCLIApprover() 手动 y/n。）
+	approver := agent.ApproverFunc(func(name, args string) bool {
+		return name != "delete_file"
+	})
+
+	// 模型脚本：先尝试高风险动作 → 被拒 → 学乖走安全路径 → 完成
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "delete_file", ToolInput: "/tmp/report.txt"},
+		{ToolName: "get_weather", ToolInput: `{"city":"北京"}`},
+		{Content: "北京今天晴，24 度。未执行删除操作（用户未授权）。"},
+	})
+
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(5), agent.WithApprover(approver), agent.WithVerbose(verbose))
+	showResult(a.Run("先删除 /tmp/report.txt，再查北京天气"))
 }
 
 // showResult 统一打印 RunResult（completed / aborted 都按"结果"展示，不当作异常）。

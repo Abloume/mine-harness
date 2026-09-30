@@ -3,10 +3,15 @@ package agent
 import "fmt"
 
 // Tool 描述一个可被模型调用的工具。
+//
+// RequiresApproval 标记高风险工具（删文件、发消息、花钱）：调用前必须过审批闸门
+// （human-in-the-loop）。这是"工具白名单"之外的又一层护栏——白名单决定"能不能
+// 调用"，审批点决定"这次调用要不要人点头"。
 type Tool struct {
-	Name        string
-	Description string
-	Execute     func(input string) (string, error) // 简化：JSON 字符串进、字符串出
+	Name             string
+	Description      string
+	RequiresApproval bool                               // 高风险工具：调用前需人工/策略确认
+	Execute          func(input string) (string, error) // 简化：JSON 字符串进、字符串出
 }
 
 // Registry 是工具注册表：模型只能调用已注册的工具——这本身就是一层护栏
@@ -36,6 +41,13 @@ func (r *Registry) List() []Tool {
 		out = append(out, t)
 	}
 	return out
+}
+
+// NeedsApproval 判断某工具是否标记为高风险（调用前需审批）。
+// 未注册的工具返回 false（反正会被 Call 护栏拦住）。
+func (r *Registry) NeedsApproval(name string) bool {
+	t, ok := r.tools[name]
+	return ok && t.RequiresApproval
 }
 
 // Call 执行指定工具并返回结果。
