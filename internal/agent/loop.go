@@ -142,6 +142,7 @@ type Agent struct {
 	maxSteps    int
 	tokenBudget int
 	verbose     bool // 打印每步，对应 harness 的 trace / 可观测概念
+	summarizer  Summarizer
 
 	guard *LoopGuard
 
@@ -166,6 +167,9 @@ func WithVerbose(on bool) Option { return func(a *Agent) { a.verbose = on } }
 // WithLoopGuard 替换默认循环护栏（自定义阈值用）。
 func WithLoopGuard(g *LoopGuard) Option { return func(a *Agent) { a.guard = g } }
 
+// WithSummarizer 替换默认摘要压缩器（如换成调 LLM 的生成式摘要）。
+func WithSummarizer(s Summarizer) Option { return func(a *Agent) { a.summarizer = s } }
+
 // NewAgent 构造一个 Agent，默认 maxSteps=10、budget=4096、verbose=false。
 func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 	a := &Agent{
@@ -174,6 +178,7 @@ func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 		maxSteps:    10,
 		tokenBudget: 4096,
 		guard:       NewLoopGuard(),
+		summarizer:  NewHeuristicSummarizer(),
 	}
 	for _, o := range opts {
 		o(a)
@@ -193,8 +198,13 @@ func (a *Agent) Run(task string) RunResult {
 	)
 
 	for step := 1; step <= a.maxSteps; step++ {
-		// 0. 上下文预算检查：超预算先截断最旧消息（context.go 的 FIFO 截断）
-		a.history = TrimContext(a.history, a.tokenBudget)
+		// 0. 上下文预算检查：超预算先做摘要压缩（context.go 的 CompactContext），
+		//    压缩不了才走 FIFO 兜底——对齐真实 harness 的 context compaction
+		var compacted bool
+		a.history, compacted = CompactContext(a.history, a.tokenBudget, a.summarizer)
+		if compacted && a.verbose {
+			log.Printf("[step %d] 上下文压缩：旧消息已压缩为摘要，当前 token=%d", step, MessagesTokens(a.history))
+		}
 
 		// 1. 调模型（把工具清单一起给它，对应 function calling 的 tools 参数）
 		resp, err := a.llm.Chat(a.history, a.registry.List())

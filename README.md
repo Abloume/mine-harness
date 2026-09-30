@@ -20,7 +20,7 @@
 
 - [x] agent loop（ReAct 风格主循环）— `internal/agent/loop.go`
 - [x] 工具注册与调用（function calling / 本地工具）— `internal/agent/tools.go`
-- [x] 上下文管理（token 预算、FIFO 截断）— `internal/agent/context.go`（摘要压缩待升级）
+- [x] 上下文管理（token 预算 + 摘要压缩 + FIFO 兜底）— `internal/agent/context.go`（摘要器可替换为生成式 LLM 摘要）
 - [x] 循环检测 + 软停止（精确重复 N=2、滑动窗口 8 步、失败重试预算 3、分级响应）— `internal/agent/loop.go`
 - [ ] 审批点（人工确认/自动放行）
 - [ ] 评测门（任务成功率、结构化判断）

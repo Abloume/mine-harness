@@ -1,5 +1,5 @@
-// mine-harness 入口：三个演示场景，覆盖"正常链路 / 循环检测 / 软停止"。
-// 用法：go run . -demo normal | loop | soft
+// mine-harness 入口：四个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩"。
+// 用法：go run . -demo normal | loop | soft | compact
 package main
 
 import (
@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -20,6 +20,8 @@ func main() {
 		runDemoLoop(*verbose)
 	case "soft":
 		runDemoSoftStop(*verbose)
+	case "compact":
+		runDemoCompact(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -96,6 +98,40 @@ func runDemoSoftStop(verbose bool) {
 
 	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(2), agent.WithVerbose(verbose))
 	showResult(a.Run("帮我查上海和杭州的天气并总结"))
+}
+
+// runDemoCompact 演示摘要压缩：多次工具调用产生长历史 + 很小的 token 预算。
+// 期望：历史超预算后，最旧的工具结果被压缩成摘要放回（不是裸丢），任务仍能完成。
+func runDemoCompact(verbose bool) {
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "get_weather",
+		Description: "查询指定城市的当前天气（返回详细预报）",
+		Execute: func(input string) (string, error) {
+			// mock：返回较长文本，模拟真实工具的大结果撑爆上下文
+			city := "未知"
+			for _, c := range []string{"北京", "上海", "杭州", "广州"} {
+				if strings.Contains(input, c) {
+					city = c
+					break
+				}
+			}
+			return fmt.Sprintf(`{"city":"%s","weather":"晴转多云","temp":22,"wind":"3级东南风","humidity":45,"summary":"%s今天白天晴转多云，午后体感舒适，适合户外活动，夜间最低温18度，注意添衣。"}`, city, city), nil
+		},
+	})
+
+	// 连续查询 4 个城市（参数在变，不会误触发循环检测），历史快速膨胀
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "get_weather", ToolInput: `{"city":"北京"}`},
+		{ToolName: "get_weather", ToolInput: `{"city":"上海"}`},
+		{ToolName: "get_weather", ToolInput: `{"city":"杭州"}`},
+		{ToolName: "get_weather", ToolInput: `{"city":"广州"}`},
+		{Content: "四城天气已汇总：北京晴、上海多云、杭州有雨、广州晴热。"},
+	})
+
+	// 预算 200：远小于历史增长速度，必然触发摘要压缩
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(8), agent.WithTokenBudget(200), agent.WithVerbose(verbose))
+	showResult(a.Run("分别查北京、上海、杭州、广州的天气并汇总"))
 }
 
 // showResult 统一打印 RunResult（completed / aborted 都按"结果"展示，不当作异常）。
