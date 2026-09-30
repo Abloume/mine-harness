@@ -277,7 +277,7 @@ func (a *Agent) Run(task string) RunResult {
 				if !approved {
 					a.denials++
 					if a.verbose {
-						log.Printf("[step %d] ⛔ 审批拒绝（连续 %d 次）：%s(%s)", step, a.denials, tc.Name, tc.Input)
+						log.Printf("[step %d] ⛔ 审批拒绝（风险 %s，连续 %d 次）：%s(%s)", step, risk, a.denials, tc.Name, tc.Input)
 					}
 					// 升级兜底：连续被拒说明模型在反复越权，停止并交还用户
 					// （对应 Claude Code auto mode 的"3 次连续拒绝 → 升级给人"）。

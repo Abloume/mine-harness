@@ -74,7 +74,11 @@ func (f FuncRiskEvaluator) Evaluate(toolName, args string, base RiskLevel) RiskL
 //   - **模型判断只能上调风险，不能下调**：上调 = 把规则没标出来的"灰色地带"
 //     动作挑出来送审；下调 = 禁止——低风险自动放行仍由规则（审批阈值）决定。
 //     这是防"自利偏差"（模型判断自己的动作危不危险会系统性低估）的手段；
-//   - 模型调用失败或返回无法解析 → 退回基础风险（保守兜底，fail-closed 方向）。
+//   - **解析失败不静默放行**：模型调用失败或返回无法解析 → 保守升级到
+//     maxRisk(基础风险, RiskMedium)。原因是真实踩坑：混合思考模型（如
+//     glm-4.7-flash）在 max_tokens 太小时 reasoning 吃掉全部预算，content
+//     为空 → parseRisk 失败；如果此时退回基础风险（常是 LOW），删除这类
+//     高风险动作会被静默放行——宁多审、勿漏审（不对称风险论）。
 //
 // 注意：风险评估用**独立的 LLM 实例**，不占用主 agent 的模型调用预算——
 // 生产里这一步通常是专用小模型/分类器（便宜、快、确定性）。
@@ -102,12 +106,12 @@ func (e *LLMRiskEvaluator) Evaluate(toolName, args string, base RiskLevel) RiskL
 		},
 	}, nil)
 	if err != nil {
-		return base // 模型不可用：退回基础风险（保守兜底）
+		return maxRisk(base, RiskMedium) // 模型不可用：保守升级，宁可送审不可漏审
 	}
 	if lv, ok := parseRisk(resp.Content); ok {
 		return maxRisk(base, lv) // 只升不降
 	}
-	return base // 返回无法解析：同样退回基础风险
+	return maxRisk(base, RiskMedium) // 解析失败（如 content 为空）：同样保守升级
 }
 
 // parseRisk 把模型返回的文本解析成 RiskLevel。无法识别返回 ok=false，

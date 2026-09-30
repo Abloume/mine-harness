@@ -28,15 +28,24 @@
 
 ## 当前进度（2026-09-30）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real` 六个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 审批点 / 真实模型」，其中前五个用 `MockLLM`
-（脚本化假模型）不依赖 API Key，`real` 走真实智谱 GLM（OpenAI 兼容，需 `ZHIPU_API_KEY`）。
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval` 七个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批」，
+前五个用 `MockLLM`（脚本化假模型）不依赖 API Key，后两个走真实智谱 GLM
+（OpenAI 兼容，需 `ZHIPU_API_KEY`，写入项目根 `.env`，已被 `.gitignore` 排除）。
 撞上限与循环命中均为"软停止"（返回带原因的 RunResult），
 不是 error——对齐生产 Agent 的"交还用户"语义。审批点采用风险分级：工具声明基础风险
 （`BaseRisk` L0-L3），风险由 `RiskEvaluator` 判定——静态/函数（参数感知）/模型
-（`LLMRiskEvaluator` 用独立 LLM 判断，只升不降 + 失败退回基础风险）；低于审批阈值
-自动放行、达到阈值进闸门；未配置 approver 时默认拒绝（fail-closed）；连续拒绝达上限
-升级中止（对应 Claude Code 的 3 连拒升级）。
+（`LLMRiskEvaluator` 用独立 LLM 判断，只升不降）；低于审批阈值自动放行、达到阈值
+进闸门；未配置 approver 时默认拒绝（fail-closed）；连续拒绝达上限升级中止。
+
+**真实接入踩坑记录（重要）**：
+- `glm-4.7-flash` 是混合思考模型：reasoning 会先吃掉输出预算，`max_tokens` 太小导致
+  `content` 为空——风险判断这类"只输出级别名"的任务会解析失败，**静默退回基础风险
+  造成高风险动作漏审**。修复两层：① 风险判断 Provider 给足 `MaxTokens`（2048）；
+  ② `LLMRiskEvaluator` 解析失败不再退回基础风险，改为保守升级
+  `maxRisk(base, MEDIUM)`（宁多送审、勿漏审——不对称风险论）。
+- 真实模型判断存在输出方差：同一请求在不同运行可能给出不同级别，生产应换
+  专用小模型/分类器 + 确定性输出约束（JSON mode / 低温度 / 多次采样）。
 
 token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 token，含局限说明见
 `internal/agent/context.go` 注释），单元测试见 `internal/agent/context_test.go`、

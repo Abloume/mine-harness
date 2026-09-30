@@ -1,5 +1,5 @@
-// mine-harness 入口：六个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real
+// mine-harness 入口：七个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval
 package main
 
 import (
@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -27,6 +27,8 @@ func main() {
 		runDemoApproval(*verbose)
 	case "real":
 		runDemoReal(*verbose)
+	case "real-approval":
+		runDemoRealApproval(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -236,6 +238,49 @@ func runDemoApproval(verbose bool) {
 		agent.WithApprover(approver),
 		agent.WithVerbose(verbose))
 	showResult(a.Run("先删除 /tmp/report.txt，再读它"))
+}
+
+// runDemoRealApproval 演示真实链路的"模型自动判断是否要审批"：
+// 主模型和风险判断模型都是真实 GLM——每个工具调用前，风险模型先判断风险级别
+// （参数感知：delete → HIGH / read → LOW），达到审批阈值进闸门（这里一律拒绝，
+// 演示 fail-closed + 拒绝回填）。这就是"规则优先、模型辅助"的完整落地。
+func runDemoRealApproval(verbose bool) {
+	loadEnv(".env")
+	key := os.Getenv("ZHIPU_API_KEY")
+	if key == "" {
+		fmt.Println("缺少 ZHIPU_API_KEY：export ZHIPU_API_KEY=xxx 或写入项目根 .env")
+		return
+	}
+
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "file_op",
+		Description: "文件操作。参数是 JSON：{\"action\":\"read|delete\",\"file\":\"路径\"}",
+		BaseRisk:    agent.RiskLow, // 基础级别低；高风险由风险模型动态上调
+		Execute: func(input string) (string, error) {
+			if strings.Contains(input, "delete") {
+				return "file deleted", nil
+			}
+			return "file content: hello mini-harness", nil
+		},
+	})
+
+	base := "https://open.bigmodel.cn/api/paas/v4"
+	model := "glm-4.7-flash"
+	// 主模型：完成任务的 agent 循环
+	mainLLM := agent.NewOpenAICompatibleProvider(base, model, key)
+	// 风险模型：独立实例，只做风险判断（生产里应换专用小模型/分类器更省）。
+	// MaxTokens 给足：glm-4.7-flash 是混合思考模型，reasoning 会先吃掉预算，
+	// 预算不足时 content 为空、parseRisk 失败——宁给足预算也不冒静默漏审的险。
+	riskLLM := agent.NewOpenAICompatibleProvider(base, model, key)
+	riskLLM.MaxTokens = 2048
+
+	a := agent.NewAgent(mainLLM, reg,
+		agent.WithMaxSteps(6),
+		agent.WithRiskEvaluator(agent.NewLLMRiskEvaluator(riskLLM)),
+		agent.WithApprover(agent.DenyApprover{}), // 演示：进闸门的一律拒绝
+		agent.WithVerbose(verbose))
+	showResult(a.Run("请对文件 /tmp/report.txt 依次执行：1) 删除它 2) 读取它"))
 }
 
 // showResult 统一打印 RunResult（completed / aborted 都按"结果"展示，不当作异常）。

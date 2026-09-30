@@ -23,11 +23,19 @@ import (
 //   - 协议适配：mock 用自然语言文本记录工具调用（"调用工具 X"），
 //     真实 API 要求 assistant 消息携带结构化的 tool_calls——
 //     内核的 Message.ToolCall 字段就是为此而设，适配在本 Provider 完成。
+//
+// OpenAICompatibleProvider 通过 OpenAI 兼容的 /chat/completions 协议调用真实模型
+// （智谱 BigModel / DeepSeek / 火山 Ark 等）。
+//
+// MaxTokens 控制单次输出预算：**混合思考模型（如 glm-4.7-flash）的 reasoning
+// 会先吃掉预算**，max_tokens 太小会导致 reasoning 没写完、content 为空——
+// 对"只输出一个级别名"这类短输出任务尤其致命（风险判断要用大预算）。
 type OpenAICompatibleProvider struct {
-	BaseURL string // 例如 https://open.bigmodel.cn/api/paas/v4
-	Model   string // 例如 glm-4.7-flash（智谱免费模型）
-	APIKey  string
-	Client  *http.Client
+	BaseURL   string // 例如 https://open.bigmodel.cn/api/paas/v4
+	Model     string // 例如 glm-4.7-flash（智谱免费模型）
+	APIKey    string
+	MaxTokens int // 0 = 不传 max_tokens，用服务端默认值
+	Client    *http.Client
 }
 
 // NewOpenAICompatibleProvider 构造 Provider；baseURL 示例：
@@ -47,9 +55,10 @@ func NewOpenAICompatibleProvider(baseURL, model, apiKey string) *OpenAICompatibl
 // ---- OpenAI 兼容协议的结构 ----
 
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
-	Tools    []chatTool    `json:"tools,omitempty"` // 无工具时不传，部分 API 不接受空数组
+	Model     string        `json:"model"`
+	Messages  []chatMessage `json:"messages"`
+	Tools     []chatTool    `json:"tools,omitempty"` // 无工具时不传，部分 API 不接受空数组
+	MaxTokens *int          `json:"max_tokens,omitempty"`
 }
 
 type chatMessage struct {
@@ -109,9 +118,10 @@ const maxAttempts = 3
 // 编译器不能校验 API 侧字段名，错误要到运行期才发现。
 func (p *OpenAICompatibleProvider) Chat(messages []Message, tools []Tool) (LLMResponse, error) {
 	body, err := json.Marshal(chatRequest{
-		Model:    p.Model,
-		Messages: p.toChatMessages(messages),
-		Tools:    toChatTools(tools),
+		Model:     p.Model,
+		Messages:  p.toChatMessages(messages),
+		Tools:     toChatTools(tools),
+		MaxTokens: intPtrOrNil(p.MaxTokens),
 	})
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("构造请求体失败: %w", err)
@@ -133,6 +143,14 @@ func (p *OpenAICompatibleProvider) Chat(messages []Message, tools []Tool) (LLMRe
 		}
 	}
 	return LLMResponse{}, fmt.Errorf("模型调用重试 %d 次仍失败: %w", maxAttempts, lastErr)
+}
+
+// intPtrOrNil 把 0 值转成 nil（omitempty 不传），避免"0 token"这种非法请求。
+func intPtrOrNil(n int) *int {
+	if n == 0 {
+		return nil
+	}
+	return &n
 }
 
 // apiHTTPError 标记 HTTP 状态错误，并携带服务端 message。

@@ -233,24 +233,26 @@ func TestLLMRiskEvaluatorCannotDowngrade(t *testing.T) {
 }
 
 func TestLLMRiskEvaluatorFallbackOnError(t *testing.T) {
-	// 模型不可用（脚本耗尽报错）→ 退回基础风险（保守兜底）。
+	// 模型不可用（脚本耗尽报错）→ 保守升级到 maxRisk(base, MEDIUM)，
+	// 绝不退回低基础风险静默放行（真实踩坑：思考模型 content 为空时漏审）。
 	riskLLM := NewMockLLM(nil) // 无脚本，Chat 必然报"脚本已耗尽"
 	e := NewLLMRiskEvaluator(riskLLM)
 
 	got := e.Evaluate("file_op", `{"action":"delete"}`, RiskMedium)
 	if got != RiskMedium {
-		t.Errorf("模型失败应退回基础风险 MEDIUM，实际 %s", got)
+		t.Errorf("模型失败应保守升级到 maxRisk(MEDIUM,MEDIUM)=MEDIUM，实际 %s", got)
 	}
 }
 
 func TestLLMRiskEvaluatorFallbackOnUnparsable(t *testing.T) {
-	// 模型返回无法解析的文本 → 同样退回基础风险（fail-closed 方向）。
+	// 模型返回无法解析的文本 → 保守升级到 maxRisk(base, MEDIUM)。
+	// 注意安全方向：宁可送审（多打扰一次），不可漏审（高风险动作放行）。
 	riskLLM := NewMockLLM([]MockDecision{{Content: "这个操作很危险我觉得"}})
 	e := NewLLMRiskEvaluator(riskLLM)
 
 	got := e.Evaluate("file_op", `{"action":"delete"}`, RiskLow)
-	if got != RiskLow {
-		t.Errorf("无法解析应退回基础风险 LOW，实际 %s", got)
+	if got != RiskMedium {
+		t.Errorf("无法解析应保守升级到 MEDIUM，实际 %s", got)
 	}
 }
 
