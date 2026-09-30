@@ -13,13 +13,15 @@ import (
 // approval、LangGraph 的 interrupt）：高风险动作（删文件、发消息、花钱、
 // 改配置）在执行前暂停，交给人或策略决定放行/拒绝。
 //
-// 关键设计决策：
-//   - 决策器可插拔：Approver 接口 + ApproverFunc 函数适配器，测试用
-//     Auto/Deny，真实交互用 CLIApprover；
-//   - fail-closed（默认拒绝）：工具标记了 RequiresApproval 但 Agent 没配
-//     approver（或拒绝）→ 不执行。安全系统宁可误杀，不可放行；
-//   - 拒绝不终止：拒绝结果以 tool 角色消息回填给模型，模型看到"未授权"
-//     后换路径；若模型反复请求同一动作，循环检测（LoopGuard）会兜底中止。
+// 分级后的工作流（见 loop.go 的审批段）：
+//   - RiskEvaluator 算本次调用的最终风险（基础级别 + 参数修正）；
+//   - 低于审批阈值 → 自动放行（不打扰用户）；
+//   - 达到阈值 → 进入审批闸门：Approver 决策；
+//   - fail-closed（默认拒绝）：达到阈值但没配 approver（或拒绝）→ 不执行；
+//   - 连续拒绝达上限 → 升级中止（对应 Claude Code 的 3 连拒升级给人）。
+//
+// 决策器可插拔：Approver 接口 + ApproverFunc 函数适配器，测试用
+// Auto/Deny，真实交互用 CLIApprover。
 
 // Approver 决定一个高风险工具调用是否放行。返回 true = 放行，false = 拒绝。
 //

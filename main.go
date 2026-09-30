@@ -136,44 +136,48 @@ func runDemoCompact(verbose bool) {
 	showResult(a.Run("分别查北京、上海、杭州、广州的天气并汇总"))
 }
 
-// runDemoApproval 演示审批点（human-in-the-loop）：
-// mock 模型先请求高风险工具 delete_file → 被策略拒绝 → 看到"未授权"回填后
-// 改走安全路径 get_weather → 完成。
-// 真实交互场景应换 agent.NewCLIApprover()（会阻塞读 stdin 等人工 y/n）；
-// 这里用脚本化决策器，方便自动化演示与测试。
+// runDemoApproval 演示分级审批点 + 模型自动判断风险：
+// 同一个工具 file_op 按参数定风险——read 低风险自动放行（不打扰），
+// delete 被风险模型判定为 HIGH → 进审批闸门并被拒绝；模型看到"未授权"后
+// 改走安全路径。真实交互场景应换 agent.NewCLIApprover()（阻塞读 stdin）。
 func runDemoApproval(verbose bool) {
 	reg := agent.NewRegistry()
 	reg.Register(agent.Tool{
-		Name:        "get_weather",
-		Description: "查询指定城市的当前天气",
+		Name:        "file_op",
+		Description: "文件操作：read 读文件 / delete 删除文件（基础风险 L1，实际风险由模型判定）",
+		BaseRisk:    agent.RiskLow,
 		Execute: func(input string) (string, error) {
-			return `{"city":"北京","weather":"晴","temp":24}`, nil
-		},
-	})
-	reg.Register(agent.Tool{
-		Name:             "delete_file",
-		Description:      "删除指定文件（高风险操作，需审批）",
-		RequiresApproval: true,
-		Execute: func(input string) (string, error) {
-			return "file deleted", nil
+			if strings.Contains(input, "delete") {
+				return "file deleted", nil
+			}
+			return "file content: hello mini-harness", nil
 		},
 	})
 
-	// 脚本化决策器：delete_file 一律拒绝，其余放行。
-	// （真实场景换成 agent.NewCLIApprover() 手动 y/n。）
-	approver := agent.ApproverFunc(func(name, args string) bool {
-		return name != "delete_file"
+	// 风险判断模型：独立实例，不占用主 agent 的模型预算（生产里是专用小模型/分类器）。
+	// 它按"工具+参数"输出级别名，评估器只升不降——delete 判 HIGH、read 判 LOW。
+	riskLLM := agent.NewMockLLM([]agent.MockDecision{
+		{Content: "HIGH"}, // delete 参数 → 高风险
+		{Content: "LOW"},  // read 参数 → 低风险
 	})
+	riskEval := agent.NewLLMRiskEvaluator(riskLLM)
 
-	// 模型脚本：先尝试高风险动作 → 被拒 → 学乖走安全路径 → 完成
+	// 审批决策器：拒绝所有进闸门的调用（演示 fail-closed + 升级语义）。
+	approver := agent.ApproverFunc(func(name, args string) bool { return false })
+
+	// 主模型脚本：先尝试高风险 delete → 被拒 → 学乖走低风险 read → 完成
 	llm := agent.NewMockLLM([]agent.MockDecision{
-		{ToolName: "delete_file", ToolInput: "/tmp/report.txt"},
-		{ToolName: "get_weather", ToolInput: `{"city":"北京"}`},
-		{Content: "北京今天晴，24 度。未执行删除操作（用户未授权）。"},
+		{ToolName: "file_op", ToolInput: `{"action":"delete","file":"/tmp/report.txt"}`},
+		{ToolName: "file_op", ToolInput: `{"action":"read","file":"/tmp/report.txt"}`},
+		{Content: "读取成功：hello mini-harness。删除未执行（用户未授权）。"},
 	})
 
-	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(5), agent.WithApprover(approver), agent.WithVerbose(verbose))
-	showResult(a.Run("先删除 /tmp/report.txt，再查北京天气"))
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(5),
+		agent.WithRiskEvaluator(riskEval),
+		agent.WithApprover(approver),
+		agent.WithVerbose(verbose))
+	showResult(a.Run("先删除 /tmp/report.txt，再读它"))
 }
 
 // showResult 统一打印 RunResult（completed / aborted 都按"结果"展示，不当作异常）。

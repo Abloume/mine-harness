@@ -4,14 +4,14 @@ import "fmt"
 
 // Tool 描述一个可被模型调用的工具。
 //
-// RequiresApproval 标记高风险工具（删文件、发消息、花钱）：调用前必须过审批闸门
-// （human-in-the-loop）。这是"工具白名单"之外的又一层护栏——白名单决定"能不能
-// 调用"，审批点决定"这次调用要不要人点头"。
+// BaseRisk 声明工具的静态基础风险（人定规则），运行时可按参数修正
+// （同一工具不同参数风险不同：读文件 vs 删文件）——见 risk.go 的 RiskEvaluator。
+// 审批闸门按"基础级别 + 参数修正"的最终风险决定是否触发。
 type Tool struct {
-	Name             string
-	Description      string
-	RequiresApproval bool                               // 高风险工具：调用前需人工/策略确认
-	Execute          func(input string) (string, error) // 简化：JSON 字符串进、字符串出
+	Name        string
+	Description string
+	BaseRisk    RiskLevel                          // 基础风险级别（RiskNone..RiskHigh），默认 0 即 RiskNone
+	Execute     func(input string) (string, error) // 简化：JSON 字符串进、字符串出
 }
 
 // Registry 是工具注册表：模型只能调用已注册的工具——这本身就是一层护栏
@@ -43,11 +43,14 @@ func (r *Registry) List() []Tool {
 	return out
 }
 
-// NeedsApproval 判断某工具是否标记为高风险（调用前需审批）。
-// 未注册的工具返回 false（反正会被 Call 护栏拦住）。
-func (r *Registry) NeedsApproval(name string) bool {
+// BaseRiskOf 返回工具声明的静态基础风险；未注册工具返回 RiskNone
+// （反正会被 Call 护栏拦住，这里不额外报错）。
+func (r *Registry) BaseRiskOf(name string) RiskLevel {
 	t, ok := r.tools[name]
-	return ok && t.RequiresApproval
+	if !ok {
+		return RiskNone
+	}
+	return t.BaseRisk
 }
 
 // Call 执行指定工具并返回结果。

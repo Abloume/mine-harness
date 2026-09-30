@@ -145,6 +145,12 @@ type Agent struct {
 	summarizer  Summarizer
 	approver    Approver // 审批决策器（nil = 未启用，fail-closed 见 Run）
 
+	// 审批点分级配置：
+	riskEvaluator     RiskEvaluator // 算本次调用最终风险（基础 + 参数修正）
+	approvalThreshold RiskLevel     // 达到该级别才进审批闸门（低于则自动放行）
+	denialLimit       int           // 连续拒绝上限，超过则升级中止
+	denials           int           // 当前连续拒绝计数（一次通过/低风险放行即清零）
+
 	guard *LoopGuard
 
 	history []Message
@@ -172,18 +178,32 @@ func WithLoopGuard(g *LoopGuard) Option { return func(a *Agent) { a.guard = g } 
 func WithSummarizer(s Summarizer) Option { return func(a *Agent) { a.summarizer = s } }
 
 // WithApprover 设置审批决策器（human-in-the-loop）。
-// 不传 = 未启用审批检查；工具若标记 RequiresApproval 会被默认拒绝（fail-closed）。
+// 达到审批阈值的调用若无 approver 会被默认拒绝（fail-closed）。
 func WithApprover(ap Approver) Option { return func(a *Agent) { a.approver = ap } }
+
+// WithRiskEvaluator 替换默认风险评估器（默认静态：按工具声明级别，无参数修正）。
+func WithRiskEvaluator(re RiskEvaluator) Option { return func(a *Agent) { a.riskEvaluator = re } }
+
+// WithApprovalThreshold 设置审批阈值：达到该级别（含）的调用才进审批闸门。
+func WithApprovalThreshold(lv RiskLevel) Option {
+	return func(a *Agent) { a.approvalThreshold = lv }
+}
+
+// WithDenialLimit 设置连续拒绝升级上限（默认 3：对应 Claude Code 的 3 连拒升级）。
+func WithDenialLimit(n int) Option { return func(a *Agent) { a.denialLimit = n } }
 
 // NewAgent 构造一个 Agent，默认 maxSteps=10、budget=4096、verbose=false。
 func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 	a := &Agent{
-		llm:         llm,
-		registry:    registry,
-		maxSteps:    10,
-		tokenBudget: 4096,
-		guard:       NewLoopGuard(),
-		summarizer:  NewHeuristicSummarizer(),
+		llm:               llm,
+		registry:          registry,
+		maxSteps:          10,
+		tokenBudget:       4096,
+		guard:             NewLoopGuard(),
+		summarizer:        NewHeuristicSummarizer(),
+		riskEvaluator:     StaticRiskEvaluator{},
+		approvalThreshold: RiskMedium, // 默认：Medium 及以上需要审批
+		denialLimit:       3,
 	}
 	for _, o := range opts {
 		o(a)
@@ -246,27 +266,41 @@ func (a *Agent) Run(task string) RunResult {
 				log.Printf("[step %d] tool_call → %s(%s)", step, tc.Name, tc.Input)
 			}
 
-			// 2a-1.5 审批点（human-in-the-loop）：高风险工具先过闸门，再执行。
-			// 默认 fail-closed：工具标记 RequiresApproval 但没有 approver
-			// （或决策器拒绝）→ 不执行工具。
-			if a.registry.NeedsApproval(tc.Name) {
+			// 2a-1.5 审批点（human-in-the-loop）：按风险分级决定走不走闸门。
+			//
+			// 流程：算本次最终风险（基础级别 + 参数修正）→ 低于阈值自动放行 →
+			// 达到阈值必须审批 → 拒绝计数，连续超限升级中止（软停止，不是 error）。
+			// fail-closed：达到阈值但没配 approver（或拒绝）→ 不执行工具。
+			risk := a.riskEvaluator.Evaluate(tc.Name, tc.Input, a.registry.BaseRiskOf(tc.Name))
+			if risk >= a.approvalThreshold {
 				approved := a.approver != nil && a.approver.Approve(tc.Name, tc.Input)
 				if !approved {
+					a.denials++
 					if a.verbose {
-						log.Printf("[step %d] ⛔ 审批拒绝：%s(%s) 未执行", step, tc.Name, tc.Input)
+						log.Printf("[step %d] ⛔ 审批拒绝（连续 %d 次）：%s(%s)", step, a.denials, tc.Name, tc.Input)
+					}
+					// 升级兜底：连续被拒说明模型在反复越权，停止并交还用户
+					// （对应 Claude Code auto mode 的"3 次连续拒绝 → 升级给人"）。
+					// 这是软停止不是 error，调用方可以展示进度并接手指挥。
+					if a.denials >= a.denialLimit {
+						return RunResult{Steps: step, Status: StatusAborted,
+							Reason: fmt.Sprintf("审批升级：连续 %d 次高风险调用被拒绝，停止并交还人工", a.denials)}
 					}
 					// 拒绝结果以 tool 角色回填给模型（不是终止）：
 					// 模型看到"未授权"可以换路径、改参数或直接回答。
-					// 若模型反复请求同一动作，上方的循环检测会先警告再中止兜底。
+					// 若模型反复请求同一动作，循环检测（上方）也会先警告再中止兜底。
 					a.history = append(a.history, Message{
 						Role:    roleTool,
 						Content: fmt.Sprintf("调用被拒绝：%s(%s)。用户未授权此操作，请改用其他方式完成目标，或直接给出当前可完成的部分。", tc.Name, tc.Input),
 					})
 					continue
 				}
+				a.denials = 0 // 审批通过：模型收敛了，清空拒绝计数
 				if a.verbose {
-					log.Printf("[step %d] ✅ 审批通过：%s(%s)", step, tc.Name, tc.Input)
+					log.Printf("[step %d] ✅ 审批通过（风险 %s）：%s(%s)", step, risk, tc.Name, tc.Input)
 				}
+			} else {
+				a.denials = 0 // 低风险自动放行：模型已换路径，清空拒绝计数
 			}
 
 			// 2a-2. 执行工具；失败不崩掉 loop，回填错误让模型自己决定，
