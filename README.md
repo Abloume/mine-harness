@@ -25,12 +25,13 @@
 - [x] 审批点（风险分级 L0-L3 + 参数感知 + 模型自动判断风险 LLMRiskEvaluator（只升不降）+ fail-closed 默认拒绝 + 拒绝回填 + 连续拒绝升级中止）— `internal/agent/approval.go`、`internal/agent/risk.go`
 - [x] 真实模型接入（OpenAI 兼容 Provider：智谱 BigModel / DeepSeek / 火山 Ark 通用，tool_call id 关联 + 结构化 tool_calls 协议适配 + **多 tool_call 并行调用支持** + 指数退避重试）— `internal/agent/provider.go`
 - [x] 评测门（任务成功率、结构化判断）— `internal/eval/eval.go`（RuleJudge 确定性规则 + LLMJudge 结构化 JSON 判断 + RunSuite 汇总，`go run . -demo eval`）
+- [x] Skill 加载（A 方案：Skill 包装为工具——Description 常驻触发 + SKILL.md 正文按需读取，用 function calling 伪装渐进式披露）— `internal/agent/skill.go`、示例 `skills/example/SKILL.md`
 
 ## 当前进度（2026-09-30）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval` 七个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批」，
-前五个用 `MockLLM`（脚本化假模型）不依赖 API Key，后两个走真实智谱 GLM
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill` 九个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载」，
+前六个用 `MockLLM`（脚本化假模型）不依赖 API Key，后两个走真实智谱 GLM
 （OpenAI 兼容，需 `ZHIPU_API_KEY`，写入项目根 `.env`，已被 `.gitignore` 排除；
 模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`）。
 撞上限与循环命中均为"软停止"（返回带原因的 RunResult），
@@ -59,6 +60,12 @@
   （passed/reason），失败或解析不了判负（评测也 fail-closed）；判定基于完整轨迹
   （`Agent.History()`）而非只凭最终回答——能发现"模型声称删了但没删"这类事实性谎言。
   `go run . -demo eval` 演示 4 用例（成功/多工具并行/审批安全/未收敛）→ 成功率 75%。
+- Skill 加载（A 方案）：`SkillAsTool` 把 SKILL.md 包装成普通工具——Description 是常驻
+  metadata（第一层），正文在模型调用后才作为工具结果进入上下文（第二层），
+  即"用 function calling 伪装渐进式披露"。局限（设计取舍）：正文进对话历史可能被
+  摘要压缩摘要掉；触发靠模型的工具选择而非 harness 路由。B 方案（真渐进式披露：
+  load_skill 特殊工具 + harness 注入 system）为后续扩展方向，边界清晰：
+  机制归内核（internal/agent）、skill 目录/发现归宿主（harness 层）。
 
 token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 token，含局限说明见
 `internal/agent/context.go` 注释），单元测试见 `internal/agent/context_test.go`、

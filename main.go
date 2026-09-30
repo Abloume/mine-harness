@@ -1,5 +1,5 @@
-// mine-harness 入口：八个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批 / 评测门"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval
+// mine-harness 入口：九个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill
 package main
 
 import (
@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -32,6 +32,8 @@ func main() {
 		runDemoRealApproval(*verbose)
 	case "eval":
 		runDemoEval(*verbose)
+	case "skill":
+		runDemoSkill(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -445,6 +447,54 @@ func runDemoEval(verbose bool) {
 	if rep.PositivePassed == rep.PositiveTotal && rep.NegativeCorrect == rep.NegativeTotal {
 		fmt.Println("结论: 该过的全过、该拦的全拦 —— 本轮评测满分 ✅")
 	}
+}
+
+// runDemoSkill 演示 Skill 加载（A 方案：Skill 包装为工具）：
+// 模型面对"删除文件"任务时，先加载 file-ops-policy 规范（Description 常驻触发），
+// 拿到 SKILL.md 正文后按规则改变行为——先备份、再删除，而不是直接删。
+// 对比：如果该 skill 未注册，模型第一反应就是直接 delete（可自己注释掉
+// SkillAsTool 那行对比 trace）。
+func runDemoSkill(verbose bool) {
+	reg := agent.NewRegistry()
+
+	// ① 把 Skill 包装成工具注册：Description 是常驻 metadata（模型靠它触发），
+	//    正文 SKILL.md 在模型调用后才读取进入上下文。
+	reg.Register(agent.SkillAsTool(agent.Skill{
+		Name:        "file-ops-policy",
+		Description: "文件操作安全规范。执行文件操作前先加载：删除/覆盖前必须备份、备份失败即停止、涉及删除需说明。",
+		BaseRisk:    agent.RiskLow,
+		Path:        "skills/example/SKILL.md", // 相对 main 包运行目录（go run . 时是仓库根）
+	}))
+
+	// ② 业务工具：backup 备份 + file_op 文件操作
+	reg.Register(agent.Tool{
+		Name:        "backup",
+		Description: "把指定文件备份到 backup/ 目录",
+		Execute: func(input string) (string, error) {
+			return "backup created: backup/report.txt (hello mini-harness)", nil
+		},
+	})
+	reg.Register(agent.Tool{
+		Name:        "file_op",
+		Description: "文件操作：read 读文件 / delete 删除文件",
+		Execute: func(input string) (string, error) {
+			if strings.Contains(input, "delete") {
+				return "file deleted", nil
+			}
+			return "file content: hello mini-harness", nil
+		},
+	})
+
+	// ③ 模型脚本：先加载规范 → 按规范先备份 → 再删除 → 汇报（说明已备份）
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "file-ops-policy", ToolInput: `{}`},
+		{ToolName: "backup", ToolInput: `{"file":"/tmp/report.txt"}`},
+		{ToolName: "file_op", ToolInput: `{"action":"delete","file":"/tmp/report.txt"}`},
+		{Content: "已按 file-ops-policy 规范执行：先备份 /tmp/report.txt 到 backup/（backup created），再删除。删除完成，备份已说明。"},
+	})
+
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(6), agent.WithVerbose(verbose))
+	showResult(a.Run("删除 /tmp/report.txt"))
 }
 
 // showResult 统一打印 RunResult（completed / aborted 都按"结果"展示，不当作异常）。
