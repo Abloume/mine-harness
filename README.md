@@ -27,10 +27,14 @@
 
 ## 当前进度（2026-09-30）
 
-第一版已跑通：`go run . -demo normal | loop | soft` 三个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止」，模型层用 `MockLLM`（脚本化假模型），
+第一版已跑通：`go run . -demo normal | loop | soft | compact` 四个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩」，模型层用 `MockLLM`（脚本化假模型），
 不依赖真实 API Key。撞上限与循环命中均为"软停止"（返回带原因的 RunResult），
 不是 error——对齐生产 Agent 的"交还用户"语义。
+
+token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 token，含局限说明见
+`internal/agent/context.go` 注释），单元测试见 `internal/agent/context_test.go`
+（`go test ./...` 可跑）。
 
 ## 约定
 
