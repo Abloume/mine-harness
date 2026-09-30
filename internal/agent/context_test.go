@@ -15,10 +15,10 @@ func TestEstimateTokens(t *testing.T) {
 		want int
 	}{
 		{"空串", "", 0},
-		{"纯中文 6 字", "今天天气很好", 6},        // CJK 1 字 ≈ 1 token
-		{"纯英文 hello", "hello", 1},            // 5 字符 / 4 = 1
-		{"纯英文 hello world", "hello world", 2}, // 11 字符 / 4 = 2（空格也计入 rest）
-		{"混合中英", "北京 Beijing 2026", 5},      // 2 CJK + 12/4 = 5
+		{"纯中文 6 字", "今天天气很好", 6},                                   // CJK 1 字 ≈ 1 token
+		{"纯英文 hello", "hello", 1},                                  // 5 字符 / 4 = 1
+		{"纯英文 hello world", "hello world", 2},                      // 11 字符 / 4 = 2（空格也计入 rest）
+		{"混合中英", "北京 Beijing 2026", 5},                             // 2 CJK + 12/4 = 5
 		{"工具结果 JSON", `{"city":"北京","weather":"晴","temp":24}`, 11}, // 3 CJK + 32/4 = 11
 	}
 
@@ -34,7 +34,7 @@ func TestEstimateTokens(t *testing.T) {
 func TestMessagesTokens(t *testing.T) {
 	msgs := []Message{
 		{Role: roleUser, Content: "今天天气很好"}, // 6
-		{Role: roleTool, Content: "hello"},     // 1
+		{Role: roleTool, Content: "hello"},  // 1
 	}
 	if got := MessagesTokens(msgs); got != 7 {
 		t.Errorf("MessagesTokens = %d, want 7", got)
