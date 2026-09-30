@@ -287,11 +287,14 @@ func (a *Agent) Run(task string) RunResult {
 							Reason: fmt.Sprintf("审批升级：连续 %d 次高风险调用被拒绝，停止并交还人工", a.denials)}
 					}
 					// 拒绝结果以 tool 角色回填给模型（不是终止）：
-					// 模型看到"未授权"可以换路径、改参数或直接回答。
+					// 模型看到"未授权"可以停止该动作、汇报进展或询问用户。
+					// 文案刻意反绕过：明确禁止"效果等价的替代操作"——真实模型
+					// 会把"换个方式达成同样目的"理解为合法路径（如删不掉就覆盖
+					// 清空），只有把路径②显式封死，才只留下安全分支。
 					// 若模型反复请求同一动作，循环检测（上方）也会先警告再中止兜底。
 					a.history = append(a.history, Message{
 						Role:       roleTool,
-						Content:    fmt.Sprintf("调用被拒绝：%s(%s)。用户未授权此操作，请改用其他方式完成目标，或直接给出当前可完成的部分。", tc.Name, tc.Input),
+						Content:    fmt.Sprintf("调用被拒绝：%s(%s)。用户未授权此操作。请停止该动作，不要尝试效果等价的其他操作或组合方式绕过审批；你可以汇报当前进展、说明受限原因，或询问用户。", tc.Name, tc.Input),
 						ToolCallID: tc.ID, // 真实 API 需要 tool 消息关联 tool_call_id
 					})
 					continue
