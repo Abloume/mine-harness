@@ -23,13 +23,15 @@
 - [x] 上下文管理（token 预算 + 摘要压缩 + FIFO 兜底）— `internal/agent/context.go`（摘要器可替换为生成式 LLM 摘要）
 - [x] 循环检测 + 软停止（精确重复 N=2、滑动窗口 8 步、失败重试预算 3、分级响应）— `internal/agent/loop.go`
 - [x] 审批点（风险分级 L0-L3 + 参数感知 + 模型自动判断风险 LLMRiskEvaluator（只升不降）+ fail-closed 默认拒绝 + 拒绝回填 + 连续拒绝升级中止）— `internal/agent/approval.go`、`internal/agent/risk.go`
+- [x] 真实模型接入（OpenAI 兼容 Provider：智谱 BigModel / DeepSeek / 火山 Ark 通用，tool_call id 关联 + 结构化 tool_calls 协议适配）— `internal/agent/provider.go`
 - [ ] 评测门（任务成功率、结构化判断）
 
 ## 当前进度（2026-09-30）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval` 五个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 审批点」，模型层用 `MockLLM`（脚本化假模型），
-不依赖真实 API Key。撞上限与循环命中均为"软停止"（返回带原因的 RunResult），
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real` 六个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 审批点 / 真实模型」，其中前五个用 `MockLLM`
+（脚本化假模型）不依赖 API Key，`real` 走真实智谱 GLM（OpenAI 兼容，需 `ZHIPU_API_KEY`）。
+撞上限与循环命中均为"软停止"（返回带原因的 RunResult），
 不是 error——对齐生产 Agent 的"交还用户"语义。审批点采用风险分级：工具声明基础风险
 （`BaseRisk` L0-L3），风险由 `RiskEvaluator` 判定——静态/函数（参数感知）/模型
 （`LLMRiskEvaluator` 用独立 LLM 判断，只升不降 + 失败退回基础风险）；低于审批阈值
@@ -38,7 +40,7 @@
 
 token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 token，含局限说明见
 `internal/agent/context.go` 注释），单元测试见 `internal/agent/context_test.go`、
-`internal/agent/approval_test.go`（`go test ./...` 可跑）。
+`internal/agent/approval_test.go`、`internal/agent/provider_test.go`（`go test ./...` 可跑）。
 
 ## 约定
 

@@ -1,17 +1,18 @@
-// mine-harness 入口：五个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点"。
-// 用法：go run . -demo normal | loop | soft | compact | approval
+// mine-harness 入口：六个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real
 package main
 
 import (
 	"flag"
 	"fmt"
+	"os"
 	"strings"
 
 	"mine-harness/internal/agent"
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -24,9 +25,66 @@ func main() {
 		runDemoCompact(*verbose)
 	case "approval":
 		runDemoApproval(*verbose)
+	case "real":
+		runDemoReal(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
+}
+
+// loadEnv 极简 .env 加载：按行解析 KEY=VALUE 写入环境变量。
+// 已存在的环境变量优先（.env 只是兜底）；不处理引号/转义，够 demo 用即可，
+// 生产用官方 dotenv 库。
+func loadEnv(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // 文件不存在就跳过，靠真实环境变量
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if os.Getenv(k) == "" {
+			os.Setenv(k, v)
+		}
+	}
+}
+
+// runDemoReal 演示真实模型接入：智谱 GLM（OpenAI 兼容格式）+ 真实工具调用。
+// 需要有效的 API Key：优先读环境变量 ZHIPU_API_KEY，或项目根 .env 文件
+// （.env 已被 .gitignore 排除，不会进仓库）。
+// 模型默认 glm-4.7-flash（智谱免费模型），可换成其他。
+func runDemoReal(verbose bool) {
+	loadEnv(".env")
+	key := os.Getenv("ZHIPU_API_KEY")
+	if key == "" {
+		fmt.Println("缺少 ZHIPU_API_KEY：export ZHIPU_API_KEY=xxx 或写入项目根 .env（已被 git 忽略）")
+		return
+	}
+
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "get_weather",
+		Description: "查询指定城市的当前天气。参数是 JSON：{\"city\":\"城市名\"}",
+		Execute: func(input string) (string, error) {
+			// 演示用 mock 数据源；真实系统这里会调用天气服务
+			return `{"city":"北京","weather":"晴","temp":24,"humidity":40}`, nil
+		},
+	})
+
+	llm := agent.NewOpenAICompatibleProvider(
+		"https://open.bigmodel.cn/api/paas/v4", // 智谱 BigModel
+		"glm-4.7-flash",                        // 免费模型
+		key,
+	)
+
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(5), agent.WithVerbose(verbose))
+	showResult(a.Run("帮我查一下北京的天气，并告诉我要不要带伞"))
 }
 
 // runDemoNormal 演示完整成功链路：mock 模型先查天气，再基于结果总结。

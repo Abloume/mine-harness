@@ -9,16 +9,28 @@ import "fmt"
 
 // Message 表示对话中的一条消息。
 //
+// ToolCallID：仅 tool 角色消息使用，关联它回答的那次工具调用。
+// 真实 API（OpenAI 兼容）要求 tool 结果消息必须带 tool_call_id——
+// 这是 mock → 真实协议的关键差异，Provider 负责把它填对。
+//
+// ToolCall：仅 assistant 角色消息使用，携带结构化的工具调用记录。
+// mock 内核用自然语言文本（"调用工具 X"）记录即可；真实协议需要
+// assistant 消息携带 tool_calls 结构（含 id/name/arguments），
+// Provider 优先读这个字段做协议适配。
+//
 // JS/TS ↔ Go 差异：TS 常用 discriminated union 表达角色
 // （type: 'user' | 'assistant' | 'tool'），Go 里用 string 常量 + 简单 struct，
 // 类型安全靠使用处的约定，缺少 TS 的编译期穷尽检查。
 type Message struct {
-	Role    string // user / assistant / tool / system
-	Content string
+	Role       string // user / assistant / tool / system
+	Content    string
+	ToolCallID string    // tool 角色：关联的工具调用 id（真实 API 必需）
+	ToolCall   *ToolCall // assistant 角色：本次工具调用的结构化记录（可选）
 }
 
 // ToolCall 表示模型请求调用某个工具。
 type ToolCall struct {
+	ID    string // 模型响应中的工具调用 id（真实 API 用于关联结果；mock 可空）
 	Name  string // 工具名
 	Input string // 输入，JSON 字符串（真实系统里会用 JSON Schema 做结构化校验）
 }

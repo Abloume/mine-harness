@@ -290,8 +290,9 @@ func (a *Agent) Run(task string) RunResult {
 					// 模型看到"未授权"可以换路径、改参数或直接回答。
 					// 若模型反复请求同一动作，循环检测（上方）也会先警告再中止兜底。
 					a.history = append(a.history, Message{
-						Role:    roleTool,
-						Content: fmt.Sprintf("调用被拒绝：%s(%s)。用户未授权此操作，请改用其他方式完成目标，或直接给出当前可完成的部分。", tc.Name, tc.Input),
+						Role:       roleTool,
+						Content:    fmt.Sprintf("调用被拒绝：%s(%s)。用户未授权此操作，请改用其他方式完成目标，或直接给出当前可完成的部分。", tc.Name, tc.Input),
+						ToolCallID: tc.ID, // 真实 API 需要 tool 消息关联 tool_call_id
 					})
 					continue
 				}
@@ -318,8 +319,8 @@ func (a *Agent) Run(task string) RunResult {
 			}
 
 			a.history = append(a.history,
-				Message{Role: roleAssistant, Content: fmt.Sprintf("调用工具 %s", tc.Name)},
-				Message{Role: roleTool, Content: out},
+				Message{Role: roleAssistant, Content: fmt.Sprintf("调用工具 %s", tc.Name), ToolCall: tc},
+				Message{Role: roleTool, Content: out, ToolCallID: tc.ID},
 			)
 			continue
 		}
