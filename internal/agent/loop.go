@@ -356,3 +356,10 @@ func (a *Agent) Run(task string) RunResult {
 	// 步数耗尽仍未收敛：软停止（不是 error）——返回进度与原因，交还用户继续指挥
 	return RunResult{Steps: a.maxSteps, Status: StatusAborted, Reason: fmt.Sprintf("达到最大步数 %d，任务未完成", a.maxSteps)}
 }
+
+// History 返回本轮对话轨迹（只读引用，调用方不得修改）。
+// 对应生产 harness 的 trajectory 暴露：评测门（eval）、审计、回放都依赖它——
+// 只给 RunResult 而不给轨迹，外部无法判断"为什么成功/失败"。
+func (a *Agent) History() []Message {
+	return a.history
+}

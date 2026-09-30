@@ -24,7 +24,7 @@
 - [x] 循环检测 + 软停止（精确重复 N=2、滑动窗口 8 步、失败重试预算 3、分级响应）— `internal/agent/loop.go`
 - [x] 审批点（风险分级 L0-L3 + 参数感知 + 模型自动判断风险 LLMRiskEvaluator（只升不降）+ fail-closed 默认拒绝 + 拒绝回填 + 连续拒绝升级中止）— `internal/agent/approval.go`、`internal/agent/risk.go`
 - [x] 真实模型接入（OpenAI 兼容 Provider：智谱 BigModel / DeepSeek / 火山 Ark 通用，tool_call id 关联 + 结构化 tool_calls 协议适配 + **多 tool_call 并行调用支持** + 指数退避重试）— `internal/agent/provider.go`
-- [ ] 评测门（任务成功率、结构化判断）
+- [x] 评测门（任务成功率、结构化判断）— `internal/eval/eval.go`（RuleJudge 确定性规则 + LLMJudge 结构化 JSON 判断 + RunSuite 汇总，`go run . -demo eval`）
 
 ## 当前进度（2026-09-30）
 
@@ -54,6 +54,11 @@
   "1 条 assistant（带全部 tool_calls）+ N 条 tool 结果（各自 tool_call_id 关联）"
   的协议回填；每个调用独立过循环检测/审批/执行，一个被拒不影响其他。
   工具顺序执行（不并发）：生产并行执行需工具声明并发安全。
+- 评测门：任务集 + 判定器分离（`internal/eval`）。RuleJudge（确定性规则：必调工具/
+  参数级安全判据/回答子串）零成本可复现；LLMJudge（LLM-as-judge）输出结构化 JSON
+  （passed/reason），失败或解析不了判负（评测也 fail-closed）；判定基于完整轨迹
+  （`Agent.History()`）而非只凭最终回答——能发现"模型声称删了但没删"这类事实性谎言。
+  `go run . -demo eval` 演示 4 用例（成功/多工具并行/审批安全/未收敛）→ 成功率 75%。
 
 token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 token，含局限说明见
 `internal/agent/context.go` 注释），单元测试见 `internal/agent/context_test.go`、

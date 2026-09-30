@@ -88,7 +88,10 @@ func (m *MockLLM) Chat(messages []Message, tools []Tool) (LLMResponse, error) {
 		return LLMResponse{ToolCalls: d.ToolCalls}, nil
 	}
 	if d.ToolName != "" {
-		return LLMResponse{ToolCalls: []ToolCall{{Name: d.ToolName, Input: d.ToolInput}}}, nil
+		// 自动赋 ID（mock-%d）：真实 Provider 每个 tool_call 都有 id，
+		// mock 若留空会让"tool 结果 ↔ 调用"的关联反查产生歧义
+		// （同轮多个调用时无法区分，评测门的 executedCalls 依赖它）。
+		return LLMResponse{ToolCalls: []ToolCall{{ID: fmt.Sprintf("mock-%d", m.index), Name: d.ToolName, Input: d.ToolInput}}}, nil
 	}
 	return LLMResponse{Content: d.Content}, nil
 }
