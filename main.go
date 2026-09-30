@@ -1,47 +1,113 @@
-// mine-harness 入口：组装一个最小 Agent，跑通"工具调用 → 回填 → 最终回答"的完整链路。
+// mine-harness 入口：三个演示场景，覆盖"正常链路 / 循环检测 / 软停止"。
+// 用法：go run . -demo normal | loop | soft
 package main
 
 import (
 	"flag"
 	"fmt"
-	"log"
+	"strings"
 
 	"mine-harness/internal/agent"
 )
 
 func main() {
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
-	// 1. 工具注册：mini-harness 里只有一个 mock 天气工具（不联网）
+	switch *demo {
+	case "loop":
+		runDemoLoop(*verbose)
+	case "soft":
+		runDemoSoftStop(*verbose)
+	default:
+		runDemoNormal(*verbose)
+	}
+}
+
+// runDemoNormal 演示完整成功链路：mock 模型先查天气，再基于结果总结。
+func runDemoNormal(verbose bool) {
 	reg := agent.NewRegistry()
 	reg.Register(agent.Tool{
 		Name:        "get_weather",
 		Description: "查询指定城市的当前天气",
 		Execute: func(input string) (string, error) {
-			// mock 实现：固定返回，演示用。真实工具会在这里调外部 API。
 			return `{"city":"北京","weather":"晴","temp":24}`, nil
 		},
 	})
 
-	// 2. mock 模型脚本：先请求查天气，再基于工具结果给出总结。
-	// 这模拟了真实模型"感知工具结果后收敛"的行为，让链路可复现。
 	llm := agent.NewMockLLM([]agent.MockDecision{
 		{ToolName: "get_weather", ToolInput: `{"city":"北京"}`},
 		{Content: "北京今天晴，24 度，适合出门。"},
 	})
 
-	// 3. 组装内核并运行
-	a := agent.NewAgent(llm, reg,
-		agent.WithMaxSteps(5),
-		agent.WithTokenBudget(2000),
-		agent.WithVerbose(*verbose),
-	)
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(5), agent.WithVerbose(verbose))
+	showResult(a.Run("帮我查一下北京的天气并总结"))
+}
 
-	answer, err := a.Run("帮我查一下北京的天气并总结")
-	if err != nil {
-		log.Fatalf("运行失败: %v", err)
+// runDemoLoop 演示循环检测：mock 模型反复用相同参数调用同一工具。
+// 期望：第 2 次命中 → 注入警告；第 3 次仍重复 → 中止（软停止，不是 error）。
+func runDemoLoop(verbose bool) {
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "get_weather",
+		Description: "查询指定城市的当前天气",
+		Execute: func(input string) (string, error) {
+			return `{"city":"北京","weather":"晴","temp":24}`, nil
+		},
+	})
+
+	// 病态模型脚本：不换参数、不收敛，一直查同一个城市
+	steps := make([]agent.MockDecision, 0, 5)
+	for i := 0; i < 5; i++ {
+		steps = append(steps, agent.MockDecision{ToolName: "get_weather", ToolInput: `{"city":"北京"}`})
 	}
-	fmt.Println("==== 最终回答 ====")
-	fmt.Println(answer)
+	llm := agent.NewMockLLM(steps)
+
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(5), agent.WithVerbose(verbose))
+	showResult(a.Run("帮我查一下北京的天气并总结"))
+}
+
+// runDemoSoftStop 演示步数软停止：maxSteps=2，但任务需要 3 步才能完成。
+// 期望：第 2 步结束后撞上限 → 返回"未完成 + 原因"，而不是报错中断。
+func runDemoSoftStop(verbose bool) {
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "get_weather",
+		Description: "查询指定城市的当前天气",
+		Execute: func(input string) (string, error) {
+			// mock：按输入中的城市名返回对应数据，演示用
+			if strings.Contains(input, "杭州") {
+				return `{"city":"杭州","weather":"小雨","temp":16}`, nil
+			}
+			if strings.Contains(input, "上海") {
+				return `{"city":"上海","weather":"多云","temp":18}`, nil
+			}
+			return `{"city":"未知","weather":"未知"}`, nil
+		},
+	})
+
+	// 正常脚本但需要 3 步：两次工具调用 + 一次最终回答
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "get_weather", ToolInput: `{"city":"上海"}`},
+		{ToolName: "get_weather", ToolInput: `{"city":"杭州"}`},
+		{Content: "上海多云 18 度，杭州待补充。"},
+	})
+
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(2), agent.WithVerbose(verbose))
+	showResult(a.Run("帮我查上海和杭州的天气并总结"))
+}
+
+// showResult 统一打印 RunResult（completed / aborted 都按"结果"展示，不当作异常）。
+func showResult(r agent.RunResult) {
+	fmt.Println("==== 运行结果 ====")
+	fmt.Printf("状态: %s  步数: %d\n", r.Status, r.Steps)
+	switch r.Status {
+	case agent.StatusCompleted:
+		fmt.Printf("最终回答: %s\n", r.Answer)
+	case agent.StatusAborted:
+		fmt.Printf("未完成原因: %s\n", r.Reason)
+		// 软停止的语义：任务中断，但系统没有崩——这就是生产 Agent 的
+		// "交还给用户继续指挥"，而不是把 error 抛给上层。
+	}
 }

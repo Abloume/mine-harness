@@ -21,13 +21,16 @@
 - [x] agent loop（ReAct 风格主循环）— `internal/agent/loop.go`
 - [x] 工具注册与调用（function calling / 本地工具）— `internal/agent/tools.go`
 - [x] 上下文管理（token 预算、FIFO 截断）— `internal/agent/context.go`（摘要压缩待升级）
+- [x] 循环检测 + 软停止（精确重复 N=2、滑动窗口 8 步、失败重试预算 3、分级响应）— `internal/agent/loop.go`
 - [ ] 审批点（人工确认/自动放行）
 - [ ] 评测门（任务成功率、结构化判断）
 
 ## 当前进度（2026-09-30）
 
-第一版已跑通：`go run .` 输出「工具调用 → 回填 → 最终回答」完整链路，
-模型层用 `MockLLM`（脚本化假模型），不依赖真实 API Key。
+第一版已跑通：`go run . -demo normal | loop | soft` 三个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止」，模型层用 `MockLLM`（脚本化假模型），
+不依赖真实 API Key。撞上限与循环命中均为"软停止"（返回带原因的 RunResult），
+不是 error——对齐生产 Agent 的"交还用户"语义。
 
 ## 约定
 
