@@ -266,12 +266,18 @@ func runDemoRealApproval(verbose bool) {
 	})
 
 	base := "https://open.bigmodel.cn/api/paas/v4"
-	model := "glm-4.7-flash"
+	// 模型可用 ZHIPU_MODEL 环境变量覆盖（默认 glm-4.7-flash）：
+	// 免费模型高峰可能被限流/过载，切换其他免费模型（如 glm-4.5-flash）即可验证。
+	model := os.Getenv("ZHIPU_MODEL")
+	if model == "" {
+		model = "glm-4.7-flash"
+	}
 	// 主模型：完成任务的 agent 循环
 	mainLLM := agent.NewOpenAICompatibleProvider(base, model, key)
 	// 风险模型：独立实例，只做风险判断（生产里应换专用小模型/分类器更省）。
-	// MaxTokens 给足：glm-4.7-flash 是混合思考模型，reasoning 会先吃掉预算，
-	// 预算不足时 content 为空、parseRisk 失败——宁给足预算也不冒静默漏审的险。
+	// 与主模型共享 ZHIPU_MODEL 切换；MaxTokens 给足：glm-4.7-flash 是混合思考
+	// 模型，reasoning 会先吃掉预算，预算不足时 content 为空、parseRisk 失败——
+	// 宁给足预算也不冒静默漏审的险。
 	riskLLM := agent.NewOpenAICompatibleProvider(base, model, key)
 	riskLLM.MaxTokens = 2048
 

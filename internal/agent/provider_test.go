@@ -38,7 +38,7 @@ func TestProviderSendsStructuredToolCalls(t *testing.T) {
 	p := NewOpenAICompatibleProvider(srv.URL, "test-model", "test-key")
 	msgs := []Message{
 		{Role: roleUser, Content: "删掉 /tmp/a"},
-		{Role: roleAssistant, Content: "调用工具 delete_file", ToolCall: &ToolCall{ID: "call_1", Name: "delete_file", Input: `{"file":"/tmp/a"}`}},
+		{Role: roleAssistant, Content: "调用工具 delete_file", ToolCalls: []ToolCall{{ID: "call_1", Name: "delete_file", Input: `{"file":"/tmp/a"}`}}},
 		{Role: roleTool, Content: "deleted", ToolCallID: "call_1"},
 	}
 
@@ -105,14 +105,100 @@ func TestProviderParsesToolCallResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chat 失败: %v", err)
 	}
-	if resp.ToolCall == nil {
-		t.Fatal("应返回 ToolCall，实际为 nil")
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("应返回 1 个 ToolCall，实际 %d 个", len(resp.ToolCalls))
 	}
-	if resp.ToolCall.ID != "call_9" || resp.ToolCall.Name != "get_weather" {
-		t.Errorf("ToolCall 字段不符: %+v", resp.ToolCall)
+	tc := resp.ToolCalls[0]
+	if tc.ID != "call_9" || tc.Name != "get_weather" {
+		t.Errorf("ToolCall 字段不符: %+v", tc)
 	}
-	if resp.ToolCall.Input != `{"city":"北京"}` {
-		t.Errorf("ToolCall.Input 应透传原始 JSON，实际 %s", resp.ToolCall.Input)
+	if tc.Input != `{"city":"北京"}` {
+		t.Errorf("ToolCall.Input 应透传原始 JSON，实际 %s", tc.Input)
+	}
+}
+
+func TestProviderParsesMultipleToolCalls(t *testing.T) {
+	// 多 tool_call：真实模型支持"一轮并行调用多个工具"，Provider 必须全部透传，
+	// 而不是只取第一个——这是 mock 时代"一次一个动作"假设的协议级升级。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{
+			"choices":[{"message":{
+				"content":null,
+				"tool_calls":[
+					{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}},
+					{"id":"call_2","type":"function","function":{"name":"get_time","arguments":"{\"zone\":\"Asia/Shanghai\"}"}}
+				]
+			}}]
+		}`))
+	}))
+	defer srv.Close()
+
+	p := NewOpenAICompatibleProvider(srv.URL, "test-model", "test-key")
+	resp, err := p.Chat([]Message{{Role: roleUser, Content: "查天气和时间"}}, nil)
+	if err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+	if len(resp.ToolCalls) != 2 {
+		t.Fatalf("应透传 2 个 ToolCall，实际 %d 个", len(resp.ToolCalls))
+	}
+	if resp.ToolCalls[0].ID != "call_1" || resp.ToolCalls[0].Name != "get_weather" {
+		t.Errorf("第一个 tool_call 不符: %+v", resp.ToolCalls[0])
+	}
+	if resp.ToolCalls[1].ID != "call_2" || resp.ToolCalls[1].Name != "get_time" {
+		t.Errorf("第二个 tool_call 不符: %+v", resp.ToolCalls[1])
+	}
+}
+
+func TestProviderSendsMultipleToolCallsInHistory(t *testing.T) {
+	// 历史回填：assistant 消息带多个 tool_calls 时，请求里必须原样输出全部
+	//（content:null + 数组），每条 tool 结果消息用各自 tool_call_id 关联。
+	var gotReq chatRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotReq)
+		w.Write([]byte(`{"choices":[{"message":{"content":"done"}}]}`))
+	}))
+	defer srv.Close()
+
+	p := NewOpenAICompatibleProvider(srv.URL, "test-model", "test-key")
+	msgs := []Message{
+		{Role: roleUser, Content: "并行查两个城市天气"},
+		{Role: roleAssistant, Content: "调用工具 2 个: get_weather, get_weather",
+			ToolCalls: []ToolCall{
+				{ID: "c1", Name: "get_weather", Input: `{"city":"北京"}`},
+				{ID: "c2", Name: "get_weather", Input: `{"city":"上海"}`},
+			}},
+		{Role: roleTool, Content: "晴 24 度", ToolCallID: "c1"},
+		{Role: roleTool, Content: "雨 20 度", ToolCallID: "c2"},
+	}
+	if _, err := p.Chat(msgs, nil); err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+
+	var assistantMsg *chatMessage
+	for i := range gotReq.Messages {
+		if gotReq.Messages[i].Role == roleAssistant && gotReq.Messages[i].ToolCalls != nil {
+			assistantMsg = &gotReq.Messages[i]
+			break
+		}
+	}
+	if assistantMsg == nil {
+		t.Fatal("请求中没有带 tool_calls 的 assistant 消息")
+	}
+	if len(assistantMsg.ToolCalls) != 2 {
+		t.Fatalf("应有 2 个 tool_calls，实际 %d", len(assistantMsg.ToolCalls))
+	}
+	if assistantMsg.ToolCalls[1].ID != "c2" || assistantMsg.ToolCalls[1].Function.Name != "get_weather" {
+		t.Errorf("第二个 tool_call 不符: %+v", assistantMsg.ToolCalls[1])
+	}
+
+	toolIDs := map[string]bool{}
+	for _, m := range gotReq.Messages {
+		if m.Role == roleTool {
+			toolIDs[m.ToolCallID] = true
+		}
+	}
+	if !toolIDs["c1"] || !toolIDs["c2"] {
+		t.Errorf("tool 结果消息应分别关联 c1/c2，实际 %v", toolIDs)
 	}
 }
 

@@ -13,7 +13,8 @@ import "fmt"
 // 真实 API（OpenAI 兼容）要求 tool 结果消息必须带 tool_call_id——
 // 这是 mock → 真实协议的关键差异，Provider 负责把它填对。
 //
-// ToolCall：仅 assistant 角色消息使用，携带结构化的工具调用记录。
+// ToolCalls：仅 assistant 角色消息使用，携带结构化的工具调用记录（可为多个——
+// 真实模型支持"一轮并行调用多个工具"，对应 OpenAI 协议的 tool_calls 数组）。
 // mock 内核用自然语言文本（"调用工具 X"）记录即可；真实协议需要
 // assistant 消息携带 tool_calls 结构（含 id/name/arguments），
 // Provider 优先读这个字段做协议适配。
@@ -24,8 +25,8 @@ import "fmt"
 type Message struct {
 	Role       string // user / assistant / tool / system
 	Content    string
-	ToolCallID string    // tool 角色：关联的工具调用 id（真实 API 必需）
-	ToolCall   *ToolCall // assistant 角色：本次工具调用的结构化记录（可选）
+	ToolCallID string     // tool 角色：关联的工具调用 id（真实 API 必需）
+	ToolCalls  []ToolCall // assistant 角色：本次请求的工具调用（可为多个，并行调用）
 }
 
 // ToolCall 表示模型请求调用某个工具。
@@ -35,13 +36,13 @@ type ToolCall struct {
 	Input string // 输入，JSON 字符串（真实系统里会用 JSON Schema 做结构化校验）
 }
 
-// LLMResponse 是模型一次返回的结果：要么给一段文本，要么请求调用工具。
+// LLMResponse 是模型一次返回的结果：要么给一段文本，要么请求调用一个或多个工具。
 //
-// JS/TS ↔ Go 差异：TS 常用联合类型 { text } | { toolCall }；
-// Go 用 struct + 指针字段，nil 表示"没有"，对应 TS 的 | null。
+// JS/TS ↔ Go 差异：TS 常用联合类型 { text } | { toolCall: ToolCall[] }；
+// Go 用 struct + slice 字段，len==0 表示"没有"，对应 TS 的空数组。
 type LLMResponse struct {
-	Content  string
-	ToolCall *ToolCall // 非 nil 表示本轮要调用工具
+	Content   string
+	ToolCalls []ToolCall // 非空表示本轮要调用工具（可为多个）
 }
 
 // LLM 是模型接入层接口，mini-harness 只依赖这个抽象，不关心底层是哪个模型。
@@ -53,10 +54,12 @@ type LLM interface {
 }
 
 // MockDecision 描述 mock 模型"下一轮"的行为，用于精确控制演示走向。
+// ToolCalls 非空则模拟"一轮并行调用多个工具"（真实模型的多 tool_calls 行为）。
 type MockDecision struct {
-	Content   string // 最终回答（与 ToolName 二选一）
-	ToolName  string // 本轮要调用的工具名（非空则优先走工具调用）
-	ToolInput string // 传给工具的 JSON 输入
+	Content   string     // 最终回答（与 ToolName/ToolCalls 互斥，后两者优先）
+	ToolName  string     // 本轮要调用的工具名（非空则优先走工具调用）
+	ToolInput string     // 传给工具的 JSON 输入
+	ToolCalls []ToolCall // 本轮并行调用多个工具（非空时优先于 ToolName）
 }
 
 // MockLLM 是一个可编程假模型：按脚本依次返回"先调用工具、再给答案"。
@@ -81,8 +84,11 @@ func (m *MockLLM) Chat(messages []Message, tools []Tool) (LLMResponse, error) {
 	}
 	d := m.steps[m.index]
 	m.index++
+	if len(d.ToolCalls) > 0 {
+		return LLMResponse{ToolCalls: d.ToolCalls}, nil
+	}
 	if d.ToolName != "" {
-		return LLMResponse{ToolCall: &ToolCall{Name: d.ToolName, Input: d.ToolInput}}, nil
+		return LLMResponse{ToolCalls: []ToolCall{{Name: d.ToolName, Input: d.ToolInput}}}, nil
 	}
 	return LLMResponse{Content: d.Content}, nil
 }

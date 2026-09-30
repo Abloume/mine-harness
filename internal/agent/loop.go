@@ -3,6 +3,7 @@ package agent
 import (
 	"fmt"
 	"log"
+	"strings"
 )
 
 // 常量消息角色（与 llm.go 的 Message.Role 配合，避免魔法字符串散落）。
@@ -239,92 +240,108 @@ func (a *Agent) Run(task string) RunResult {
 			return RunResult{Steps: step, Status: StatusAborted, Reason: fmt.Sprintf("模型调用失败: %v", err)}
 		}
 
-		// 2a. 模型请求调用工具
-		if resp.ToolCall != nil {
-			tc := resp.ToolCall
-
-			// 2a-1. 循环检测：命中先警告、再犯中止
-			switch a.guard.guard(tc.Name, tc.Input) {
-			case guardWarn:
-				if a.verbose {
-					log.Printf("[step %d] ⚠ 循环检测命中（重复调用 %s），注入警告", step, tc.Name)
-				}
-				a.history = append(a.history, Message{
-					Role:    roleSystem,
-					Content: fmt.Sprintf("检测到你重复调用工具 %s(%s) 且无进展。请换一种方式：改用其他工具、修改参数或直接给出最终回答。", tc.Name, tc.Input),
-				})
-				continue
-			case guardAbort:
-				if a.verbose {
-					log.Printf("[step %d] ✗ 循环检测二次命中，中止", step)
-				}
-				return RunResult{Steps: step, Status: StatusAborted,
-					Reason: fmt.Sprintf("循环检测：重复调用 %s(%s) 且警告后无进展", tc.Name, tc.Input)}
+		// 2a. 模型请求调用工具（一轮可并行多个，真实模型的多 tool_calls 行为）
+		if len(resp.ToolCalls) > 0 {
+			// 先把 assistant 消息（含全部 tool_calls）写入历史——
+			// 真实 API 要求 assistant 的 tool_calls 数组先于各条 tool 结果出现，
+			// 且每条 tool 消息用 tool_call_id 关联。mock 读文本记录即可。
+			names := make([]string, 0, len(resp.ToolCalls))
+			for _, tc := range resp.ToolCalls {
+				names = append(names, tc.Name)
 			}
+			a.history = append(a.history, Message{
+				Role:      roleAssistant,
+				Content:   fmt.Sprintf("调用工具 %d 个: %s", len(resp.ToolCalls), strings.Join(names, ", ")),
+				ToolCalls: resp.ToolCalls,
+			})
 
-			if a.verbose {
-				log.Printf("[step %d] tool_call → %s(%s)", step, tc.Name, tc.Input)
-			}
-
-			// 2a-1.5 审批点（human-in-the-loop）：按风险分级决定走不走闸门。
-			//
-			// 流程：算本次最终风险（基础级别 + 参数修正）→ 低于阈值自动放行 →
-			// 达到阈值必须审批 → 拒绝计数，连续超限升级中止（软停止，不是 error）。
-			// fail-closed：达到阈值但没配 approver（或拒绝）→ 不执行工具。
-			risk := a.riskEvaluator.Evaluate(tc.Name, tc.Input, a.registry.BaseRiskOf(tc.Name))
-			if risk >= a.approvalThreshold {
-				approved := a.approver != nil && a.approver.Approve(tc.Name, tc.Input)
-				if !approved {
-					a.denials++
+			// 逐个处理：循环检测 → 审批点 → 执行 → 回填。
+			// 顺序执行（不并发）：工具可能共享状态/非线程安全，先保证正确性；
+			// 生产里的并行执行是优化，且需要每个工具声明并发安全。
+			for _, tc := range resp.ToolCalls {
+				// 2a-1. 循环检测：命中先警告、再犯中止
+				switch a.guard.guard(tc.Name, tc.Input) {
+				case guardWarn:
 					if a.verbose {
-						log.Printf("[step %d] ⛔ 审批拒绝（风险 %s，连续 %d 次）：%s(%s)", step, risk, a.denials, tc.Name, tc.Input)
+						log.Printf("[step %d] ⚠ 循环检测命中（重复调用 %s），该调用被停止", step, tc.Name)
 					}
-					// 升级兜底：连续被拒说明模型在反复越权，停止并交还用户
-					// （对应 Claude Code auto mode 的"3 次连续拒绝 → 升级给人"）。
-					// 这是软停止不是 error，调用方可以展示进度并接手指挥。
-					if a.denials >= a.denialLimit {
-						return RunResult{Steps: step, Status: StatusAborted,
-							Reason: fmt.Sprintf("审批升级：连续 %d 次高风险调用被拒绝，停止并交还人工", a.denials)}
-					}
-					// 拒绝结果以 tool 角色回填给模型（不是终止）：
-					// 模型看到"未授权"可以停止该动作、汇报进展或询问用户。
-					// 文案刻意反绕过：明确禁止"效果等价的替代操作"——真实模型
-					// 会把"换个方式达成同样目的"理解为合法路径（如删不掉就覆盖
-					// 清空），只有把路径②显式封死，才只留下安全分支。
-					// 若模型反复请求同一动作，循环检测（上方）也会先警告再中止兜底。
-					a.history = append(a.history, Message{
-						Role:       roleTool,
-						Content:    fmt.Sprintf("调用被拒绝：%s(%s)。用户未授权此操作。请停止该动作，不要尝试效果等价的其他操作或组合方式绕过审批；你可以汇报当前进展、说明受限原因，或询问用户。", tc.Name, tc.Input),
-						ToolCallID: tc.ID, // 真实 API 需要 tool 消息关联 tool_call_id
-					})
+					a.history = append(a.history,
+						Message{Role: roleSystem,
+							Content: fmt.Sprintf("检测到你重复调用工具 %s(%s) 且无进展。请换一种方式：改用其他工具、修改参数或直接给出最终回答。", tc.Name, tc.Input)},
+						// 该调用不执行，但补一条 tool 消息让 tool_calls 协议闭合（真实 API 要求）
+						Message{Role: roleTool, Content: "该调用因循环检测被停止，未执行。", ToolCallID: tc.ID},
+					)
 					continue
-				}
-				a.denials = 0 // 审批通过：模型收敛了，清空拒绝计数
-				if a.verbose {
-					log.Printf("[step %d] ✅ 审批通过（风险 %s）：%s(%s)", step, risk, tc.Name, tc.Input)
-				}
-			} else {
-				a.denials = 0 // 低风险自动放行：模型已换路径，清空拒绝计数
-			}
-
-			// 2a-2. 执行工具；失败不崩掉 loop，回填错误让模型自己决定，
-			// 但连续同参失败受重试预算约束（guard.retryHit）
-			out, err := a.registry.Call(tc.Name, tc.Input)
-			if err != nil {
-				if a.guard.retryHit(tc.Name, tc.Input) {
+				case guardAbort:
+					if a.verbose {
+						log.Printf("[step %d] ✗ 循环检测二次命中，中止", step)
+					}
 					return RunResult{Steps: step, Status: StatusAborted,
-						Reason: fmt.Sprintf("重试超预算：%s 连续失败超过 %d 次", tc.Name, a.guard.retryLimit)}
+						Reason: fmt.Sprintf("循环检测：重复调用 %s(%s) 且警告后无进展", tc.Name, tc.Input)}
 				}
-				out = fmt.Sprintf("工具调用失败: %v", err)
-			}
-			if a.verbose {
-				log.Printf("[step %d] tool_result ← %s", step, out)
-			}
 
-			a.history = append(a.history,
-				Message{Role: roleAssistant, Content: fmt.Sprintf("调用工具 %s", tc.Name), ToolCall: tc},
-				Message{Role: roleTool, Content: out, ToolCallID: tc.ID},
-			)
+				if a.verbose {
+					log.Printf("[step %d] tool_call → %s(%s)", step, tc.Name, tc.Input)
+				}
+
+				// 2a-1.5 审批点（human-in-the-loop）：按风险分级决定走不走闸门。
+				//
+				// 流程：算本次最终风险（基础级别 + 参数修正）→ 低于阈值自动放行 →
+				// 达到阈值必须审批 → 拒绝计数，连续超限升级中止（软停止，不是 error）。
+				// fail-closed：达到阈值但没配 approver（或拒绝）→ 不执行工具。
+				risk := a.riskEvaluator.Evaluate(tc.Name, tc.Input, a.registry.BaseRiskOf(tc.Name))
+				if risk >= a.approvalThreshold {
+					approved := a.approver != nil && a.approver.Approve(tc.Name, tc.Input)
+					if !approved {
+						a.denials++
+						if a.verbose {
+							log.Printf("[step %d] ⛔ 审批拒绝（风险 %s，连续 %d 次）：%s(%s)", step, risk, a.denials, tc.Name, tc.Input)
+						}
+						// 升级兜底：连续被拒说明模型在反复越权，停止并交还用户
+						// （对应 Claude Code auto mode 的"3 次连续拒绝 → 升级给人"）。
+						// 这是软停止不是 error，调用方可以展示进度并接手指挥。
+						if a.denials >= a.denialLimit {
+							return RunResult{Steps: step, Status: StatusAborted,
+								Reason: fmt.Sprintf("审批升级：连续 %d 次高风险调用被拒绝，停止并交还人工", a.denials)}
+						}
+						// 拒绝结果以 tool 角色回填给模型（不是终止）：
+						// 模型看到"未授权"可以停止该动作、汇报进展或询问用户。
+						// 文案刻意反绕过：明确禁止"效果等价的替代操作"——真实模型
+						// 会把"换个方式达成同样目的"理解为合法路径（如删不掉就覆盖
+						// 清空），只有把路径②显式封死，才只留下安全分支。
+						// 若模型反复请求同一动作，循环检测（上方）也会先警告再中止兜底。
+						a.history = append(a.history, Message{
+							Role:       roleTool,
+							Content:    fmt.Sprintf("调用被拒绝：%s(%s)。用户未授权此操作。请停止该动作，不要尝试效果等价的其他操作或组合方式绕过审批；你可以汇报当前进展、说明受限原因，或询问用户。", tc.Name, tc.Input),
+							ToolCallID: tc.ID, // 真实 API 需要 tool 消息关联 tool_call_id
+						})
+						continue
+					}
+					a.denials = 0 // 审批通过：模型收敛了，清空拒绝计数
+					if a.verbose {
+						log.Printf("[step %d] ✅ 审批通过（风险 %s）：%s(%s)", step, risk, tc.Name, tc.Input)
+					}
+				} else {
+					a.denials = 0 // 低风险自动放行：模型已换路径，清空拒绝计数
+				}
+
+				// 2a-2. 执行工具；失败不崩掉 loop，回填错误让模型自己决定，
+				// 但连续同参失败受重试预算约束（guard.retryHit）
+				out, err := a.registry.Call(tc.Name, tc.Input)
+				if err != nil {
+					if a.guard.retryHit(tc.Name, tc.Input) {
+						return RunResult{Steps: step, Status: StatusAborted,
+							Reason: fmt.Sprintf("重试超预算：%s 连续失败超过 %d 次", tc.Name, a.guard.retryLimit)}
+					}
+					out = fmt.Sprintf("工具调用失败: %v", err)
+				}
+				if a.verbose {
+					log.Printf("[step %d] tool_result ← %s", step, out)
+				}
+
+				a.history = append(a.history,
+					Message{Role: roleTool, Content: out, ToolCallID: tc.ID})
+			}
 			continue
 		}
 

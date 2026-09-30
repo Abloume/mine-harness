@@ -46,6 +46,11 @@ func MessagesTokens(msgs []Message) int {
 	total := 0
 	for _, m := range msgs {
 		total += EstimateTokens(m.Content)
+		// 工具调用参数也是上下文的一部分：assistant 的 tool_calls（结构化）
+		// 以及 tool 消息的输入都占用窗口——多 tool_call 场景下占比不小。
+		for _, tc := range m.ToolCalls {
+			total += EstimateTokens(tc.Name) + EstimateTokens(tc.Input)
+		}
 	}
 	return total
 }

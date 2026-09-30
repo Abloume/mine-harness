@@ -214,9 +214,13 @@ func (p *OpenAICompatibleProvider) doOnce(body []byte) (LLMResponse, error) {
 
 	m := cr.Choices[0].Message
 	if len(m.ToolCalls) > 0 {
-		tc := m.ToolCalls[0]
+		// 真实模型支持"一轮并行调用多个工具"（tool_calls 数组），全部透传给内核；
 		// arguments 是 JSON 字符串，直接透传给工具（mini-harness 工具输入约定）
-		return LLMResponse{ToolCall: &ToolCall{ID: tc.ID, Name: tc.Function.Name, Input: tc.Function.Arguments}}, nil
+		calls := make([]ToolCall, 0, len(m.ToolCalls))
+		for _, tc := range m.ToolCalls {
+			calls = append(calls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Input: tc.Function.Arguments})
+		}
+		return LLMResponse{ToolCalls: calls}, nil
 	}
 	return LLMResponse{Content: m.Content}, nil
 }
@@ -225,26 +229,26 @@ func (p *OpenAICompatibleProvider) doOnce(body []byte) (LLMResponse, error) {
 //
 // 关键转换：内核回填的 assistant 工具调用是自然语言文本（"调用工具 X"），
 // 真实协议要求 assistant 消息带 tool_calls 结构（含 id/name/arguments）——
-// 内核已把结构化记录放在 Message.ToolCall，这里优先读它；读不到才退回文本。
+// 内核已把结构化记录放在 Message.ToolCalls，这里优先读它；读不到才退回文本。
 func (p *OpenAICompatibleProvider) toChatMessages(msgs []Message) []chatMessage {
 	out := make([]chatMessage, 0, len(msgs))
 	for _, m := range msgs {
 		switch m.Role {
 		case roleAssistant:
-			if m.ToolCall != nil {
-				// 结构化工具调用：content 置 null（协议要求），带 tool_calls
-				out = append(out, chatMessage{
-					Role:    roleAssistant,
-					Content: nil,
-					ToolCalls: []toolCall{{
-						ID:   m.ToolCall.ID,
+			if len(m.ToolCalls) > 0 {
+				// 结构化工具调用（可多个）：content 置 null（协议要求），带全部 tool_calls
+				tcs := make([]toolCall, 0, len(m.ToolCalls))
+				for _, tc := range m.ToolCalls {
+					tcs = append(tcs, toolCall{
+						ID:   tc.ID,
 						Type: "function",
 						Function: functionCall{
-							Name:      m.ToolCall.Name,
-							Arguments: m.ToolCall.Input,
+							Name:      tc.Name,
+							Arguments: tc.Input,
 						},
-					}},
-				})
+					})
+				}
+				out = append(out, chatMessage{Role: roleAssistant, Content: nil, ToolCalls: tcs})
 				continue
 			}
 			// 普通 assistant 文本（最终回答）

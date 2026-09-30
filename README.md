@@ -23,7 +23,7 @@
 - [x] 上下文管理（token 预算 + 摘要压缩 + FIFO 兜底）— `internal/agent/context.go`（摘要器可替换为生成式 LLM 摘要）
 - [x] 循环检测 + 软停止（精确重复 N=2、滑动窗口 8 步、失败重试预算 3、分级响应）— `internal/agent/loop.go`
 - [x] 审批点（风险分级 L0-L3 + 参数感知 + 模型自动判断风险 LLMRiskEvaluator（只升不降）+ fail-closed 默认拒绝 + 拒绝回填 + 连续拒绝升级中止）— `internal/agent/approval.go`、`internal/agent/risk.go`
-- [x] 真实模型接入（OpenAI 兼容 Provider：智谱 BigModel / DeepSeek / 火山 Ark 通用，tool_call id 关联 + 结构化 tool_calls 协议适配）— `internal/agent/provider.go`
+- [x] 真实模型接入（OpenAI 兼容 Provider：智谱 BigModel / DeepSeek / 火山 Ark 通用，tool_call id 关联 + 结构化 tool_calls 协议适配 + **多 tool_call 并行调用支持** + 指数退避重试）— `internal/agent/provider.go`
 - [ ] 评测门（任务成功率、结构化判断）
 
 ## 当前进度（2026-09-30）
@@ -31,7 +31,8 @@
 第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval` 七个场景分别演示
 「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批」，
 前五个用 `MockLLM`（脚本化假模型）不依赖 API Key，后两个走真实智谱 GLM
-（OpenAI 兼容，需 `ZHIPU_API_KEY`，写入项目根 `.env`，已被 `.gitignore` 排除）。
+（OpenAI 兼容，需 `ZHIPU_API_KEY`，写入项目根 `.env`，已被 `.gitignore` 排除；
+模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`）。
 撞上限与循环命中均为"软停止"（返回带原因的 RunResult），
 不是 error——对齐生产 Agent 的"交还用户"语义。审批点采用风险分级：工具声明基础风险
 （`BaseRisk` L0-L3），风险由 `RiskEvaluator` 判定——静态/函数（参数感知）/模型
@@ -49,6 +50,10 @@
   `maxRisk(base, MEDIUM)`（宁多送审、勿漏审——不对称风险论）。
 - 真实模型判断存在输出方差：同一请求在不同运行可能给出不同级别，生产应换
   专用小模型/分类器 + 确定性输出约束（JSON mode / 低温度 / 多次采样）。
+- 多 tool_call（并行工具调用）：真实模型支持一轮返回多个 tool_calls，内核按
+  "1 条 assistant（带全部 tool_calls）+ N 条 tool 结果（各自 tool_call_id 关联）"
+  的协议回填；每个调用独立过循环检测/审批/执行，一个被拒不影响其他。
+  工具顺序执行（不并发）：生产并行执行需工具声明并发安全。
 
 token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 token，含局限说明见
 `internal/agent/context.go` 注释），单元测试见 `internal/agent/context_test.go`、
