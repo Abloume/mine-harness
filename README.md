@@ -18,11 +18,16 @@
 
 规划的能力（按学习顺序）：
 
-- [ ] agent loop（ReAct 风格主循环）
-- [ ] 工具注册与调用（function calling / 本地工具）
-- [ ] 上下文管理（token 预算、截断、摘要压缩）
+- [x] agent loop（ReAct 风格主循环）— `internal/agent/loop.go`
+- [x] 工具注册与调用（function calling / 本地工具）— `internal/agent/tools.go`
+- [x] 上下文管理（token 预算、FIFO 截断）— `internal/agent/context.go`（摘要压缩待升级）
 - [ ] 审批点（人工确认/自动放行）
 - [ ] 评测门（任务成功率、结构化判断）
+
+## 当前进度（2026-09-30）
+
+第一版已跑通：`go run .` 输出「工具调用 → 回填 → 最终回答」完整链路，
+模型层用 `MockLLM`（脚本化假模型），不依赖真实 API Key。
 
 ## 约定
 

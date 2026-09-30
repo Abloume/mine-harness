@@ -1,0 +1,76 @@
+// Package agent 实现一个最小 Agent 运行时内核（mini-harness）。
+//
+// 学习定位：这是"最小内核"练习，不是生产框架。生产请使用成熟运行时
+// （Agent Framework / LangGraph / Agent SDK 等）。
+// 注释中统一标注 JS/TS ↔ Go 差异点，便于前端转 Go 迁移学习。
+package agent
+
+import "fmt"
+
+// Message 表示对话中的一条消息。
+//
+// JS/TS ↔ Go 差异：TS 常用 discriminated union 表达角色
+// （type: 'user' | 'assistant' | 'tool'），Go 里用 string 常量 + 简单 struct，
+// 类型安全靠使用处的约定，缺少 TS 的编译期穷尽检查。
+type Message struct {
+	Role    string // user / assistant / tool / system
+	Content string
+}
+
+// ToolCall 表示模型请求调用某个工具。
+type ToolCall struct {
+	Name  string // 工具名
+	Input string // 输入，JSON 字符串（真实系统里会用 JSON Schema 做结构化校验）
+}
+
+// LLMResponse 是模型一次返回的结果：要么给一段文本，要么请求调用工具。
+//
+// JS/TS ↔ Go 差异：TS 常用联合类型 { text } | { toolCall }；
+// Go 用 struct + 指针字段，nil 表示"没有"，对应 TS 的 | null。
+type LLMResponse struct {
+	Content  string
+	ToolCall *ToolCall // 非 nil 表示本轮要调用工具
+}
+
+// LLM 是模型接入层接口，mini-harness 只依赖这个抽象，不关心底层是哪个模型。
+//
+// JS/TS ↔ Go 差异：TS 接口是结构类型、可 extends；Go interface 靠方法集
+// 隐式实现（鸭子类型），类型实现方法即自动满足接口，无需显式 implements。
+type LLM interface {
+	Chat(messages []Message, tools []Tool) (LLMResponse, error)
+}
+
+// MockDecision 描述 mock 模型"下一轮"的行为，用于精确控制演示走向。
+type MockDecision struct {
+	Content   string // 最终回答（与 ToolName 二选一）
+	ToolName  string // 本轮要调用的工具名（非空则优先走工具调用）
+	ToolInput string // 传给工具的 JSON 输入
+}
+
+// MockLLM 是一个可编程假模型：按脚本依次返回"先调用工具、再给答案"。
+// 它让 loop 在没有真实 API Key 的情况下完整跑通，是学习内核时的标准做法。
+type MockLLM struct {
+	steps []MockDecision
+	index int
+}
+
+// NewMockLLM 构造一个按 steps 顺序决策的假模型。
+func NewMockLLM(steps []MockDecision) *MockLLM {
+	return &MockLLM{steps: steps}
+}
+
+// Chat 实现 LLM 接口：按脚本顺序弹出一步。
+//
+// JS/TS ↔ Go 差异：JS 数组越界返回 undefined；Go 越界会 panic，
+// 所以必须先判断 index >= len(steps)，把"脚本耗尽"转成显式 error。
+func (m *MockLLM) Chat(messages []Message, tools []Tool) (LLMResponse, error) {
+	if m.index >= len(m.steps) {
+		return LLMResponse{}, fmt.Errorf("mock 脚本已耗尽（共 %d 步），loop 可能没有正常收敛", len(m.steps))
+	}
+	d := m.steps[m.index]
+	m.index++
+	if d.ToolName != "" {
+		return LLMResponse{ToolCall: &ToolCall{Name: d.ToolName, Input: d.ToolInput}}, nil
+	}
+	return LLMResponse{Content: d.Content}, nil
+}
