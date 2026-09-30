@@ -1,0 +1,32 @@
+# Binaries / build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+build/
+
+# Go
+vendor/
+coverage.out
+coverage.html
+
+# Node (possible TS comparison side-project)
+node_modules/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env / secrets
+.env
+.env.local
