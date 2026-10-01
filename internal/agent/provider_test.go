@@ -284,3 +284,84 @@ func TestProviderDoesNotRetryOn401(t *testing.T) {
 		t.Errorf("401 不应重试，实际尝试 %d 次", attempts)
 	}
 }
+
+// ---- thinking 开关（深度思考参数，非所有模型支持）----
+
+func TestProviderSendsThinkingDisabled(t *testing.T) {
+	// DisableThinking=true → 请求体带 thinking:{"type":"disabled"}
+	//（豆包 2.x / glm-4.7 系列用它关掉窄任务用不到的深度思考，省输出 token）。
+	var gotReq chatRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotReq)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	p := NewOpenAICompatibleProvider(srv.URL, "test-model", "test-key")
+	p.DisableThinking = true
+	if _, err := p.Chat([]Message{{Role: roleUser, Content: "hi"}}, nil); err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+	if gotReq.Thinking == nil || gotReq.Thinking.Type != "disabled" {
+		t.Errorf("应传 thinking:{type:disabled}，实际 %+v", gotReq.Thinking)
+	}
+}
+
+func TestProviderOmitsThinkingByDefault(t *testing.T) {
+	// 默认不传 thinking：参数非通用（DeepSeek 靠模型 ID、OpenAI 用
+	// reasoning_effort），塞给不支持的模型可能 400——默认不传最安全。
+	var gotReq chatRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotReq)
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	p := NewOpenAICompatibleProvider(srv.URL, "test-model", "test-key")
+	if _, err := p.Chat([]Message{{Role: roleUser, Content: "hi"}}, nil); err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+	if gotReq.Thinking != nil {
+		t.Errorf("默认不应传 thinking 字段，实际 %+v", gotReq.Thinking)
+	}
+}
+
+// ---- usage（OpenAI 兼容协议标准字段，各厂商通用）----
+
+func TestProviderParsesUsage(t *testing.T) {
+	// 服务端真实用量解析：usage 是触发上下文压缩的依据（比本地估算准，
+	// 包含角色/schema 等结构性开销）。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"content":"done"}}],"usage":{"prompt_tokens":120,"completion_tokens":45,"total_tokens":165}}`))
+	}))
+	defer srv.Close()
+
+	p := NewOpenAICompatibleProvider(srv.URL, "test-model", "test-key")
+	resp, err := p.Chat([]Message{{Role: roleUser, Content: "hi"}}, nil)
+	if err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+	if resp.Usage == nil {
+		t.Fatal("应解析出 usage")
+	}
+	if resp.Usage.PromptTokens != 120 || resp.Usage.CompletionTokens != 45 || resp.Usage.TotalTokens != 165 {
+		t.Errorf("usage 解析不符: %+v", resp.Usage)
+	}
+}
+
+func TestProviderHandlesMissingUsage(t *testing.T) {
+	// 个别模型/服务端可能不返回 usage（或返回 null）→ 不崩，Usage 为 nil。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"content":"done"}}]}`)) // 无 usage 字段
+	}))
+	defer srv.Close()
+
+	p := NewOpenAICompatibleProvider(srv.URL, "test-model", "test-key")
+	resp, err := p.Chat([]Message{{Role: roleUser, Content: "hi"}}, nil)
+	if err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+	if resp.Usage != nil {
+		t.Errorf("无 usage 时应为 nil，实际 %+v", resp.Usage)
+	}
+}

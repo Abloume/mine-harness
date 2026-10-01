@@ -162,6 +162,10 @@ type Agent struct {
 	summarizer  Summarizer
 	approver    Approver // 审批决策器（nil = 未启用，fail-closed 见 Run）
 
+	// lastUsageTokens 是最近一次模型响应的服务端真实 total_tokens
+	// （OpenAI 兼容协议 usage 字段；mock 无 usage 时为 0 → 回退本地估算触发压缩）
+	lastUsageTokens int
+
 	// 审批点分级配置：
 	riskEvaluator     RiskEvaluator // 算本次调用最终风险（基础 + 参数修正）
 	approvalThreshold RiskLevel     // 达到该级别才进审批闸门（低于则自动放行）
@@ -257,17 +261,43 @@ func (a *Agent) Run(task string) RunResult {
 
 	for step := 1; step <= a.maxSteps; step++ {
 		// 0. 上下文预算检查：超预算先做摘要压缩（context.go 的 CompactContext），
-		//    压缩不了才走 FIFO 兜底——对齐真实 harness 的 context compaction
-		var compacted bool
-		a.history, compacted = CompactContext(a.history, a.tokenBudget, a.summarizer)
-		if compacted && a.verbose {
-			log.Printf("[step %d] 上下文压缩：旧消息已压缩为摘要，当前 token=%d", step, MessagesTokens(a.history))
+		//    压缩不了才走 FIFO 兜底——对齐真实 harness 的 context compaction。
+		//    触发依据优先用**服务端真实 usage**（最近一次响应的 total_tokens，
+		//    OpenAI 兼容协议标准字段）：本地估算（MessagesTokens）漏掉角色标记、
+		//    工具 schema 等结构性开销，真实 API 计费更高（fast-agent 等行业实现
+		//    同样用服务端 usage 触发）。mock 模型不返回 usage → 回退本地估算兜底。
+		over := a.lastUsageTokens > a.tokenBudget
+		if a.lastUsageTokens == 0 {
+			over = MessagesTokens(a.history) > a.tokenBudget // mock 无 usage 时估算兜底
+		}
+		if over {
+			// 压缩目标：usage 触发时压到预算的 1/2——真实 usage 恒大于本地估算
+			// （角色/schema 等结构开销），只压到估算 ≤ 预算的话，下一轮真实
+			// usage 仍可能超；估算触发（mock）保持原预算即可。
+			target := a.tokenBudget
+			if a.lastUsageTokens > 0 {
+				target = a.tokenBudget / 2
+			}
+			a.history, _ = CompactContext(a.history, target, a.summarizer)
+			if a.verbose {
+				if a.lastUsageTokens > 0 {
+					log.Printf("[step %d] 上下文压缩：服务端 usage=%d > 预算 %d，压缩后估算 token=%d",
+						step, a.lastUsageTokens, a.tokenBudget, MessagesTokens(a.history))
+				} else {
+					log.Printf("[step %d] 上下文压缩：估算 token=%d > 预算 %d（mock 无 usage，估算兜底），压缩后估算 token=%d",
+						step, MessagesTokens(a.history), a.tokenBudget, MessagesTokens(a.history))
+				}
+			}
 		}
 
 		// 1. 调模型（把工具清单一起给它，对应 function calling 的 tools 参数）
 		resp, err := a.llm.Chat(a.history, a.registry.List())
 		if err != nil {
 			return RunResult{Steps: step, Status: StatusAborted, Reason: fmt.Sprintf("模型调用失败: %v", err)}
+		}
+		// 记录服务端真实用量：下一轮循环用它判断是否压缩（真实模型才有效）
+		if resp.Usage != nil {
+			a.lastUsageTokens = resp.Usage.TotalTokens
 		}
 
 		// 2a. 模型请求调用工具（一轮可并行多个，真实模型的多 tool_calls 行为）

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -30,12 +31,24 @@ import (
 // MaxTokens 控制单次输出预算：**混合思考模型（如 glm-4.7-flash）的 reasoning
 // 会先吃掉预算**，max_tokens 太小会导致 reasoning 没写完、content 为空——
 // 对"只输出一个级别名"这类短输出任务尤其致命（风险判断要用大预算）。
+//
+// DisableThinking 关闭深度思考（thinking:{"type":"disabled"}）：
+// **不是所有模型通用**——豆包 2.x、glm-4.7 系列支持该参数；DeepSeek 等
+// 靠模型 ID 区分思考/非思考（无参数开关）；OpenAI 用 reasoning_effort 且
+// 不能完全关闭。默认 false 不传（避免塞给不支持的模型导致 400）。
+// 摘要器 / 风险判断这类"窄任务"应开启：思考链（COT）计入输出 token 计费
+// （豆包输出单价是输入的 5 倍），关掉后输出成本可降 70~90%。
+//
+// Verbose 打印每次请求的 usage（prompt/completion/total）——usage 是
+// OpenAI 兼容协议的标准返回字段，对所有厂商通用，是"消耗可见"的观测点。
 type OpenAICompatibleProvider struct {
-	BaseURL   string // 例如 https://open.bigmodel.cn/api/paas/v4
-	Model     string // 例如 glm-4.7-flash（智谱免费模型）
-	APIKey    string
-	MaxTokens int // 0 = 不传 max_tokens，用服务端默认值
-	Client    *http.Client
+	BaseURL         string // 例如 https://open.bigmodel.cn/api/paas/v4
+	Model           string // 例如 glm-4.7-flash（智谱免费模型）
+	APIKey          string
+	MaxTokens       int  // 0 = 不传 max_tokens，用服务端默认值
+	DisableThinking bool // true = 传 thinking:{"type":"disabled"}（仅支持的模型）
+	Verbose         bool // true = 打印每次请求的 usage
+	Client          *http.Client
 }
 
 // NewOpenAICompatibleProvider 构造 Provider；baseURL 示例：
@@ -59,6 +72,13 @@ type chatRequest struct {
 	Messages  []chatMessage `json:"messages"`
 	Tools     []chatTool    `json:"tools,omitempty"` // 无工具时不传，部分 API 不接受空数组
 	MaxTokens *int          `json:"max_tokens,omitempty"`
+	Thinking  *thinkingParam `json:"thinking,omitempty"` // 深度思考模型专用（豆包2.x / glm-4.7）
+}
+
+// thinkingParam 是 OpenAI 兼容生态里"深度思考"的非标准扩展参数：
+// 方舟 / 智谱用 {"type":"disabled"} 关闭思考；DeepSeek 无此参数（靠模型 ID）。
+type thinkingParam struct {
+	Type string `json:"type"`
 }
 
 type chatMessage struct {
@@ -103,6 +123,16 @@ type chatResponse struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
+	Usage *Usage `json:"usage"` // 服务端真实用量；个别模型可能缺失（null）
+}
+
+// Usage 是 OpenAI 兼容协议的 token 用量统计（标准字段，各厂商通用）。
+// completion_tokens 包含思考模型的思维链（COT）输出——深度思考模型
+// 输出单价远高于输入（豆包 6 vs 30 元/百万），窄任务关 thinking 才有意义。
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 // ---- LLM 接口实现 ----
@@ -122,6 +152,7 @@ func (p *OpenAICompatibleProvider) Chat(messages []Message, tools []Tool) (LLMRe
 		Messages:  p.toChatMessages(messages),
 		Tools:     toChatTools(tools),
 		MaxTokens: intPtrOrNil(p.MaxTokens),
+		Thinking:  p.thinkingParam(),
 	})
 	if err != nil {
 		return LLMResponse{}, fmt.Errorf("构造请求体失败: %w", err)
@@ -135,6 +166,10 @@ func (p *OpenAICompatibleProvider) Chat(messages []Message, tools []Tool) (LLMRe
 		}
 		resp, err := p.doOnce(body)
 		if err == nil {
+			if p.Verbose && resp.Usage != nil {
+				log.Printf("[provider:%s] usage → prompt=%d completion=%d total=%d",
+					p.Model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens)
+			}
 			return resp, nil
 		}
 		lastErr = err
@@ -143,6 +178,17 @@ func (p *OpenAICompatibleProvider) Chat(messages []Message, tools []Tool) (LLMRe
 		}
 	}
 	return LLMResponse{}, fmt.Errorf("模型调用重试 %d 次仍失败: %w", maxAttempts, lastErr)
+}
+
+// thinkingParam 按 DisableThinking 生成 thinking 参数。
+// 仅部分厂商支持（豆包 2.x、glm-4.7 系列用 {"type":"disabled"} 关闭深度思考）；
+// DeepSeek 靠模型 ID 区分思考/非思考（无此参数）；OpenAI 用 reasoning_effort 且
+// 不能完全关闭。默认（false）不传——塞给不支持的模型可能被 400 拒绝。
+func (p *OpenAICompatibleProvider) thinkingParam() *thinkingParam {
+	if !p.DisableThinking {
+		return nil
+	}
+	return &thinkingParam{Type: "disabled"}
 }
 
 // intPtrOrNil 把 0 值转成 nil（omitempty 不传），避免"0 token"这种非法请求。
@@ -220,9 +266,9 @@ func (p *OpenAICompatibleProvider) doOnce(body []byte) (LLMResponse, error) {
 		for _, tc := range m.ToolCalls {
 			calls = append(calls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Input: tc.Function.Arguments})
 		}
-		return LLMResponse{ToolCalls: calls}, nil
+		return LLMResponse{ToolCalls: calls, Usage: cr.Usage}, nil
 	}
-	return LLMResponse{Content: m.Content}, nil
+	return LLMResponse{Content: m.Content, Usage: cr.Usage}, nil
 }
 
 // toChatMessages 做"内核消息 → OpenAI 协议消息"的适配。

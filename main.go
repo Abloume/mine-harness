@@ -730,9 +730,12 @@ func runDemoLLMCompact(verbose bool) {
 	})
 
 	// 摘要器：独立豆包实例（与主模型分离，生产应换小模型）。
-	// MaxTokens 必须给足（2048）：豆包 2.x 是混合思考模型，max_tokens 太小
-	// 会让 reasoning 吃光预算、content 为空 → 摘要失败回退 FIFO——
-	// 与风险判断 Provider 的踩坑完全一致（见 README）。
+	// DisableThinking=true：摘要是"窄任务"，不需要深度思考——豆包 2.x 的
+	// 思考链（COT）计入输出 token（单价是输入的 5 倍），关掉后输出成本
+	// 降 70~90%（thinking 参数非通用，仅豆包/智谱系列支持，见 provider.go）。
+	// MaxTokens 必须给足（2048）：混合思考模型 max_tokens 太小会让 reasoning
+	// 吃光预算、content 为空 → 摘要失败回退 FIFO（README 有完整踩坑记录）。
+	// Verbose=true：打印每次摘要请求的服务端 usage（真实消耗可见）。
 	model := os.Getenv("DOUBAO_MODEL")
 	if model == "" {
 		model = "doubao-seed-2-1-lite-260915"
@@ -743,6 +746,8 @@ func runDemoLLMCompact(verbose bool) {
 		key,
 	)
 	summLLM.MaxTokens = 2048
+	summLLM.DisableThinking = true // 窄任务：关思考，省输出 token
+	summLLM.Verbose = verbose      // 打印服务端 usage（prompt/completion/total）
 
 	// 预算 650：历史积累到第 6 步超预算（约 700）→ 触发 1 次生成式压缩（1 次豆包调用）。
 	// 注意：预算若设太小会让 CompactContext 反复压缩、每次调一次摘要模型；

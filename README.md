@@ -71,16 +71,40 @@
   并发安全声明把责任交给工具实现方）。`-demo parallel` 演示 3 个 400ms
   调用并行约 0.4s 完成。
 - 生成式 LLM 摘要器（`LLMSummarizer`）：实现 `Summarizer` 接口，把旧消息交给
-  真实模型写摘要（可插拔替换默认抽取式）。两个配套踩坑：
+  真实模型写**结构化摘要**（6 段式，对齐 Claude Code 的 9 段 compaction：
+  任务目标/已执行动作/已完成/失败与问题/未完成与待办/用户约束——结构化比
+  自由摘要信息密度高、后续模型更容易续接，是生产框架的标准做法）。
+  两个配套踩坑：
   ① **thinking 模型 max_tokens 同坑**：豆包 2.x 是混合思考模型，摘要器
   `MaxTokens` 设太小（如 120/200）会让 reasoning 吃光预算、`content` 为空 →
   摘要失败全部回退 FIFO（`-demo llm-compact` 一度摘要从未插入就是这个原因），
   必须给足（2048）；② **收敛护栏**：生成式摘要输出长度不可控，若摘要比它
   替换的旧批次还大，`CompactContext` 的 while 循环会永不收敛（token 不降、
-  每轮调一次模型 → 死循环）。修复：摘要不比原文小就回退 FIFO 丢弃
-  （`context.go` 的 `CompactContext`），保证循环必然收敛。另外预算不宜设
-  得太小：会触发反复压缩、每次压缩多一次模型调用（`-demo llm-compact`
-  预算 650 在 6 步后触发 1 次压缩，摘要稳定插入）。
+  每轮调一次模型 → 死循环，实测 12 分钟烧掉数万 token）。修复：摘要不比
+  原文小就回退 FIFO 丢弃（`context.go` 的 `CompactContext`），保证循环必然
+  收敛。另外预算不宜设得太小：会触发反复压缩、每次压缩多一次模型调用
+  （`-demo llm-compact` 预算 650 在 6 步后触发 1 次压缩，摘要稳定插入）。
+- **窄任务关 thinking（豆包 2.x / glm-4.7 等深度思考模型）**：思考链（COT）
+  计入输出 token 计费，且输出单价是输入的 5 倍（豆包 6 vs 30 元/百万）——
+  摘要、风险判断这类"窄任务"用不到深度思考，`thinking:{"type":"disabled"}`
+  关掉后输出成本降 70~90%（`-demo llm-compact` 实测 completion 从 1000+ 级
+  降到 133）。**注意：thinking 参数非所有模型通用**——DeepSeek 靠模型 ID 区分
+  （deepseek-reasoner / deepseek-chat，无参数开关）；OpenAI 用 reasoning_effort
+  且不能完全关闭。Provider 默认不传该参数（`DisableThinking=false`），避免塞给
+  不支持的模型被 400 拒绝。
+- **usage（服务端真实用量）触发压缩**：`usage` 是 OpenAI 兼容协议标准字段
+  （prompt/completion/total_tokens，各厂商通用），Provider 解析后随
+  `LLMResponse.Usage` 回传并可选打印（`Verbose=true`）——本地估算
+  （`EstimateTokens`）漏掉角色标记、工具 schema 等结构性开销，真实计费恒大于
+  估算；压缩触发**优先用服务端 usage**（fast-agent 等行业实现同此），mock 无
+  usage 时估算兜底。usage 触发时压缩目标取预算 1/2（覆盖结构开销，避免
+  "压完仍超"）。
+- **上下文缓存红利（免费）**：`doubao-seed-2.0+` 支持隐式上下文缓存，重复前缀
+  （system、工具 schema、早期历史）命中后输入单价降 5 倍（6→1.2 元/百万）——
+  harness 每轮重发相同前缀，天然受益；保持消息顺序稳定即可，无需额外配置。
+  免费额度统计口径 = 输入 + 输出（含思考链），安心体验模式下额度耗尽自动
+  暂停、不会扣费（13 万 token 教训：死循环调试 + 思考模型 COT + 压缩过频，
+  三者叠加瞬间烧掉 1/4 免费额度）。
 - 评测门：任务集 + 判定器分离（`internal/eval`）。RuleJudge（确定性规则：必调工具/
   参数级安全判据/回答子串）零成本可复现；LLMJudge（LLM-as-judge）输出结构化 JSON
   （passed/reason），失败或解析不了判负（评测也 fail-closed）；判定基于完整轨迹

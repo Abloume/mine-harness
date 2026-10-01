@@ -382,3 +382,60 @@ func errorsNew(s string) error { return &testError{s} }
 type testError struct{ s string }
 
 func (e *testError) Error() string { return e.s }
+
+// ---- 服务端 usage 触发压缩 ----
+
+// usageLLM 是带服务端用量信息的 stub：前 toolRounds 次返回工具调用
+// （让历史累积），之后返回最终回答；每次都带同一份 usage（模拟真实模型的 usage）。
+type usageLLM struct {
+	calls      int
+	toolRounds int
+	usage      *Usage
+}
+
+func (u *usageLLM) Chat(messages []Message, tools []Tool) (LLMResponse, error) {
+	u.calls++
+	if u.calls <= u.toolRounds {
+		return LLMResponse{ToolCalls: []ToolCall{{ID: "c1", Name: "get_weather", Input: `{}`}}, Usage: u.usage}, nil
+	}
+	return LLMResponse{Content: "done", Usage: u.usage}, nil
+}
+
+// TestCompactTriggersOnServerUsage 验证：压缩触发优先用**服务端真实 usage**
+// （total_tokens），而非本地估算——本地估算漏掉角色/schema 等结构性开销，
+// 可能"估算没超但真实已超"。这里历史估算（约 100+）低于预算 180，但服务端
+// usage=9999 远超 → 必须触发压缩（且压缩目标为预算一半，覆盖结构开销）。
+func TestCompactTriggersOnServerUsage(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(Tool{
+		Name:     "get_weather",
+		BaseRisk: RiskNone,
+		Execute: func(input string) (string, error) {
+			return strings.Repeat("天气很好", 10), nil // 工具结果约 30 token，让历史够大
+		},
+	})
+
+	llm := &usageLLM{toolRounds: 2, usage: &Usage{TotalTokens: 9999}}
+	a := NewAgent(llm, reg,
+		WithMaxSteps(6),
+		WithTokenBudget(180), // 本地估算(约100~140) < 180，但 usage 9999 > 180
+		// 短摘要器：确保摘要比被压批次小、走"插入摘要"路径（否则回退 FIFO
+		// 就观察不到【历史摘要】——那测的是收敛护栏，不是 usage 触发）
+		WithSummarizer(&HeuristicSummarizer{MaxLenPerMsg: 10}),
+	)
+	res := a.Run("查天气")
+	if res.Status != StatusCompleted {
+		t.Fatalf("应 completed，实际 %s（%s）", res.Status, res.Reason)
+	}
+
+	// 第 2 轮起必须压缩：历史里出现【历史摘要】（usage 触发，与估算无关）
+	seen := false
+	for _, m := range a.history {
+		if strings.Contains(m.Content, "【历史摘要】") {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Error("服务端 usage 超预算时应触发压缩（出现【历史摘要】）")
+	}
+}

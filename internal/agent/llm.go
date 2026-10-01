@@ -38,11 +38,16 @@ type ToolCall struct {
 
 // LLMResponse 是模型一次返回的结果：要么给一段文本，要么请求调用一个或多个工具。
 //
+// Usage 是服务端返回的真实 token 用量（OpenAI 兼容协议标准字段，各厂商通用）；
+// mock 模型没有该数据（nil）——内核用"服务端 usage 优先、本地估算兜底"
+// 的方式触发上下文压缩（见 loop.go）。
+//
 // JS/TS ↔ Go 差异：TS 常用联合类型 { text } | { toolCall: ToolCall[] }；
 // Go 用 struct + slice 字段，len==0 表示"没有"，对应 TS 的空数组。
 type LLMResponse struct {
 	Content   string
 	ToolCalls []ToolCall // 非空表示本轮要调用工具（可为多个）
+	Usage     *Usage     // 服务端真实 token 用量（mock 为 nil）
 }
 
 // LLM 是模型接入层接口，mini-harness 只依赖这个抽象，不关心底层是哪个模型。
