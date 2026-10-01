@@ -1,6 +1,9 @@
 package agent
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // 本文件是"上下文管理"的实现：token 估算 + FIFO 兜底 + 摘要压缩（compaction）。
 //
@@ -97,11 +100,77 @@ func (s *HeuristicSummarizer) Summarize(msgs []Message) (string, error) {
 	return b.String(), nil
 }
 
+// LLMSummarizer 是生成式摘要器：把一批旧消息交给 LLM 生成浓缩摘要。
+//
+// 与 HeuristicSummarizer（抽取式、零成本、确定性）相对：生成式摘要质量更高、
+// 更紧凑（能跨消息归纳），代价是每次压缩多一次模型调用——生产里应给摘要器
+// 配独立的小模型/专用摘要模型，避免占用主 agent 的模型预算（与
+// LLMRiskEvaluator 的"专用小模型"思路一致）。
+type LLMSummarizer struct {
+	llm             LLM    // 摘要用的模型（可与主 agent 同实例或独立实例）
+	maxSourceTokens int    // 喂给摘要模型的输入预算：超了先丢最旧（防摘要器自身撑爆窗口）
+	prompt          string // 摘要指令模板
+}
+
+// NewLLMSummarizer 构造生成式摘要器。默认输入预算 1500 token（够覆盖
+// 一批工具结果），prompt 要求中文、200 字内、不得编造。
+func NewLLMSummarizer(llm LLM) *LLMSummarizer {
+	return &LLMSummarizer{
+		llm:             llm,
+		maxSourceTokens: 1500,
+		prompt: "你是对话历史压缩器。把下面对话压缩成一段简明摘要，保留：任务目标、已执行的工具及关键结果、未完成的待办、用户的关键要求。用中文，不超过 200 字，不得编造未出现的信息。\n\n对话：\n",
+	}
+}
+
+// Summarize 实现 Summarizer 接口。
+//
+// 递归风险：摘要器内部也要调 LLM，若把超长历史原样喂进去，摘要器自己就会
+// 撑爆窗口——所以按 maxSourceTokens 从"最新消息"反向累积、预算封顶
+// （预算内保留最新信息，与 TrimContext 的 FIFO 语义一致，且细化到单条级别：
+// 单条本身超预算的消息宁可跳过也不截半截）。LLM 失败时返回 error，
+// 由 CompactContext 兜底 FIFO（不崩 loop）。
+func (s *LLMSummarizer) Summarize(msgs []Message) (string, error) {
+	// 1. 从最新往前收集，控制喂给模型的输入总量
+	//    （TrimContext 只能整条丢，单条超预算会漏网；这里逐条判定更细）
+	var lines []string
+	total := EstimateTokens(s.prompt)
+	for i := len(msgs) - 1; i >= 0; i-- {
+		line := msgs[i].Role + ": " + msgs[i].Content + "\n"
+		if total+EstimateTokens(line) > s.maxSourceTokens {
+			break // 再加就超预算：丢弃这条及更旧的（宁缺毋滥，防撑爆）
+		}
+		lines = append(lines, line)
+		total += EstimateTokens(line)
+	}
+
+	// 2. 反序写回（保持时间顺序：prompt + 最早的可行消息 → 最新消息）
+	var b strings.Builder
+	b.WriteString(s.prompt)
+	for i := len(lines) - 1; i >= 0; i-- {
+		b.WriteString(lines[i])
+	}
+
+	// 3. 调 LLM 生成摘要（tools 传 nil：摘要不是工具调用场景）
+	resp, err := s.llm.Chat([]Message{{Role: roleUser, Content: b.String()}}, nil)
+	if err != nil {
+		return "", fmt.Errorf("生成式摘要失败: %w", err)
+	}
+	if strings.TrimSpace(resp.Content) == "" {
+		return "", fmt.Errorf("生成式摘要返回空内容")
+	}
+	return resp.Content, nil
+}
+
 // CompactContext 上下文压缩：超预算时，把最早的一批"非首条"消息压缩成
 // 一条摘要消息放回历史；仍超预算则继续压缩下一批；最终兜底用 FIFO 丢弃。
 // 返回值中 compacted 表示本轮是否发生过压缩（供调用方打 trace）。
 //
 // 约定：第 0 条是 system 指令，永不被压缩/丢弃。
+//
+// 收敛保证：摘要消息若不比它替换的旧批次更小（生成式摘要器输出长度
+// 不可控，可能超预算），插入摘要反而会让循环永不收敛——此时回退为
+// FIFO 直接丢弃该批（token 必然下降）。这是生成式摘要的配套护栏：
+// 抽取式摘要（Heuristic）天然收敛，生成式必须显式防死循环。
 //
 // JS/TS ↔ Go 差异：切片 msgs[1:1+k] 是取子切片（引用原数组），
 // 对应 JS 的 slice(1, 1+k)。Go 切片是视图，拼接新数组时用 append 组合。
@@ -116,6 +185,7 @@ func CompactContext(msgs []Message, budget int, s Summarizer) ([]Message, bool) 
 		k := max(1, n/2) // Go 1.21+ 内置 max
 
 		old := msgs[1 : 1+k]
+		before := MessagesTokens(old)
 		summary, err := s.Summarize(old)
 		if err != nil {
 			// 摘要失败：兜底 FIFO，直接丢这一批
@@ -125,8 +195,15 @@ func CompactContext(msgs []Message, budget int, s Summarizer) ([]Message, bool) 
 		}
 
 		// 用一条"摘要消息"替换这批旧消息（角色标记为 system，前缀注明是摘要）
-		merged := append([]Message{msgs[0]},
-			Message{Role: roleSystem, Content: "【历史摘要】\n" + summary})
+		sumMsg := Message{Role: roleSystem, Content: "【历史摘要】\n" + summary}
+		if MessagesTokens([]Message{sumMsg}) >= before {
+			// 摘要不比原文小：插入不收敛（如生成式摘要器输出超长），
+			// 回退 FIFO 丢弃，保证循环必然收敛
+			msgs = append(msgs[:1], msgs[1+k:]...)
+			compacted = true
+			continue
+		}
+		merged := append([]Message{msgs[0]}, sumMsg)
 		merged = append(merged, msgs[1+k:]...)
 		msgs = merged
 		compacted = true

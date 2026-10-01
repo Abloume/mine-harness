@@ -1,5 +1,5 @@
-// mine-harness 入口：十三个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | doubao | doubao-approval
+// mine-harness 入口：十四个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval
 package main
 
 import (
@@ -14,7 +14,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | doubao | doubao-approval")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -39,6 +39,8 @@ func main() {
 		runDemoSkillB(*verbose)
 	case "parallel":
 		runDemoParallel(*verbose)
+	case "llm-compact":
+		runDemoLLMCompact(*verbose)
 	case "doubao":
 		runDemoDoubao(*verbose)
 	case "doubao-approval":
@@ -683,6 +685,82 @@ func runDemoParallel(verbose bool) {
 
 	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(4), agent.WithVerbose(verbose))
 	showResult(a.Run("同时查北京、上海、杭州三城天气并汇总"))
+}
+
+// runDemoLLMCompact 演示生成式 LLM 摘要器：
+// 主模型用 MockLLM（脚本化，不依赖 API Key），摘要器换成真实豆包——
+// 上下文超预算时，把旧消息交给豆包写摘要（而非启发式截断拼接），
+// 历史里出现"【历史摘要】+ 豆包生成的浓缩文本"。
+// 需要 ARK_API_KEY（复用豆包接入）；生产里摘要器应配独立小模型。
+func runDemoLLMCompact(verbose bool) {
+	loadEnv(".env")
+	key := os.Getenv("ARK_API_KEY")
+	if key == "" {
+		fmt.Println("缺少 ARK_API_KEY：export ARK_API_KEY=xxx 或写入项目根 .env（已被 git 忽略）")
+		return
+	}
+
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:     "get_weather",
+		Description: "查询指定城市的当前天气（返回详细预报）",
+		BaseRisk: agent.RiskNone,
+		Execute: func(input string) (string, error) {
+			city := "未知"
+			for _, c := range []string{"北京", "上海", "杭州", "广州", "深圳"} {
+				if strings.Contains(input, c) {
+					city = c
+					break
+				}
+			}
+			// 模拟较长的工具结果（如 API 返回的完整天气 JSON），让历史快速膨胀
+			return fmt.Sprintf(`{"city":"%s","weather":"晴转多云","temp":22,"wind":"3级东南风","humidity":45,"aqi":72,"summary":"%s今天白天晴转多云，午后体感舒适，适合户外活动，夜间最低温18度，早晨有轻雾能见度一般，出行注意安全，建议添一件薄外套，明天转为多云。"}`, city, city), nil
+		},
+	})
+
+	// 主模型脚本：连续查 6 个城市（参数在变，不触发循环检测），历史逐步膨胀
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "get_weather", ToolInput: `{"city":"北京"}`},
+		{ToolName: "get_weather", ToolInput: `{"city":"上海"}`},
+		{ToolName: "get_weather", ToolInput: `{"city":"杭州"}`},
+		{ToolName: "get_weather", ToolInput: `{"city":"广州"}`},
+		{ToolName: "get_weather", ToolInput: `{"city":"深圳"}`},
+		{ToolName: "get_weather", ToolInput: `{"city":"成都"}`},
+		{Content: "六城天气已汇总：北京晴、上海多云、杭州有雨、广州晴热、深圳阵雨、成都阴。"},
+	})
+
+	// 摘要器：独立豆包实例（与主模型分离，生产应换小模型）。
+	// MaxTokens 必须给足（2048）：豆包 2.x 是混合思考模型，max_tokens 太小
+	// 会让 reasoning 吃光预算、content 为空 → 摘要失败回退 FIFO——
+	// 与风险判断 Provider 的踩坑完全一致（见 README）。
+	model := os.Getenv("DOUBAO_MODEL")
+	if model == "" {
+		model = "doubao-seed-2-1-lite-260915"
+	}
+	summLLM := agent.NewOpenAICompatibleProvider(
+		"https://ark.cn-beijing.volces.com/api/v3",
+		model,
+		key,
+	)
+	summLLM.MaxTokens = 2048
+
+	// 预算 650：历史积累到第 6 步超预算（约 700）→ 触发 1 次生成式压缩（1 次豆包调用）。
+	// 注意：预算若设太小会让 CompactContext 反复压缩、每次调一次摘要模型；
+	// 且生成式摘要输出长度不可控——内核有"摘要不比原文小就回退 FIFO"的
+	// 收敛护栏（context.go），不会因长摘要死循环。
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(8),
+		agent.WithTokenBudget(650),
+		agent.WithSummarizer(agent.NewLLMSummarizer(summLLM)),
+		agent.WithVerbose(verbose))
+	res := a.Run("分别查北京、上海、杭州、广州、深圳、成都的天气并汇总")
+	// 展示生成式摘要的实际产出（豆包写的浓缩文本）
+	for _, m := range a.History() {
+		if strings.HasPrefix(m.Content, "【历史摘要】") {
+			fmt.Printf("\n--- 豆包生成的摘要 ---\n%s\n", m.Content)
+		}
+	}
+	showResult(res)
 }
 
 // showResult 统一打印 RunResult（completed / aborted 都按"结果"展示，不当作异常）。

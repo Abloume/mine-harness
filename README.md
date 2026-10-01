@@ -20,7 +20,7 @@
 
 - [x] agent loop（ReAct 风格主循环）— `internal/agent/loop.go`
 - [x] 工具注册与调用（function calling / 本地工具）— `internal/agent/tools.go`
-- [x] 上下文管理（token 预算 + 摘要压缩 + FIFO 兜底）— `internal/agent/context.go`（摘要器可替换为生成式 LLM 摘要）
+- [x] 上下文管理（token 预算 + 摘要压缩 + FIFO 兜底 + **生成式 LLM 摘要器**）— `internal/agent/context.go`（`Summarizer` 接口可插拔：默认抽取式 `HeuristicSummarizer`，`LLMSummarizer` 调真实模型写摘要；**收敛护栏**——摘要不比被压批次小就回退 FIFO，防生成式摘要死循环；`-demo llm-compact` 用豆包做真实摘要）
 - [x] 循环检测 + 软停止（精确重复 N=2、滑动窗口 8 步、失败重试预算 3、分级响应）— `internal/agent/loop.go`
 - [x] 审批点（风险分级 L0-L3 + 参数感知 + 模型自动判断风险 LLMRiskEvaluator（只升不降）+ fail-closed 默认拒绝 + 拒绝回填 + 连续拒绝升级中止）— `internal/agent/approval.go`、`internal/agent/risk.go`
 - [x] 真实模型接入（OpenAI 兼容 Provider：智谱 BigModel / DeepSeek / 火山 Ark 通用，tool_call id 关联 + 结构化 tool_calls 协议适配 + **多 tool_call 并行调用支持** + 指数退避重试）— `internal/agent/provider.go`
@@ -32,8 +32,8 @@
 
 ## 当前进度（2026-10-01）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | doubao | doubao-approval` 十三个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批」，
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval` 十四个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批」，
 前六个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
 
 - **智谱**：需 `ZHIPU_API_KEY`，写入项目根 `.env`（已被 `.gitignore` 排除）；模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`。
@@ -70,6 +70,17 @@
   声明（JS/TS 无共享内存并发，不需要这个概念；Go 里 goroutine 共享内存，
   并发安全声明把责任交给工具实现方）。`-demo parallel` 演示 3 个 400ms
   调用并行约 0.4s 完成。
+- 生成式 LLM 摘要器（`LLMSummarizer`）：实现 `Summarizer` 接口，把旧消息交给
+  真实模型写摘要（可插拔替换默认抽取式）。两个配套踩坑：
+  ① **thinking 模型 max_tokens 同坑**：豆包 2.x 是混合思考模型，摘要器
+  `MaxTokens` 设太小（如 120/200）会让 reasoning 吃光预算、`content` 为空 →
+  摘要失败全部回退 FIFO（`-demo llm-compact` 一度摘要从未插入就是这个原因），
+  必须给足（2048）；② **收敛护栏**：生成式摘要输出长度不可控，若摘要比它
+  替换的旧批次还大，`CompactContext` 的 while 循环会永不收敛（token 不降、
+  每轮调一次模型 → 死循环）。修复：摘要不比原文小就回退 FIFO 丢弃
+  （`context.go` 的 `CompactContext`），保证循环必然收敛。另外预算不宜设
+  得太小：会触发反复压缩、每次压缩多一次模型调用（`-demo llm-compact`
+  预算 650 在 6 步后触发 1 次压缩，摘要稳定插入）。
 - 评测门：任务集 + 判定器分离（`internal/eval`）。RuleJudge（确定性规则：必调工具/
   参数级安全判据/回答子串）零成本可复现；LLMJudge（LLM-as-judge）输出结构化 JSON
   （passed/reason），失败或解析不了判负（评测也 fail-closed）；判定基于完整轨迹
