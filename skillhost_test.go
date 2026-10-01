@@ -81,3 +81,44 @@ func TestSplitTags(t *testing.T) {
 		}
 	}
 }
+
+// TestDirSkillProviderLoadReference 验证 L3 宿主读取：正常命中返回引用正文；
+// 目录穿越（../ 或绝对路径）一律拒绝；未知技能/未知引用返回 ok=false。
+func TestDirSkillProviderLoadReference(t *testing.T) {
+	root := t.TempDir()
+	writeSkillFile(t, root, "example", `---
+name: file-ops-policy
+description: 安全规范
+---
+# 正文
+删除前读取 references/safety.md`)
+	// 引用文件在技能目录内
+	if err := os.MkdirAll(filepath.Join(root, "example", "references"), 0o755); err != nil {
+		t.Fatalf("建 references 目录失败: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "example", "references", "safety.md"), []byte("# 检查清单\n1. 已备份"), 0o644); err != nil {
+		t.Fatalf("写引用文件失败: %v", err)
+	}
+
+	p := newDirSkillProvider(root)
+
+	body, ok := p.LoadReference("file-ops-policy", "references/safety.md")
+	if !ok || !strings.Contains(body, "1. 已备份") {
+		t.Errorf("正常引用应命中, ok=%v body=%q", ok, body)
+	}
+
+	// 目录穿越：../ 和绝对路径必须拒绝
+	for _, bad := range []string{"../outside.md", "/etc/passwd", "references/../../x.md"} {
+		if _, ok := p.LoadReference("file-ops-policy", bad); ok {
+			t.Errorf("危险引用 %q 应被拒绝", bad)
+		}
+	}
+
+	// 未知技能 / 未知引用
+	if _, ok := p.LoadReference("ghost", "references/safety.md"); ok {
+		t.Error("未知技能应返回 ok=false")
+	}
+	if _, ok := p.LoadReference("file-ops-policy", "references/nope.md"); ok {
+		t.Error("未知引用应返回 ok=false")
+	}
+}

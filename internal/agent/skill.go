@@ -59,20 +59,29 @@ func SkillAsTool(s Skill) Tool {
 // 而不是当作普通工具结果回填。
 const LoadSkillToolName = "load_skill"
 
+// ReadSkillRefToolName 是 L3 的特殊工具名（保留名）：按需读取已加载技能的
+// 附属资源（references/xxx.md、模板、示例等），正文注入 system。
+const ReadSkillRefToolName = "read_skill_ref"
+
 // SkillProvider 负责 Skill 的发现与正文读取（宿主实现）。
 //
 // 边界（README 约定）：机制归内核（internal/agent），目录扫描/解析归宿主。
 // 内核只依赖这个接口，不关心 skill 存在哪、怎么解析——测试里用 stub，
 // 生产里用目录扫描/数据库/远程仓库。
 //
-// 渐进式披露的两层都在这：List() 是常驻 metadata（第一层，模型先"看目录"），
-// LoadSkill() 是按需正文（第二层，选中后才取全文）。
+// 渐进式披露的三层都在这：List() 是常驻 metadata（第一层，模型先"看目录"），
+// LoadSkill() 是按需正文（第二层，选中后才取全文），LoadReference() 是
+// 按需附属资源（第三层，正文指示"需要 X 时"再取 references/X.md）。
 type SkillProvider interface {
 	// List 返回全部可用技能的常驻元数据——随 load_skill 工具描述发给模型，
 	// 模型据此决定加载哪个技能（对应 Agent Skills 的 metadata 常驻）。
 	List() []SkillMeta
 	// LoadSkill 返回技能正文（如 SKILL.md 全文）；未找到返回 (ok=false)。
 	LoadSkill(name string) (body string, ok bool)
+	// LoadReference 返回技能附属资源正文（L3，如 references/safety.md）；
+	// 未找到返回 (ok=false)。refPath 必须是技能目录内的相对路径
+	// （宿主应拒绝绝对路径与 .. 穿越）。
+	LoadReference(skillName, refPath string) (body string, ok bool)
 }
 
 // SkillMeta 是技能的常驻元数据（第一层）。正文不进这里——正文太重，
@@ -137,4 +146,35 @@ func parseLoadSkillInput(input string) string {
 		return ""
 	}
 	return strings.Trim(input, `"'`)
+}
+
+// NewReadSkillRefTool 返回 L3 特殊工具：按需读取已加载技能的附属资源。
+// 宿主注册它，模型才知道"正文里提到的 references/X.md 可以进一步加载"。
+// BaseRisk 给 None：读规范附属资源是只读、无副作用操作。
+// Execute 是占位：真实处理由 Agent.Run 按 ReadSkillRefToolName 拦截。
+func NewReadSkillRefTool() Tool {
+	return Tool{
+		Name:        ReadSkillRefToolName,
+		Description: "读取已加载技能规范引用的附属资源（references/xxx.md、模板、示例）。参数是 JSON：{\"skill\":\"技能名\",\"ref\":\"引用路径\"}。必须先加载技能，再读取其引用。",
+		BaseRisk:    RiskNone,
+		Execute: func(input string) (string, error) {
+			return "", fmt.Errorf("read_skill_ref 应由内核特殊处理，不应走到普通工具执行")
+		},
+	}
+}
+
+// parseReadSkillRefInput 从 read_skill_ref 参数提取 (技能名, 引用路径)。
+// 只接受 JSON：{"skill":"x","ref":"references/y.md"}——两个字段缺一不可。
+func parseReadSkillRefInput(input string) (skill, ref string, ok bool) {
+	input = strings.TrimSpace(input)
+	var m map[string]string
+	if json.Unmarshal([]byte(input), &m) != nil {
+		return "", "", false
+	}
+	skill = strings.TrimSpace(m["skill"])
+	ref = strings.TrimSpace(m["ref"])
+	if skill == "" || ref == "" {
+		return "", "", false
+	}
+	return skill, ref, true
 }

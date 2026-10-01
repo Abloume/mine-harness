@@ -157,6 +157,7 @@ type Agent struct {
 	// B 方案真渐进式 Skill：load_skill 特殊通道 + system 注入。
 	skillProvider SkillProvider     // 宿主提供的技能发现器（nil = 未启用 B 方案）
 	loadedSkills  map[string]bool   // 已注入过的技能名（去重：同一规范只进一次上下文）
+	loadedRefs    map[string]bool   // 已注入过的引用 key（"skill/ref" 去重）
 
 	history []Message
 }
@@ -217,6 +218,7 @@ func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 		approvalThreshold: RiskMedium, // 默认：Medium 及以上需要审批
 		denialLimit:       3,
 		loadedSkills:      map[string]bool{},
+		loadedRefs:        map[string]bool{},
 	}
 	for _, o := range opts {
 		o(a)
@@ -345,6 +347,13 @@ func (a *Agent) Run(task string) RunResult {
 					continue
 				}
 
+				// 2a-1.8 L3 按需引用：read_skill_ref 同属特殊通道——
+				// 只读已加载技能的附属资源，正文同样注入 system。
+				if tc.Name == ReadSkillRefToolName {
+					a.runReadSkillRef(step, tc)
+					continue
+				}
+
 				// 2a-2. 执行工具；失败不崩掉 loop，回填错误让模型自己决定，
 				// 但连续同参失败受重试预算约束（guard.retryHit）
 				out, err := a.registry.Call(tc.Name, tc.Input)
@@ -419,6 +428,48 @@ func (a *Agent) runLoadSkill(step int, tc ToolCall) {
 // appendTool 以 tool 角色回填一条结果（协议闭合用，对应真实 API 的 tool 消息）。
 func (a *Agent) appendTool(toolCallID, content string) {
 	a.history = append(a.history, Message{Role: roleTool, Content: content, ToolCallID: toolCallID})
+}
+
+// runReadSkillRef 处理 read_skill_ref 特殊通道（L3 按需引用）。
+//
+// 设计约束（防呆 + 防滥用）：
+//  1. 顺序依赖：必须先 load_skill 加载技能正文，才能读它的引用——
+//     引用脱离正文没有意义，也防止模型绕过 L2 直接读任意资源；
+//  2. 去重：同一 (skill, ref) 只注入一次（key 用 "skill/ref"）；
+//  3. 协议闭合：成功/失败/重复都回填 tool 消息。
+func (a *Agent) runReadSkillRef(step int, tc ToolCall) {
+	if a.skillProvider == nil {
+		a.appendTool(tc.ID, "未配置技能加载器（未调用 WithSkillProvider），无法读取技能引用。")
+		return
+	}
+	skill, ref, ok := parseReadSkillRefInput(tc.Input)
+	if !ok {
+		a.appendTool(tc.ID, "read_skill_ref 参数无效：应为 {\"skill\":\"技能名\",\"ref\":\"引用路径\"}。")
+		return
+	}
+	if !a.loadedSkills[skill] {
+		a.appendTool(tc.ID, fmt.Sprintf("技能 %s 尚未加载，请先调用 load_skill 加载其正文，再读取引用。", skill))
+		return
+	}
+	key := skill + "/" + ref
+	if a.loadedRefs[key] {
+		a.appendTool(tc.ID, fmt.Sprintf("技能 %s 的引用 %s 已加载过，内容已在系统上下文中，无需重复读取。", skill, ref))
+		return
+	}
+	body, ok := a.skillProvider.LoadReference(skill, ref)
+	if !ok {
+		a.appendTool(tc.ID, fmt.Sprintf("技能 %s 的引用 %s 不存在或无法加载。", skill, ref))
+		return
+	}
+	a.loadedRefs[key] = true
+	if a.verbose {
+		log.Printf("[step %d] skill_ref → %s/%s（%d 字符注入 system 消息）", step, skill, ref, len(body))
+	}
+	a.history = append(a.history, Message{
+		Role:    roleSystem,
+		Content: fmt.Sprintf("[技能 %s 引用 %s]\n%s", skill, ref, body),
+	})
+	a.appendTool(tc.ID, fmt.Sprintf("已加载技能 %s 的引用 %s，内容已注入系统上下文，请按其中规则执行。", skill, ref))
 }
 
 // History 返回本轮对话轨迹（只读引用，调用方不得修改）。

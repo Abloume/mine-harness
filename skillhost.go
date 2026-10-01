@@ -55,6 +55,39 @@ func (p *dirSkillProvider) List() []agent.SkillMeta {
 // LoadSkill 按技能名查找并返回 SKILL.md 正文（剥离 frontmatter）。
 // 每次调用现扫目录（demo 够用）；生产可加缓存/mtime 感知。
 func (p *dirSkillProvider) LoadSkill(name string) (string, bool) {
+	dir, ok := p.dirOf(name)
+	if !ok {
+		return "", false
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "SKILL.md"))
+	if err != nil {
+		return "", false
+	}
+	_, body, ok := parseFrontmatter(string(data))
+	return strings.TrimSpace(body), ok
+}
+
+// LoadReference 返回技能附属资源正文（L3 按需引用）。
+// 安全约束：refPath 必须是技能目录内的相对路径——filepath.IsLocal 拒绝
+// 绝对路径和 .. 穿越（skill 目录里如果有恶意/误写的引用，不能借此读仓库外文件）。
+func (p *dirSkillProvider) LoadReference(skillName, refPath string) (string, bool) {
+	dir, ok := p.dirOf(skillName)
+	if !ok {
+		return "", false
+	}
+	clean := filepath.Clean(refPath)
+	if !filepath.IsLocal(clean) {
+		return "", false // 绝对路径或 .. 穿越：拒绝
+	}
+	data, err := os.ReadFile(filepath.Join(dir, clean))
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+// dirOf 按技能名（frontmatter 的 name）找到技能所在目录。
+func (p *dirSkillProvider) dirOf(name string) (string, bool) {
 	entries, err := os.ReadDir(p.root)
 	if err != nil {
 		return "", false
@@ -67,12 +100,12 @@ func (p *dirSkillProvider) LoadSkill(name string) (string, bool) {
 		if err != nil {
 			continue
 		}
-		meta, body, ok := parseFrontmatter(string(data))
+		meta, _, ok := parseFrontmatter(string(data))
 		if !ok {
 			continue
 		}
-		if meta["name"] == name {
-			return strings.TrimSpace(body), true
+		if strings.TrimSpace(meta["name"]) == name {
+			return filepath.Join(p.root, e.Name()), true
 		}
 	}
 	return "", false

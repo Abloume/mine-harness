@@ -126,8 +126,9 @@ func TestSkillLoadedIntoHistory(t *testing.T) {
 
 // stubSkillProvider 是测试用 SkillProvider（不依赖文件系统）。
 type stubSkillProvider struct {
-	skills map[string]string // name → 正文
-	meta   []SkillMeta       // 常驻清单（第一层）
+	skills  map[string]string            // name → 正文
+	refs    map[string]string            // "skill/ref" → 引用正文
+	meta    []SkillMeta                  // 常驻清单（第一层）
 }
 
 func (s *stubSkillProvider) List() []SkillMeta {
@@ -144,6 +145,11 @@ func (s *stubSkillProvider) List() []SkillMeta {
 
 func (s *stubSkillProvider) LoadSkill(name string) (string, bool) {
 	body, ok := s.skills[name]
+	return body, ok
+}
+
+func (s *stubSkillProvider) LoadReference(skill, ref string) (string, bool) {
+	body, ok := s.refs[skill+"/"+ref]
 	return body, ok
 }
 
@@ -282,6 +288,136 @@ func TestBuildLoadSkillDescription(t *testing.T) {
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("描述应包含 %q, got: %s", want, desc)
+		}
+	}
+}
+
+// TestReadSkillRefInjectsSystem 验证 L3 端到端：先 load_skill 再 read_skill_ref，
+// 引用正文以 system 角色注入、tool 消息协议闭合。
+func TestReadSkillRefInjectsSystem(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(NewLoadSkillTool())
+	reg.Register(NewReadSkillRefTool())
+
+	llm := NewMockLLM([]MockDecision{
+		{ToolName: LoadSkillToolName, ToolInput: `{"name":"policy"}`},
+		{ToolName: ReadSkillRefToolName, ToolInput: `{"skill":"policy","ref":"references/safety.md"}`},
+		{Content: "按引用清单核对后完成。"},
+	})
+
+	sp := &stubSkillProvider{
+		skills: map[string]string{"policy": "# 规范\n删除前读取检查清单"},
+		refs:   map[string]string{"policy/references/safety.md": "# 检查清单\n1. 已备份\n2. 非关键文件"},
+	}
+	a := NewAgent(llm, reg, WithMaxSteps(5), WithSkillProvider(sp))
+	res := a.Run("删除 a.txt")
+	if res.Status != StatusCompleted {
+		t.Fatalf("应正常完成, got %s: %s", res.Status, res.Reason)
+	}
+
+	var refSys, refClosed bool
+	for _, m := range a.History() {
+		if m.Role == "system" && strings.Contains(m.Content, "1. 已备份") {
+			refSys = true
+		}
+		if m.Role == "tool" && strings.Contains(m.Content, "已加载技能 policy 的引用") {
+			refClosed = m.ToolCallID != ""
+		}
+	}
+	if !refSys {
+		t.Error("L3：引用正文应以 system 角色注入上下文")
+	}
+	if !refClosed {
+		t.Error("L3：tool 消息应关联 tool_call_id（协议闭合）")
+	}
+}
+
+// TestReadSkillRefRequiresLoadedSkill 验证顺序约束：未加载技能就读引用 → 拒绝，
+// 引用必须依附于已加载的正文（防绕过 L2 直接读资源）。
+func TestReadSkillRefRequiresLoadedSkill(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(NewLoadSkillTool())
+	reg.Register(NewReadSkillRefTool())
+
+	llm := NewMockLLM([]MockDecision{
+		{ToolName: ReadSkillRefToolName, ToolInput: `{"skill":"policy","ref":"references/safety.md"}`},
+		{Content: "提示未加载，我先加载技能。"},
+	})
+
+	sp := &stubSkillProvider{skills: map[string]string{"policy": "x"}}
+	a := NewAgent(llm, reg, WithMaxSteps(4), WithSkillProvider(sp))
+	res := a.Run("删除 a.txt")
+	if res.Status != StatusCompleted {
+		t.Fatalf("顺序约束不应中断 loop, got %s: %s", res.Status, res.Reason)
+	}
+
+	seen := false
+	for _, m := range a.History() {
+		if m.Role == "tool" && strings.Contains(m.Content, "尚未加载") {
+			seen = true
+		}
+		if m.Role == "system" && strings.Contains(m.Content, "safety.md") {
+			t.Error("未加载技能时，引用不应注入 system")
+		}
+	}
+	if !seen {
+		t.Error("未加载技能时读引用，应回填'尚未加载'提示")
+	}
+}
+
+// TestReadSkillRefDedupe 验证引用去重：同一 (skill, ref) 只注入一次 system。
+func TestReadSkillRefDedupe(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(NewLoadSkillTool())
+	reg.Register(NewReadSkillRefTool())
+
+	llm := NewMockLLM([]MockDecision{
+		{ToolName: LoadSkillToolName, ToolInput: `{"name":"policy"}`},
+		{ToolName: ReadSkillRefToolName, ToolInput: `{"skill":"policy","ref":"references/safety.md"}`},
+		{ToolName: ReadSkillRefToolName, ToolInput: `{"skill":"policy","ref":"references/safety.md"}`},
+		{Content: "完成。"},
+	})
+
+	sp := &stubSkillProvider{
+		skills: map[string]string{"policy": "正文"},
+		refs:   map[string]string{"policy/references/safety.md": "# 清单\n内容"},
+	}
+	a := NewAgent(llm, reg, WithMaxSteps(6), WithSkillProvider(sp))
+	res := a.Run("删除 a.txt")
+	if res.Status != StatusCompleted {
+		t.Fatalf("应正常完成, got %s: %s", res.Status, res.Reason)
+	}
+
+	count := 0
+	for _, m := range a.History() {
+		// system 注入标记格式：[技能 policy 引用 references/safety.md]
+		if m.Role == "system" && strings.Contains(m.Content, "references/safety.md") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("同一引用应只注入一次, got %d 次", count)
+	}
+}
+
+// TestParseReadSkillRefInput 验证 L3 参数解析：JSON 双字段、缺字段、非法。
+func TestParseReadSkillRefInput(t *testing.T) {
+	cases := []struct {
+		input    string
+		skill    string
+		ref      string
+		ok       bool
+	}{
+		{`{"skill":"file-ops-policy","ref":"references/safety.md"}`, "file-ops-policy", "references/safety.md", true},
+		{`{"ref":"references/safety.md"}`, "", "", false}, // 缺 skill
+		{`{"skill":"x"}`, "", "", false},                   // 缺 ref
+		{`not-json`, "", "", false},                        // 非 JSON
+	}
+	for _, c := range cases {
+		skill, ref, ok := parseReadSkillRefInput(c.input)
+		if ok != c.ok || skill != c.skill || ref != c.ref {
+			t.Errorf("parseReadSkillRefInput(%q) = (%q,%q,%v), want (%q,%q,%v)",
+				c.input, skill, ref, ok, c.skill, c.ref, c.ok)
 		}
 	}
 }

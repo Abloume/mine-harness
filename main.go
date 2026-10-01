@@ -602,6 +602,8 @@ func runDemoSkillB(verbose bool) {
 	loadSkillTool := agent.NewLoadSkillTool()
 	loadSkillTool.Description = agent.BuildLoadSkillDescription(provider.List())
 	reg.Register(loadSkillTool)
+	// ①' L3：read_skill_ref 按需读取已加载技能的附属资源（references/safety.md）
+	reg.Register(agent.NewReadSkillRefTool())
 
 	// ② 业务工具：backup 备份 + file_op 文件操作
 	reg.Register(agent.Tool{
@@ -624,16 +626,17 @@ func runDemoSkillB(verbose bool) {
 
 	// ③ 宿主技能发现器已在 ① 构造（skills/example/SKILL.md 的 frontmatter
 	//    name 是 file-ops-policy，LoadSkill("file-ops-policy") 会命中）
-	// ④ 模型脚本：先 load_skill 加载规范 → 按规范先备份 → 再删除 → 汇报
+	// ④ 模型脚本：L2 加载规范 → L3 读检查清单 → 按清单先备份 → 再删除 → 汇报
 	llm := agent.NewMockLLM([]agent.MockDecision{
 		{ToolName: agent.LoadSkillToolName, ToolInput: `{"name":"file-ops-policy"}`},
+		{ToolName: agent.ReadSkillRefToolName, ToolInput: `{"skill":"file-ops-policy","ref":"references/safety.md"}`},
 		{ToolName: "backup", ToolInput: `{"file":"/tmp/report.txt"}`},
 		{ToolName: "file_op", ToolInput: `{"action":"delete","file":"/tmp/report.txt"}`},
-		{Content: "已按加载的 file-ops-policy 规范执行：先备份 /tmp/report.txt 到 backup/，再删除。删除完成，备份已说明。"},
+		{Content: "已按 file-ops-policy 规范执行：加载规范 → 读取安全检查清单并逐项核对 → 先备份 /tmp/report.txt 到 backup/ → 再删除。删除完成，备份已说明。"},
 	})
 
 	a := agent.NewAgent(llm, reg,
-		agent.WithMaxSteps(6),
+		agent.WithMaxSteps(7),
 		agent.WithSkillProvider(provider),
 		agent.WithVerbose(verbose))
 	showResult(a.Run("删除 /tmp/report.txt"))

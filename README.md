@@ -26,7 +26,7 @@
 - [x] 真实模型接入（OpenAI 兼容 Provider：智谱 BigModel / DeepSeek / 火山 Ark 通用，tool_call id 关联 + 结构化 tool_calls 协议适配 + **多 tool_call 并行调用支持** + 指数退避重试）— `internal/agent/provider.go`
 - [x] 评测门（任务成功率、结构化判断）— `internal/eval/eval.go`（RuleJudge 确定性规则 + LLMJudge 结构化 JSON 判断 + RunSuite 汇总，`go run . -demo eval`）
 - [x] Skill 加载（A 方案：Skill 包装为工具——Description 常驻触发 + SKILL.md 正文按需读取，用 function calling 伪装渐进式披露）— `internal/agent/skill.go`、示例 `skills/example/SKILL.md`
-- [x] 真渐进式 Skill（B 方案：`load_skill` 特殊通道 + harness 注入 system 消息，去重注入、协议闭合；**常驻清单**——`SkillProvider.List()` 把 name/description/tags 拼进 `load_skill` 描述，模型先"看目录"再按 name 加载正文；机制归内核、目录发现归宿主）— `internal/agent/skill.go`、宿主 `skillhost.go`、`-demo skill-b`
+- [x] 真渐进式 Skill（B 方案：`load_skill` 特殊通道 + harness 注入 system 消息，去重注入、协议闭合；**常驻清单**——`SkillProvider.List()` 把 name/description/tags 拼进 `load_skill` 描述，模型先"看目录"再按 name 加载正文；**L3 按需引用**——`read_skill_ref` 特殊通道按需读取 SKILL.md 引用的附属资源（references/xxx.md），必须先加载技能正文才能读引用，宿主做目录穿越防护；机制归内核、目录发现归宿主）— `internal/agent/skill.go`、宿主 `skillhost.go`、`-demo skill-b`
 - [x] 豆包 API 接入（火山方舟 Ark，OpenAI 兼容——与智谱/DeepSeek 共用同一个 Provider，零协议改动）— `main.go` 的 `-demo doubao` / `-demo doubao-approval`
 
 ## 当前进度（2026-10-01）
@@ -73,7 +73,12 @@
   同一技能去重只注入一次，tool 消息协议闭合。B 的**发现层**：`SkillProvider.List()` 返回全部
   技能的 name/description/tags 常驻清单，`BuildLoadSkillDescription` 把它拼进 `load_skill`
   工具描述（每次请求模型都看得到），模型"先看目录、再按 name 取正文"——加载只需要 name，
-  但发现依赖 description/tags。A 的局限（正文进 tool 结果可能被摘要压缩、触发依赖模型工具
+  但发现依赖 description/tags。**L3 按需引用**：`SkillProvider.LoadReference(skill, ref)` +
+  `read_skill_ref` 特殊工具，SKILL.md 正文只写"当需要 X 时读取 references/X.md"，执行到
+  那一步才拉附属资源（同样注入 system、按 (skill/ref) 去重）；顺序约束——必须先加载技能
+  正文才能读其引用；宿主用 `filepath.IsLocal` 拒绝绝对路径和 `..` 穿越。示例
+  `skills/example/references/safety.md` 演示了"删除前读取检查清单"的完整链路。
+  A 的局限（正文进 tool 结果可能被摘要压缩、触发依赖模型工具
   选择）在 B 中解决。边界清晰：机制归内核（internal/agent），skill 目录/发现归宿主
   （`skillhost.go` 的 `dirSkillProvider`，扫描 `skills/<dir>/SKILL.md` 并解析 frontmatter 的
   name/description/tags 字段）。
