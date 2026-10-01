@@ -154,6 +154,10 @@ type Agent struct {
 
 	guard *LoopGuard
 
+	// B 方案真渐进式 Skill：load_skill 特殊通道 + system 注入。
+	skillProvider SkillProvider     // 宿主提供的技能发现器（nil = 未启用 B 方案）
+	loadedSkills  map[string]bool   // 已注入过的技能名（去重：同一规范只进一次上下文）
+
 	history []Message
 }
 
@@ -193,6 +197,13 @@ func WithApprovalThreshold(lv RiskLevel) Option {
 // WithDenialLimit 设置连续拒绝升级上限（默认 3：对应 Claude Code 的 3 连拒升级）。
 func WithDenialLimit(n int) Option { return func(a *Agent) { a.denialLimit = n } }
 
+// WithSkillProvider 启用 B 方案真渐进式 Skill（宿主提供技能发现器）。
+// 开启后，模型调用 load_skill 会被内核拦截：SKILL.md 正文注入 system 消息
+// （而非普通工具结果），同一技能只注入一次。
+func WithSkillProvider(sp SkillProvider) Option {
+	return func(a *Agent) { a.skillProvider = sp }
+}
+
 // NewAgent 构造一个 Agent，默认 maxSteps=10、budget=4096、verbose=false。
 func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 	a := &Agent{
@@ -205,6 +216,7 @@ func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 		riskEvaluator:     StaticRiskEvaluator{},
 		approvalThreshold: RiskMedium, // 默认：Medium 及以上需要审批
 		denialLimit:       3,
+		loadedSkills:      map[string]bool{},
 	}
 	for _, o := range opts {
 		o(a)
@@ -325,6 +337,14 @@ func (a *Agent) Run(task string) RunResult {
 					a.denials = 0 // 低风险自动放行：模型已换路径，清空拒绝计数
 				}
 
+				// 2a-1.75 B 方案真渐进式 Skill：load_skill 是内核特殊通道，
+				// 不走普通工具执行——正文注入 system 消息（语义是"技能规范"，
+				// 而非一次调用结果），且不经过 registry.Call。
+				if tc.Name == LoadSkillToolName {
+					a.runLoadSkill(step, tc)
+					continue
+				}
+
 				// 2a-2. 执行工具；失败不崩掉 loop，回填错误让模型自己决定，
 				// 但连续同参失败受重试预算约束（guard.retryHit）
 				out, err := a.registry.Call(tc.Name, tc.Input)
@@ -355,6 +375,50 @@ func (a *Agent) Run(task string) RunResult {
 
 	// 步数耗尽仍未收敛：软停止（不是 error）——返回进度与原因，交还用户继续指挥
 	return RunResult{Steps: a.maxSteps, Status: StatusAborted, Reason: fmt.Sprintf("达到最大步数 %d，任务未完成", a.maxSteps)}
+}
+
+// runLoadSkill 处理 load_skill 特殊通道（B 方案真渐进式披露）。
+//
+// 与 A 方案（正文作为工具结果回填）的关键差异：
+//  1. 正文以 system 角色进入上下文——优先级高于普通对话/tool 消息，
+//     且语义是"技能规范"，模型按规则执行而非当作"一条返回数据"；
+//  2. 同一技能去重：只注入一次，防模型反复加载刷上下文；
+//  3. 协议仍闭合：无论成功/失败/重复，都补一条 tool 消息关联 tool_call_id，
+//     满足真实 API "assistant 的 tool_calls 必须有对应 tool 结果"的要求。
+func (a *Agent) runLoadSkill(step int, tc ToolCall) {
+	if a.skillProvider == nil {
+		a.appendTool(tc.ID, "未配置技能加载器（未调用 WithSkillProvider），无法加载技能。")
+		return
+	}
+	name := parseLoadSkillInput(tc.Input)
+	if name == "" {
+		a.appendTool(tc.ID, "load_skill 参数无效：应为 {\"name\":\"技能名\"} 或直接给技能名。")
+		return
+	}
+	if a.loadedSkills[name] {
+		a.appendTool(tc.ID, fmt.Sprintf("技能 %s 已加载过，其规范已在系统上下文中，无需重复加载。", name))
+		return
+	}
+	body, ok := a.skillProvider.LoadSkill(name)
+	if !ok {
+		a.appendTool(tc.ID, fmt.Sprintf("技能 %s 不存在或无法加载，请改用其他技能或直接完成任务。", name))
+		return
+	}
+	a.loadedSkills[name] = true
+	if a.verbose {
+		log.Printf("[step %d] skill → %s（正文 %d 字符注入 system 消息）", step, name, len(body))
+	}
+	// 正文进 system（B 方案的标志性行为）；skill 名打标记便于模型/审计识别来源。
+	a.history = append(a.history, Message{
+		Role:    roleSystem,
+		Content: fmt.Sprintf("[已加载技能规范 %s]\n%s", name, body),
+	})
+	a.appendTool(tc.ID, fmt.Sprintf("技能 %s 已加载，规范已注入系统上下文，请严格按规范执行后续操作。", name))
+}
+
+// appendTool 以 tool 角色回填一条结果（协议闭合用，对应真实 API 的 tool 消息）。
+func (a *Agent) appendTool(toolCallID, content string) {
+	a.history = append(a.history, Message{Role: roleTool, Content: content, ToolCallID: toolCallID})
 }
 
 // History 返回本轮对话轨迹（只读引用，调用方不得修改）。

@@ -1,6 +1,7 @@
 ---
 name: file-ops-policy
 description: 文件操作安全规范。执行文件操作（read/write/delete/rename）前必须遵守：删除或覆盖前先备份、备份失败即停止、涉及删除需确认。
+tags: [files, safety]
 ---
 
 # 文件操作安全规范

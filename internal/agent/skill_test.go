@@ -121,3 +121,167 @@ func TestSkillLoadedIntoHistory(t *testing.T) {
 		t.Error("SKILL.md 正文应出现在历史中（作为工具结果注入上下文）")
 	}
 }
+
+// ---- B 方案：真渐进式披露（load_skill + system 注入）----
+
+// stubSkillProvider 是测试用 SkillProvider（不依赖文件系统）。
+type stubSkillProvider struct {
+	skills map[string]string // name → 正文
+	meta   []SkillMeta       // 常驻清单（第一层）
+}
+
+func (s *stubSkillProvider) List() []SkillMeta {
+	if s.meta != nil {
+		return s.meta
+	}
+	// 未显式给清单时，从 skills map 推断（测试省事）
+	var out []SkillMeta
+	for name := range s.skills {
+		out = append(out, SkillMeta{Name: name})
+	}
+	return out
+}
+
+func (s *stubSkillProvider) LoadSkill(name string) (string, bool) {
+	body, ok := s.skills[name]
+	return body, ok
+}
+
+// TestLoadSkillBInjectsSystem 验证 B 方案核心行为：
+// 模型调用 load_skill 后，SKILL.md 正文以 **system 角色**进入上下文
+// （不是 A 方案的 tool 角色），且 tool 消息协议闭合（关联 tool_call_id）。
+func TestLoadSkillBInjectsSystem(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(NewLoadSkillTool())
+
+	llm := NewMockLLM([]MockDecision{
+		{ToolName: LoadSkillToolName, ToolInput: `{"name":"policy"}`},
+		{Content: "按规范执行完毕。"},
+	})
+
+	sp := &stubSkillProvider{skills: map[string]string{
+		"policy": "# 安全规范\n删除前必须先调用 backup 工具。\n",
+	}}
+	a := NewAgent(llm, reg,
+		WithMaxSteps(4),
+		WithSkillProvider(sp),
+	)
+	res := a.Run("删除 a.txt")
+	if res.Status != StatusCompleted {
+		t.Fatalf("应正常完成, got %s: %s", res.Status, res.Reason)
+	}
+
+	var sysSeen, toolSeen, closed bool
+	for _, m := range a.History() {
+		if m.Role == "system" && strings.Contains(m.Content, "删除前必须先调用 backup 工具") {
+			sysSeen = true
+		}
+		if m.Role == "tool" && strings.Contains(m.Content, "已加载") {
+			toolSeen = true
+			closed = m.ToolCallID != ""
+		}
+	}
+	if !sysSeen {
+		t.Error("B 方案：SKILL.md 正文应以 system 角色注入上下文")
+	}
+	if !toolSeen {
+		t.Error("B 方案：应回填一条 tool 消息告知模型技能已加载")
+	}
+	if !closed {
+		t.Error("B 方案：tool 消息应关联 tool_call_id（协议闭合）")
+	}
+}
+
+// TestLoadSkillBDedupe 验证去重：同一技能重复加载只注入一次 system，
+// 第二次回填"已加载过"，模型不会反复刷规范进上下文。
+func TestLoadSkillBDedupe(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(NewLoadSkillTool())
+
+	llm := NewMockLLM([]MockDecision{
+		{ToolName: LoadSkillToolName, ToolInput: `{"name":"policy"}`},
+		{ToolName: LoadSkillToolName, ToolInput: `{"name":"policy"}`},
+		{Content: "完成。"},
+	})
+
+	sp := &stubSkillProvider{skills: map[string]string{"policy": "# 规范\n正文内容"}}
+	a := NewAgent(llm, reg, WithMaxSteps(5), WithSkillProvider(sp))
+	res := a.Run("删除 a.txt")
+	if res.Status != StatusCompleted {
+		t.Fatalf("应正常完成, got %s: %s", res.Status, res.Reason)
+	}
+
+	sysCount := 0
+	for _, m := range a.History() {
+		if m.Role == "system" && strings.Contains(m.Content, "正文内容") {
+			sysCount++
+		}
+	}
+	if sysCount != 1 {
+		t.Errorf("同一技能应只注入一次 system 正文, got %d 次", sysCount)
+	}
+}
+
+// TestLoadSkillBNotFound 验证兜底：技能不存在 → 回填错误 tool 消息、不注入 system，
+// 模型拿到反馈后可以换技能或直接完成任务（不中断 loop）。
+func TestLoadSkillBNotFound(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(NewLoadSkillTool())
+
+	llm := NewMockLLM([]MockDecision{
+		{ToolName: LoadSkillToolName, ToolInput: `{"name":"ghost"}`},
+		{Content: "技能不存在，我直接完成任务。"},
+	})
+
+	sp := &stubSkillProvider{skills: map[string]string{"policy": "x"}}
+	a := NewAgent(llm, reg, WithMaxSteps(4), WithSkillProvider(sp))
+	res := a.Run("完成任务")
+	if res.Status != StatusCompleted {
+		t.Fatalf("找不到技能不应中断 loop, got %s: %s", res.Status, res.Reason)
+	}
+
+	for _, m := range a.History() {
+		if m.Role == "system" && strings.Contains(m.Content, "ghost") {
+			t.Error("找不到的技能不应注入 system 消息")
+		}
+	}
+}
+
+// TestParseLoadSkillInput 验证参数解析的三种形态：JSON、裸引号名、空。
+func TestParseLoadSkillInput(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{`{"name":"file-ops-policy"}`, "file-ops-policy"},
+		{`"policy"`, "policy"},
+		{`policy`, "policy"},
+		{`{"foo":"bar"}`, ""}, // 无 name 字段
+		{`   `, ""},           // 空白
+	}
+	for _, c := range cases {
+		if got := parseLoadSkillInput(c.input); got != c.want {
+			t.Errorf("parseLoadSkillInput(%q) = %q, want %q", c.input, got, c.want)
+		}
+	}
+}
+
+// TestBuildLoadSkillDescription 验证 metadata 层：清单（name + description + tags）
+// 拼进 load_skill 的描述——模型每次请求都能"看到目录"，这是渐进式披露第一层。
+func TestBuildLoadSkillDescription(t *testing.T) {
+	desc := BuildLoadSkillDescription([]SkillMeta{
+		{Name: "file-ops-policy", Description: "删除前必须备份", Tags: []string{"files", "safety"}},
+		{Name: "draft-policy", Description: "先起草再发送"},
+	})
+
+	for _, want := range []string{
+		"file-ops-policy",            // 技能名
+		"删除前必须备份",                // description
+		"[tags: files, safety]",      // tags
+		"draft-policy", "先起草再发送",   // 第二个技能
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("描述应包含 %q, got: %s", want, desc)
+		}
+	}
+}

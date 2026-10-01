@@ -1,5 +1,5 @@
-// mine-harness 入口：十一个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载 / 豆包真实链路 / 豆包真实审批"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | doubao | doubao-approval
+// mine-harness 入口：十二个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 豆包真实链路 / 豆包真实审批"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | doubao | doubao-approval
 package main
 
 import (
@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | doubao | doubao-approval")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | doubao | doubao-approval")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -34,6 +34,8 @@ func main() {
 		runDemoEval(*verbose)
 	case "skill":
 		runDemoSkill(*verbose)
+	case "skill-b":
+		runDemoSkillB(*verbose)
 	case "doubao":
 		runDemoDoubao(*verbose)
 	case "doubao-approval":
@@ -581,6 +583,59 @@ func runDemoSkill(verbose bool) {
 	})
 
 	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(6), agent.WithVerbose(verbose))
+	showResult(a.Run("删除 /tmp/report.txt"))
+}
+
+// runDemoSkillB 演示 B 方案真渐进式 Skill（load_skill 特殊通道 + system 注入）：
+// 与 runDemoSkill（A 方案）处理同一个"删除文件"任务，但加载机制不同——
+// 模型调用内核内置的 load_skill 工具，harness 拦截后把 SKILL.md 正文注入
+// **system 消息**（而非普通工具结果），语义是"技能规范"而非"一次返回数据"；
+// 同一技能只注入一次（重复调用会被告知已加载）。
+// 对比 A 方案 trace：A 的正文出现在 tool_result ←，B 出现在 system 注入日志。
+func runDemoSkillB(verbose bool) {
+	reg := agent.NewRegistry()
+
+	// ① B 方案入口：宿主先建技能发现器（拿到常驻清单），
+	//    再把清单拼进 load_skill 工具的 Description——模型每次请求都能看到
+	//    "有哪些技能可用 + 各自 description/tags"，据此决定加载哪个（渐进式披露第一层）。
+	provider := newDirSkillProvider("skills")
+	loadSkillTool := agent.NewLoadSkillTool()
+	loadSkillTool.Description = agent.BuildLoadSkillDescription(provider.List())
+	reg.Register(loadSkillTool)
+
+	// ② 业务工具：backup 备份 + file_op 文件操作
+	reg.Register(agent.Tool{
+		Name:        "backup",
+		Description: "把指定文件备份到 backup/ 目录",
+		Execute: func(input string) (string, error) {
+			return "backup created: backup/report.txt (hello mini-harness)", nil
+		},
+	})
+	reg.Register(agent.Tool{
+		Name:        "file_op",
+		Description: "文件操作：read 读文件 / delete 删除文件",
+		Execute: func(input string) (string, error) {
+			if strings.Contains(input, "delete") {
+				return "file deleted", nil
+			}
+			return "file content: hello mini-harness", nil
+		},
+	})
+
+	// ③ 宿主技能发现器已在 ① 构造（skills/example/SKILL.md 的 frontmatter
+	//    name 是 file-ops-policy，LoadSkill("file-ops-policy") 会命中）
+	// ④ 模型脚本：先 load_skill 加载规范 → 按规范先备份 → 再删除 → 汇报
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: agent.LoadSkillToolName, ToolInput: `{"name":"file-ops-policy"}`},
+		{ToolName: "backup", ToolInput: `{"file":"/tmp/report.txt"}`},
+		{ToolName: "file_op", ToolInput: `{"action":"delete","file":"/tmp/report.txt"}`},
+		{Content: "已按加载的 file-ops-policy 规范执行：先备份 /tmp/report.txt 到 backup/，再删除。删除完成，备份已说明。"},
+	})
+
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(6),
+		agent.WithSkillProvider(provider),
+		agent.WithVerbose(verbose))
 	showResult(a.Run("删除 /tmp/report.txt"))
 }
 
