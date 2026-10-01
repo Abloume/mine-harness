@@ -1,5 +1,5 @@
-// mine-harness 入口：九个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill
+// mine-harness 入口：十一个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载 / 豆包真实链路 / 豆包真实审批"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | doubao | doubao-approval
 package main
 
 import (
@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | doubao | doubao-approval")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -34,6 +34,10 @@ func main() {
 		runDemoEval(*verbose)
 	case "skill":
 		runDemoSkill(*verbose)
+	case "doubao":
+		runDemoDoubao(*verbose)
+	case "doubao-approval":
+		runDemoDoubaoApproval(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -283,6 +287,89 @@ func runDemoRealApproval(verbose bool) {
 	// 与主模型共享 ZHIPU_MODEL 切换；MaxTokens 给足：glm-4.7-flash 是混合思考
 	// 模型，reasoning 会先吃掉预算，预算不足时 content 为空、parseRisk 失败——
 	// 宁给足预算也不冒静默漏审的险。
+	riskLLM := agent.NewOpenAICompatibleProvider(base, model, key)
+	riskLLM.MaxTokens = 2048
+
+	a := agent.NewAgent(mainLLM, reg,
+		agent.WithMaxSteps(6),
+		agent.WithRiskEvaluator(agent.NewLLMRiskEvaluator(riskLLM)),
+		agent.WithApprover(agent.DenyApprover{}), // 演示：进闸门的一律拒绝
+		agent.WithVerbose(verbose))
+	showResult(a.Run("请对文件 /tmp/report.txt 依次执行：1) 删除它 2) 读取它"))
+}
+
+// runDemoDoubao 演示接入豆包 API（火山方舟，OpenAI 兼容）：
+// 与 runDemoReal 完全同构，只是 Provider 换了三个参数——base_url / model / api_key，
+// 协议零改动（Ark 的 /chat/completions 与智谱/DeepSeek 同一套 OpenAI 兼容协议）。
+// 模型默认 doubao-seed-2-1-lite-260915（轻量、快、够 demo），可用环境变量 DOUBAO_MODEL
+// 切换（如 doubao-seed-2-1-pro-260915）；API Key 从 ARK_API_KEY 或项目根 .env 读取。
+// 额度：每个模型独立赠送 50 万 tokens 免费额度，安心体验模式下耗尽自动暂停、不会扣费。
+func runDemoDoubao(verbose bool) {
+	loadEnv(".env")
+	key := os.Getenv("ARK_API_KEY")
+	if key == "" {
+		fmt.Println("缺少 ARK_API_KEY：export ARK_API_KEY=xxx 或写入项目根 .env（已被 git 忽略）")
+		return
+	}
+	model := os.Getenv("DOUBAO_MODEL")
+	if model == "" {
+		model = "doubao-seed-2-1-lite-260915"
+	}
+
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "get_weather",
+		Description: "查询指定城市的当前天气。参数是 JSON：{\"city\":\"城市名\"}",
+		Execute: func(input string) (string, error) {
+			// 演示用 mock 数据源；真实系统这里会调用天气服务
+			return `{"city":"北京","weather":"晴","temp":24,"humidity":40}`, nil
+		},
+	})
+
+	llm := agent.NewOpenAICompatibleProvider(
+		"https://ark.cn-beijing.volces.com/api/v3", // 火山方舟（豆包）
+		model,
+		key,
+	)
+
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(5), agent.WithVerbose(verbose))
+	showResult(a.Run("帮我查一下北京的天气，并告诉我要不要带伞"))
+}
+
+// runDemoDoubaoApproval 演示豆包真实链路的"模型自动判断是否要审批"：
+// 与 runDemoRealApproval 同构，只是把智谱换成豆包（方舟）。风险判断模型独立实例，
+// 参数感知：delete → HIGH / read → LOW，达到阈值进闸门（这里一律拒绝，fail-closed）。
+// 豆包 2.x 与 glm-4.7 同为混合思考模型：reasoning 先吃输出预算，MaxTokens 给足
+// 2048，避免 content 为空导致解析失败、静默退回基础风险造成高风险动作漏审。
+func runDemoDoubaoApproval(verbose bool) {
+	loadEnv(".env")
+	key := os.Getenv("ARK_API_KEY")
+	if key == "" {
+		fmt.Println("缺少 ARK_API_KEY：export ARK_API_KEY=xxx 或写入项目根 .env（已被 git 忽略）")
+		return
+	}
+	model := os.Getenv("DOUBAO_MODEL")
+	if model == "" {
+		model = "doubao-seed-2-1-lite-260915"
+	}
+
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "file_op",
+		Description: "文件操作。参数是 JSON：{\"action\":\"read|delete\",\"file\":\"路径\"}",
+		BaseRisk:    agent.RiskLow, // 基础级别低；高风险由风险模型动态上调
+		Execute: func(input string) (string, error) {
+			if strings.Contains(input, "delete") {
+				return "file deleted", nil
+			}
+			return "file content: hello mini-harness", nil
+		},
+	})
+
+	base := "https://ark.cn-beijing.volces.com/api/v3"
+	// 主模型：完成任务的 agent 循环
+	mainLLM := agent.NewOpenAICompatibleProvider(base, model, key)
+	// 风险模型：独立实例，只做风险判断（生产里应换专用小模型/分类器更省）
 	riskLLM := agent.NewOpenAICompatibleProvider(base, model, key)
 	riskLLM.MaxTokens = 2048
 
