@@ -7,11 +7,16 @@ import "fmt"
 // BaseRisk 声明工具的静态基础风险（人定规则），运行时可按参数修正
 // （同一工具不同参数风险不同：读文件 vs 删文件）——见 risk.go 的 RiskEvaluator。
 // 审批闸门按"基础级别 + 参数修正"的最终风险决定是否触发。
+//
+// ConcurrentSafe 声明工具是否线程安全：同一轮多 tool_call 时，只有全部
+// 声明并发安全的工具才会被 goroutine 并行执行；未声明（false）的工具
+// 保持顺序执行——并发是优化，正确性优先（工具可能共享可变状态）。
 type Tool struct {
-	Name        string
-	Description string
-	BaseRisk    RiskLevel                          // 基础风险级别（RiskNone..RiskHigh），默认 0 即 RiskNone
-	Execute     func(input string) (string, error) // 简化：JSON 字符串进、字符串出
+	Name           string
+	Description    string
+	BaseRisk       RiskLevel                          // 基础风险级别（RiskNone..RiskHigh），默认 0 即 RiskNone
+	ConcurrentSafe bool                               // 声明并发安全后参与并行执行
+	Execute        func(input string) (string, error) // 简化：JSON 字符串进、字符串出
 }
 
 // Registry 是工具注册表：模型只能调用已注册的工具——这本身就是一层护栏
@@ -51,6 +56,12 @@ func (r *Registry) BaseRiskOf(name string) RiskLevel {
 		return RiskNone
 	}
 	return t.BaseRisk
+}
+
+// IsConcurrentSafe 查询工具是否声明并发安全（可参与并行执行）。
+func (r *Registry) IsConcurrentSafe(name string) bool {
+	t, ok := r.tools[name]
+	return ok && t.ConcurrentSafe
 }
 
 // Call 执行指定工具并返回结果。

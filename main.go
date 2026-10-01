@@ -1,5 +1,5 @@
-// mine-harness 入口：十二个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 豆包真实链路 / 豆包真实审批"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | doubao | doubao-approval
+// mine-harness 入口：十三个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | doubao | doubao-approval
 package main
 
 import (
@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"mine-harness/internal/agent"
 	"mine-harness/internal/eval"
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | doubao | doubao-approval")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | doubao | doubao-approval")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -36,6 +37,8 @@ func main() {
 		runDemoSkill(*verbose)
 	case "skill-b":
 		runDemoSkillB(*verbose)
+	case "parallel":
+		runDemoParallel(*verbose)
 	case "doubao":
 		runDemoDoubao(*verbose)
 	case "doubao-approval":
@@ -395,8 +398,9 @@ func runDemoEval(verbose bool) {
 	mkWeather := func() *agent.Agent {
 		reg := agent.NewRegistry()
 		reg.Register(agent.Tool{
-			Name:     "get_weather",
-			BaseRisk: agent.RiskNone,
+			Name:           "get_weather",
+			BaseRisk:       agent.RiskNone,
+			ConcurrentSafe: true, // 声明并发安全：two-cities 用例一轮两个调用走并发路径
 			Execute: func(input string) (string, error) {
 				city := "北京"
 				if strings.Contains(input, "上海") {
@@ -424,8 +428,9 @@ func runDemoEval(verbose bool) {
 			ID: "two-cities", Task: "同时查北京和上海天气并对比", BuildAgent: func() *agent.Agent {
 				reg := agent.NewRegistry()
 				reg.Register(agent.Tool{
-					Name:     "get_weather",
-					BaseRisk: agent.RiskNone,
+					Name:           "get_weather",
+					BaseRisk:       agent.RiskNone,
+					ConcurrentSafe: true, // 一轮两个调用 → 并发执行（协议闭合不受影响）
 					Execute: func(input string) (string, error) {
 						if strings.Contains(input, "上海") {
 							return `{"city":"上海","weather":"多云","temp":18}`, nil
@@ -640,6 +645,44 @@ func runDemoSkillB(verbose bool) {
 		agent.WithSkillProvider(provider),
 		agent.WithVerbose(verbose))
 	showResult(a.Run("删除 /tmp/report.txt"))
+}
+
+// runDemoParallel 演示多 tool_call 并发执行：
+// 模型一轮返回 3 个工具调用，工具都声明 ConcurrentSafe=true → 内核用
+// goroutine 并行执行（trace 打印"⚡ 并行执行"），3 个 400ms 的调用
+// 并行约 0.4s 完成（顺序要 1.2s）。执行失败/审批仍按原护栏逐条独立处理。
+func runDemoParallel(verbose bool) {
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:           "get_weather",
+		Description:    "查询指定城市的当前天气",
+		BaseRisk:       agent.RiskNone,
+		ConcurrentSafe: true, // 无共享状态，可安全并行
+		Execute: func(input string) (string, error) {
+			time.Sleep(400 * time.Millisecond) // 模拟外部 API 耗时，体现并行收益
+			city := "北京"
+			for _, c := range []string{"上海", "杭州", "广州"} {
+				if strings.Contains(input, c) {
+					city = c
+					break
+				}
+			}
+			return fmt.Sprintf(`{"city":"%s","weather":"晴","temp":24}`, city), nil
+		},
+	})
+
+	// 一轮并行查 3 个城市（多 tool_call），下一轮汇总
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolCalls: []agent.ToolCall{
+			{ID: "c1", Name: "get_weather", Input: `{"city":"北京"}`},
+			{ID: "c2", Name: "get_weather", Input: `{"city":"上海"}`},
+			{ID: "c3", Name: "get_weather", Input: `{"city":"杭州"}`},
+		}},
+		{Content: "三城天气已汇总：北京晴、上海晴、杭州晴，都是 24 度。"},
+	})
+
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(4), agent.WithVerbose(verbose))
+	showResult(a.Run("同时查北京、上海、杭州三城天气并汇总"))
 }
 
 // showResult 统一打印 RunResult（completed / aborted 都按"结果"展示，不当作异常）。

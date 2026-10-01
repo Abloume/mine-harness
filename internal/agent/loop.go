@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 )
 
 // 常量消息角色（与 llm.go 的 Message.Role 配合，避免魔法字符串散落）。
@@ -129,6 +130,21 @@ func (g *LoopGuard) retryHit(name, input string) bool {
 	// 换了调用目标，重试计数归零
 	g.retryCount = 1
 	return false
+}
+
+// execItem 是阶段1（顺序护栏）产出的待执行项：安全判定在阶段1完成，
+// 阶段2只负责执行与回填。
+type execItem struct {
+	tc    ToolCall
+	name  string
+	input string
+	safe  bool // 普通工具且声明 ConcurrentSafe（可参与并行执行）
+}
+
+// execResult 是并行执行的单条结果（按索引写入，避免共享内存竞争）。
+type execResult struct {
+	out string
+	err error
 }
 
 // Agent 是最小运行时内核：把 LLM + 工具 + 上下文预算 + 步数限制 + 循环护栏
@@ -269,9 +285,15 @@ func (a *Agent) Run(task string) RunResult {
 				ToolCalls: resp.ToolCalls,
 			})
 
-			// 逐个处理：循环检测 → 审批点 → 执行 → 回填。
-			// 顺序执行（不并发）：工具可能共享状态/非线程安全，先保证正确性；
-			// 生产里的并行执行是优化，且需要每个工具声明并发安全。
+			// 处理本轮 tool_calls：两阶段——
+			//  阶段1（顺序）：循环检测 + 审批点。两者都有共享状态
+			//               （guard 滑动窗口 / denials 计数），必须串行；
+			//  阶段2（执行）：全部声明并发安全的普通工具 → goroutine 并行；
+			//              否则逐个顺序执行（含 load_skill/read_skill_ref 特殊通道，
+			//              它们写内核 map，不并发）。
+			// 执行失败的重试预算（guard.retryHit）也集中回主 goroutine 判断，
+			// 避免 LoopGuard 状态被并发访问。
+			var items []execItem
 			for _, tc := range resp.ToolCalls {
 				// 2a-1. 循环检测：命中先警告、再犯中止
 				switch a.guard.guard(tc.Name, tc.Input) {
@@ -339,37 +361,82 @@ func (a *Agent) Run(task string) RunResult {
 					a.denials = 0 // 低风险自动放行：模型已换路径，清空拒绝计数
 				}
 
-				// 2a-1.75 B 方案真渐进式 Skill：load_skill 是内核特殊通道，
-				// 不走普通工具执行——正文注入 system 消息（语义是"技能规范"，
-				// 而非一次调用结果），且不经过 registry.Call。
-				if tc.Name == LoadSkillToolName {
-					a.runLoadSkill(step, tc)
+				// 判定并发资格：特殊通道（写内核 map）与非并发安全工具 → safe=false。
+				// JS/TS ↔ Go 差异：TS 无共享内存并发模型（单线程事件循环），
+				// 不需要"并发安全"声明；Go 里 goroutine 共享内存，工具能否并行
+				// 执行取决于它是否线程安全——这个声明把责任交给工具作者。
+				safe := false
+				if tc.Name != LoadSkillToolName && tc.Name != ReadSkillRefToolName {
+					safe = a.registry.IsConcurrentSafe(tc.Name)
+				}
+				items = append(items, execItem{tc: tc, name: tc.Name, input: tc.Input, safe: safe})
+			}
+
+			// 阶段2：执行。全部可并发才并行，否则逐个顺序（正确性优先）。
+			canParallel := len(items) > 1
+			for _, it := range items {
+				if !it.safe {
+					canParallel = false
+					break
+				}
+			}
+
+			if canParallel {
+				if a.verbose {
+					log.Printf("[step %d] ⚡ 并行执行 %d 个工具调用", step, len(items))
+				}
+				results := make([]execResult, len(items))
+				var wg sync.WaitGroup
+				for i, it := range items {
+					wg.Add(1)
+					go func(idx int, it execItem) {
+						defer wg.Done()
+						out, err := a.registry.Call(it.name, it.input)
+						results[idx] = execResult{out: out, err: err} // 按索引写，无竞争
+					}(i, it)
+				}
+				wg.Wait()
+				for i, it := range items {
+					res := results[i]
+					if res.err != nil {
+						if a.guard.retryHit(it.name, it.input) {
+							return RunResult{Steps: step, Status: StatusAborted,
+								Reason: fmt.Sprintf("重试超预算：%s 连续失败超过 %d 次", it.name, a.guard.retryLimit)}
+						}
+						res.out = fmt.Sprintf("工具调用失败: %v", res.err)
+					}
+					if a.verbose {
+						log.Printf("[step %d] tool_result ← %s", step, res.out)
+					}
+					a.history = append(a.history,
+						Message{Role: roleTool, Content: res.out, ToolCallID: it.tc.ID})
+				}
+				continue
+			}
+
+			// 顺序执行（含特殊通道与未声明并发安全的工具）
+			for _, it := range items {
+				if it.tc.Name == LoadSkillToolName {
+					a.runLoadSkill(step, it.tc)
 					continue
 				}
-
-				// 2a-1.8 L3 按需引用：read_skill_ref 同属特殊通道——
-				// 只读已加载技能的附属资源，正文同样注入 system。
-				if tc.Name == ReadSkillRefToolName {
-					a.runReadSkillRef(step, tc)
+				if it.tc.Name == ReadSkillRefToolName {
+					a.runReadSkillRef(step, it.tc)
 					continue
 				}
-
-				// 2a-2. 执行工具；失败不崩掉 loop，回填错误让模型自己决定，
-				// 但连续同参失败受重试预算约束（guard.retryHit）
-				out, err := a.registry.Call(tc.Name, tc.Input)
+				out, err := a.registry.Call(it.name, it.input)
 				if err != nil {
-					if a.guard.retryHit(tc.Name, tc.Input) {
+					if a.guard.retryHit(it.name, it.input) {
 						return RunResult{Steps: step, Status: StatusAborted,
-							Reason: fmt.Sprintf("重试超预算：%s 连续失败超过 %d 次", tc.Name, a.guard.retryLimit)}
+							Reason: fmt.Sprintf("重试超预算：%s 连续失败超过 %d 次", it.name, a.guard.retryLimit)}
 					}
 					out = fmt.Sprintf("工具调用失败: %v", err)
 				}
 				if a.verbose {
 					log.Printf("[step %d] tool_result ← %s", step, out)
 				}
-
 				a.history = append(a.history,
-					Message{Role: roleTool, Content: out, ToolCallID: tc.ID})
+					Message{Role: roleTool, Content: out, ToolCallID: it.tc.ID})
 			}
 			continue
 		}
