@@ -1,20 +1,22 @@
-// mine-harness 入口：十四个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval
+// mine-harness 入口：十五个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs
 package main
 
 import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"mine-harness/internal/agent"
 	"mine-harness/internal/eval"
+	"mine-harness/internal/fsagent"
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -45,6 +47,8 @@ func main() {
 		runDemoDoubao(*verbose)
 	case "doubao-approval":
 		runDemoDoubaoApproval(*verbose)
+	case "fs":
+		runDemoFS(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -769,6 +773,73 @@ func runDemoLLMCompact(verbose bool) {
 }
 
 // showResult 统一打印 RunResult（completed / aborted 都按"结果"展示，不当作异常）。
+// runDemoFS 演示第 1 步真实文件工具集（internal/fsagent）：
+// 在临时"项目"里，mock 模型完成「看目录 → 读文件 → 改文件 → grep 验证」链路。
+// 展示点：
+//   - read_file / glob / grep：RiskNone 自动放行，不打扰用户
+//   - edit_file：RiskMedium 达默认审批阈值 → 走审批闸门（这里模拟人工放行）
+//   - 写前自动备份：backup/ 下保留旧内容，可回滚
+func runDemoFS(verbose bool) {
+	root, err := os.MkdirTemp("", "mine-harness-fs-*")
+	if err != nil {
+		fmt.Println("创建临时目录失败:", err)
+		return
+	}
+	defer os.RemoveAll(root) // 演示完清理临时项目
+
+	// 造一个迷你"项目"
+	if err := os.WriteFile(filepath.Join(root, "hello.go"),
+		[]byte("package main\n\n// TODO: add greeting\nfunc main() {\n}\n"), 0o644); err != nil {
+		fmt.Println("写临时文件失败:", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Join(root, "util"), 0o755); err != nil {
+		fmt.Println("建目录失败:", err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(root, "util", "helper.go"),
+		[]byte("package util\n\nfunc Helper() string { return \"hi\" }\n"), 0o644); err != nil {
+		fmt.Println("写临时文件失败:", err)
+		return
+	}
+
+	reg := agent.NewRegistry()
+	for _, t := range fsagent.NewTools(root).All() {
+		reg.Register(t)
+	}
+
+	// 脚本：先看目录 → 读 hello.go → 替换 TODO → grep 验证
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "glob", ToolInput: `{"pattern":"**/*.go"}`},
+		{ToolName: "read_file", ToolInput: `{"path":"hello.go"}`},
+		{ToolName: "edit_file", ToolInput: `{"path":"hello.go","old":"// TODO: add greeting","new":"// greeting added"}`},
+		{ToolName: "grep", ToolInput: `{"pattern":"greeting"}`},
+		{Content: "已完成：hello.go 的 TODO 已替换为 greeting added，并通过 grep 验证。"},
+	})
+
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(6),
+		agent.WithVerbose(verbose),
+		// edit_file/write_file 是 RiskMedium，达默认审批阈值——配一个
+		// "模拟人工"审批器放行（真实使用换 CLIApprover 读键盘，或
+		// LLM 决策器；这里演示审批闸门确实被触发）
+		agent.WithApprover(agent.ApproverFunc(func(toolName, args string) bool {
+			fmt.Printf("[审批] %s(%s) → 放行（演示用 Auto 放行）\n", toolName, args)
+			return true
+		})),
+	)
+	showResult(a.Run("看一下项目里有哪些 Go 文件，读 hello.go 并把 TODO 替换掉，最后验证一下"))
+
+	// 展示备份产物：编辑前的原文件躺在 root/backup/ 下，可回滚
+	fmt.Println("\n--- 备份产物（可回滚）---")
+	baks, _ := filepath.Glob(filepath.Join(root, "backup", "*"))
+	for _, b := range baks {
+		rel, _ := filepath.Rel(root, b)
+		data, _ := os.ReadFile(b)
+		fmt.Printf("%s:\n%s\n", filepath.ToSlash(rel), strings.TrimRight(string(data), "\n"))
+	}
+}
+
 func showResult(r agent.RunResult) {
 	fmt.Println("==== 运行结果 ====")
 	fmt.Printf("状态: %s  步数: %d\n", r.Status, r.Steps)

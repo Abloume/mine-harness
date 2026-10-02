@@ -27,13 +27,13 @@
 
 ---
 
-## 第 1 步 · 真实文件工具集（代码 Agent 地基）【建议先做】
+## 第 1 步 · 真实文件工具集（代码 Agent 地基） ✅ 已完成（2026-10-02）
 
 **做什么**
-- `read_file` / `write_file` / `edit_file` / `glob` / `grep` 注册为真实工具（替换演示 `file_op`）
-- 原子写入：临时文件 + `os.Rename`，写失败不留半截文件
-- 写前备份 + 审批接入（沿用 `skills/example/SKILL.md` 的 file-ops-policy 原则与既有审批机制）
-- 路径安全：`filepath.IsLocal` 拒绝绝对路径与 `..` 穿越（复用 `read_skill_ref` 已有防护）
+- [x] `read_file` / `write_file` / `edit_file` / `glob` / `grep` 注册为真实工具（`internal/fsagent`，独立包与内核解耦）— 已实现
+- [x] 原子写入：临时文件 + `os.Rename`，写失败不留半截文件 — 已实现（atomicWrite）
+- [x] 写前备份 + 审批接入（沿用 `skills/example/SKILL.md` 的 file-ops-policy 原则与既有审批机制）— 已实现（自动备份到 `backup/`，备份失败即停止；写/编辑 RiskMedium 走审批闸门）
+- [x] 路径安全：`filepath.IsLocal` 拒绝绝对路径与 `..` 穿越（复用 `read_skill_ref` 已有防护）— 已实现
 
 **Go 练习点**
 - `os` / `path/filepath` 文件与路径 API（vs JS 无内置文件系统，需 node:fs）
@@ -41,8 +41,10 @@
 - 显式 error 处理（Go 返回值 vs JS throw/catch）
 
 **验证**
-- 真实仓库 demo：Agent 读取项目文件 → 修改 → 备份可回滚
-- 越权路径用例（`../`、绝对路径）被拒
+- [x] 真实仓库 demo：`go run . -demo fs` — 临时项目里 Agent 读文件 → 修改 → 备份可回滚
+- [x] 越权路径用例（`../`、绝对路径）被拒 — `fsagent_test.go` 的 TestPathTraversalRejected 等 14 个测试全绿
+
+> 实现要点与踩坑已记录在 README「文件工具集实现要点」节。
 
 ---
 

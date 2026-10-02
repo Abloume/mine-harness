@@ -29,12 +29,13 @@
 - [x] 多 tool_call 并发执行（工具声明 `ConcurrentSafe` 才参与并行；护栏/审批保持顺序、执行失败预算集中回主 goroutine，结果按原始顺序回填；未声明或含特殊通道时整批回退顺序执行）— `internal/agent/loop.go`、`internal/agent/tools.go`、`-demo parallel`
 - [x] 真渐进式 Skill（B 方案：`load_skill` 特殊通道 + harness 注入 system 消息，去重注入、协议闭合；**常驻清单**——`SkillProvider.List()` 把 name/description/tags 拼进 `load_skill` 描述，模型先"看目录"再按 name 加载正文；**L3 按需引用**——`read_skill_ref` 特殊通道按需读取 SKILL.md 引用的附属资源（references/xxx.md），必须先加载技能正文才能读引用，宿主做目录穿越防护；机制归内核、目录发现归宿主）— `internal/agent/skill.go`、宿主 `skillhost.go`、`-demo skill-b`
 - [x] 豆包 API 接入（火山方舟 Ark，OpenAI 兼容——与智谱/DeepSeek 共用同一个 Provider，零协议改动）— `main.go` 的 `-demo doubao` / `-demo doubao-approval`
+- [x] 真实文件工具集（PLAN 第 1 步：`read_file` / `write_file` / `edit_file` / `glob` / `grep`，独立包 `internal/fsagent`，与内核解耦——机制归内核、工具归应用层）— 原子写入（同目录 temp + rename）、写前自动备份到 `backup/`（file-ops-policy 落地，备份失败即停止）、`filepath.IsLocal` 路径越界防护、edit 精确替换防幻觉（old 必须恰好出现一次）、glob/grep 跳过备份目录；读类 RiskNone 自动放行，写/编辑 RiskMedium 走审批闸门 — `-demo fs`
 
-## 当前进度（2026-10-01）
+## 当前进度（2026-10-02）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval` 十四个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批」，
-前六个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs` 十五个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集」，
+前七个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
 
 - **智谱**：需 `ZHIPU_API_KEY`，写入项目根 `.env`（已被 `.gitignore` 排除）；模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`。
 - **豆包（火山方舟 Ark）**：需 `ARK_API_KEY` + Model ID；base_url `https://ark.cn-beijing.volces.com/api/v3`；模型默认 `doubao-seed-2-1-lite-260915`，用 `DOUBAO_MODEL` 切换（如 `doubao-seed-2-1-pro-260915`）。每个模型**独立**赠送 50 万 tokens 免费额度（调用哪个模型只消耗哪个模型的额度），安心体验模式下额度耗尽自动暂停、不会扣费。
@@ -129,7 +130,25 @@
 
 token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 token，含局限说明见
 `internal/agent/context.go` 注释），单元测试见 `internal/agent/context_test.go`、
-`internal/agent/approval_test.go`、`internal/agent/provider_test.go`（`go test ./...` 可跑）。
+`internal/agent/approval_test.go`、`internal/agent/provider_test.go`、
+`internal/fsagent/fsagent_test.go`（`go test ./...` 可跑）。
+
+**文件工具集实现要点（`internal/fsagent`，PLAN 第 1 步）**：
+- **原子写入**：同目录 `os.CreateTemp` + `os.Rename`——同目录 rename 在 POSIX 上是
+  原子操作（要么旧文件、要么新文件，绝无半截文件），跨目录会退化/失败；临时文件
+  `defer Remove` 兜底清理。对应 JS `writeFile` 直接覆盖的"写一半断电就坏"问题。
+- **写前自动备份**：`write_file`/`edit_file` 覆盖已有文件前，旧内容自动存到
+  `backup/`（镜像相对路径 + 时间戳），失败即停止写入（file-ops-policy 落地）——
+  备份是**内核工具行为**而非模型纪律，不依赖"模型记得先调 backup"。
+- **路径越界防护**：所有 path 参数经 `filepath.Clean` + `filepath.IsLocal` 校验
+  （拒绝绝对路径与 `..` 穿越，与 `read_skill_ref` 同套路）；symlink 逃逸（root 内
+  链接指向 root 外）是生产增强点，需 `EvalSymlinks` 二次校验。
+- **edit 防幻觉**：`old` 必须恰好出现一次——0 次（臆想内容）或多次（定位不精确）
+  都报错，让模型先 `read_file` 精确定位；宁可报错也不乱改。
+- **备份目录自排除**：`glob`/`grep` 跳过 `backup/`——否则模型会从备份里读到
+  "已修改/已删除"的旧内容造成幻觉。
+- 风险分级：读类（read/glob/grep）RiskNone 自动放行；写/编辑 RiskMedium 达默认
+  审批阈值，必须走审批闸门（`-demo fs` 演示了闸门触发 → 放行 → 备份 → 替换全链路）。
 
 ## 约定
 
