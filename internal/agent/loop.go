@@ -175,9 +175,9 @@ type Agent struct {
 	guard *LoopGuard
 
 	// B 方案真渐进式 Skill：load_skill 特殊通道 + system 注入。
-	skillProvider SkillProvider     // 宿主提供的技能发现器（nil = 未启用 B 方案）
-	loadedSkills  map[string]bool   // 已注入过的技能名（去重：同一规范只进一次上下文）
-	loadedRefs    map[string]bool   // 已注入过的引用 key（"skill/ref" 去重）
+	skillProvider SkillProvider   // 宿主提供的技能发现器（nil = 未启用 B 方案）
+	loadedSkills  map[string]bool // 已注入过的技能名（去重：同一规范只进一次上下文）
+	loadedRefs    map[string]bool // 已注入过的引用 key（"skill/ref" 去重）
 
 	history []Message
 }

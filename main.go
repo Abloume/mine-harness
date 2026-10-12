@@ -1,5 +1,5 @@
-// mine-harness 入口：十五个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs
+// mine-harness 入口：十六个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd
 package main
 
 import (
@@ -11,12 +11,13 @@ import (
 	"time"
 
 	"mine-harness/internal/agent"
+	"mine-harness/internal/cmdagent"
 	"mine-harness/internal/eval"
 	"mine-harness/internal/fsagent"
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -49,6 +50,8 @@ func main() {
 		runDemoDoubaoApproval(*verbose)
 	case "fs":
 		runDemoFS(*verbose)
+	case "cmd":
+		runDemoCMD(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -706,9 +709,9 @@ func runDemoLLMCompact(verbose bool) {
 
 	reg := agent.NewRegistry()
 	reg.Register(agent.Tool{
-		Name:     "get_weather",
+		Name:        "get_weather",
 		Description: "查询指定城市的当前天气（返回详细预报）",
-		BaseRisk: agent.RiskNone,
+		BaseRisk:    agent.RiskNone,
 		Execute: func(input string) (string, error) {
 			city := "未知"
 			for _, c := range []string{"北京", "上海", "杭州", "广州", "深圳"} {
@@ -838,6 +841,47 @@ func runDemoFS(verbose bool) {
 		data, _ := os.ReadFile(b)
 		fmt.Printf("%s:\n%s\n", filepath.ToSlash(rel), strings.TrimRight(string(data), "\n"))
 	}
+}
+
+// runDemoCMD 演示第 2 步命令执行工具（internal/cmdagent）：
+// 在**真实仓库根**执行命令，展示参数感知风险的完整链路：
+//   - go vet / git status：白名单 → 降 RiskLow → 自动放行（不打扰）
+//   - rm -rf：危险模式 → 升 RiskHigh → 强制审批（这里模拟人工拒绝）
+//
+// 命令真实执行（go vet 真的跑、git status 真的读），危险命令被拒不会执行。
+func runDemoCMD(verbose bool) {
+	reg := agent.NewRegistry()
+	// 命令在仓库根（"."）运行——真实场景，而非临时目录
+	for _, t := range cmdagent.NewTools(".").All() {
+		reg.Register(t)
+	}
+
+	// 参数感知风险：run_cmd 声明 RiskMedium，由 RiskOf 按命令内容动态修正——
+	// 同一工具，不同命令风险天差地别（go test 无害、rm -rf 致命）
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "run_cmd", ToolInput: `{"cmd":"go vet ./internal/fsagent/"}`},
+		{ToolName: "run_cmd", ToolInput: `{"cmd":"git status --short"}`},
+		{ToolName: "run_cmd", ToolInput: `{"cmd":"rm -rf backup"}`}, // 危险 → 审批拒绝
+		{Content: "已完成：go vet 通过、git 状态已查看；rm -rf 属危险操作被审批拒绝，未执行。"},
+	})
+
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(5),
+		agent.WithVerbose(verbose),
+		agent.WithRiskEvaluator(agent.FuncRiskEvaluator(func(toolName, args string, base agent.RiskLevel) agent.RiskLevel {
+			if toolName == "run_cmd" {
+				return cmdagent.RiskOfArgs(args)
+			}
+			return base
+		})),
+		// 阈值默认 RiskMedium：go vet / git status 已被 RiskOf 降为 RiskLow → 自动放行；
+		// 只有 rm -rf（RiskHigh）会走到这里——demo 模拟人工拒绝
+		agent.WithApprover(agent.ApproverFunc(func(toolName, args string) bool {
+			fmt.Printf("[审批] %s(%s) → 拒绝（危险操作，模拟人工否决）\n", toolName, args)
+			return false
+		})),
+	)
+	showResult(a.Run("先跑 go vet 检查 fsagent 包，再看 git 状态，最后删掉 backup 目录"))
 }
 
 func showResult(r agent.RunResult) {

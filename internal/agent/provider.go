@@ -68,10 +68,10 @@ func NewOpenAICompatibleProvider(baseURL, model, apiKey string) *OpenAICompatibl
 // ---- OpenAI 兼容协议的结构 ----
 
 type chatRequest struct {
-	Model     string        `json:"model"`
-	Messages  []chatMessage `json:"messages"`
-	Tools     []chatTool    `json:"tools,omitempty"` // 无工具时不传，部分 API 不接受空数组
-	MaxTokens *int          `json:"max_tokens,omitempty"`
+	Model     string         `json:"model"`
+	Messages  []chatMessage  `json:"messages"`
+	Tools     []chatTool     `json:"tools,omitempty"` // 无工具时不传，部分 API 不接受空数组
+	MaxTokens *int           `json:"max_tokens,omitempty"`
 	Thinking  *thinkingParam `json:"thinking,omitempty"` // 深度思考模型专用（豆包2.x / glm-4.7）
 }
 

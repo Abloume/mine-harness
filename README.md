@@ -30,11 +30,12 @@
 - [x] 真渐进式 Skill（B 方案：`load_skill` 特殊通道 + harness 注入 system 消息，去重注入、协议闭合；**常驻清单**——`SkillProvider.List()` 把 name/description/tags 拼进 `load_skill` 描述，模型先"看目录"再按 name 加载正文；**L3 按需引用**——`read_skill_ref` 特殊通道按需读取 SKILL.md 引用的附属资源（references/xxx.md），必须先加载技能正文才能读引用，宿主做目录穿越防护；机制归内核、目录发现归宿主）— `internal/agent/skill.go`、宿主 `skillhost.go`、`-demo skill-b`
 - [x] 豆包 API 接入（火山方舟 Ark，OpenAI 兼容——与智谱/DeepSeek 共用同一个 Provider，零协议改动）— `main.go` 的 `-demo doubao` / `-demo doubao-approval`
 - [x] 真实文件工具集（PLAN 第 1 步：`read_file` / `write_file` / `edit_file` / `glob` / `grep`，独立包 `internal/fsagent`，与内核解耦——机制归内核、工具归应用层）— 原子写入（同目录 temp + rename）、写前自动备份到 `backup/`（file-ops-policy 落地，备份失败即停止）、`filepath.IsLocal` 路径越界防护、edit 精确替换防幻觉（old 必须恰好出现一次）、glob/grep 跳过备份目录；读类 RiskNone 自动放行，写/编辑 RiskMedium 走审批闸门 — `-demo fs`
+- [x] 命令执行工具（PLAN 第 2 步：`run_cmd`，独立包 `internal/cmdagent`）— `context.WithTimeout` 超时 + **进程组杀灭**（Setpgid + kill(-pid)，实测踩坑见下）、输出截断保留头尾防爆上下文、**参数感知风险**（`RiskOfArgs`：白名单命令 go build/test/vet、git status/diff 等降 RiskLow 自动放行，rm/git push/curl/sudo 等危险模式升 RiskHigh 强制审批，未知命令 RiskMedium）— `-demo cmd`
 
-## 当前进度（2026-10-02）
+## 当前进度（2026-10-06）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs` 十五个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集」，
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd` 十六个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行」，
 前七个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
 
 - **智谱**：需 `ZHIPU_API_KEY`，写入项目根 `.env`（已被 `.gitignore` 排除）；模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`。
@@ -149,6 +150,29 @@ token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 
   "已修改/已删除"的旧内容造成幻觉。
 - 风险分级：读类（read/glob/grep）RiskNone 自动放行；写/编辑 RiskMedium 达默认
   审批阈值，必须走审批闸门（`-demo fs` 演示了闸门触发 → 放行 → 备份 → 替换全链路）。
+
+**命令执行工具要点（`internal/cmdagent`，PLAN 第 2 步）**：
+- **超时杀进程的隐藏坑（实测踩坑，10/06 修复）**：`exec.CommandContext` 默认
+  Cancel 只杀"直接子进程"。命令是 `sh script.sh` 时，bash 会 fork 孙进程
+  （如 sleep），bash 被 SIGKILL 立即死，但孙进程还攥着 stdout 管道写端——
+  **exec.Cmd 的 Wait() 要等管道 EOF 才返回**（stdout 接 `io.Writer` 时内部是
+  os.Pipe + copy goroutine），于是"超时了却多等了整个命令时长"（sleep 5 →
+  超时 1s 却 5s 才返回）。解法：`SysProcAttr{Setpgid: true}` 自成进程组 +
+  `Cancel` 里 `kill(-pid, SIGKILL)` 连孙进程一起杀 + `WaitDelay` 兜底竞态。
+  对照：直接跑 `sleep`（无 shell）没这问题（进程自己就是叶子）；stdout 直接
+  继承终端也没问题（无内部管道）。JS/TS 对应物：`child_process` 的
+  `detached:true` + `process.kill(-pid)`，及 kill 后等 stdout 关闭的处理。
+- **参数感知风险**：同一 `run_cmd` 工具，命令不同风险天差地别——`RiskOfArgs`
+  先解包 JSON 取命令（**工具参数永远是 JSON 字符串，风险判定必须自己
+  Unmarshal**，否则会把 `{"cmd":"go` 当命令名，白名单全不命中），白名单
+  （go build/test/vet、git status/diff 等）降 RiskLow 自动放行、危险模式
+  （rm/git push/curl/sudo/重定向等）升 RiskHigh 强制审批、未知命令 RiskMedium。
+  数组执行模式（无 shell）已免疫 shell 注入，危险词检测是第二道防线。
+- **命令退出码 ≠ Go error**：非零退出码是"业务结果"（测试失败、编译报错要
+  回填给模型继续处理），只有执行层面失败（命令不存在/超时/无法启动）才是
+  error——与 JS child_process 的 exit code / throw 之分同理。
+- **输出截断保留头尾**：长输出头尾各半 + 显式"已截断 N 字符"标记——报错通常在
+  结尾，头尾保真即可；与内核压缩机制同动机（防爆上下文）。
 
 ## 约定
 

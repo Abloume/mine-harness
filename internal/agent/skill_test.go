@@ -126,9 +126,9 @@ func TestSkillLoadedIntoHistory(t *testing.T) {
 
 // stubSkillProvider 是测试用 SkillProvider（不依赖文件系统）。
 type stubSkillProvider struct {
-	skills  map[string]string            // name → 正文
-	refs    map[string]string            // "skill/ref" → 引用正文
-	meta    []SkillMeta                  // 常驻清单（第一层）
+	skills map[string]string // name → 正文
+	refs   map[string]string // "skill/ref" → 引用正文
+	meta   []SkillMeta       // 常驻清单（第一层）
 }
 
 func (s *stubSkillProvider) List() []SkillMeta {
@@ -281,10 +281,10 @@ func TestBuildLoadSkillDescription(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"file-ops-policy",            // 技能名
+		"file-ops-policy",        // 技能名
 		"删除前必须备份",                // description
-		"[tags: files, safety]",      // tags
-		"draft-policy", "先起草再发送",   // 第二个技能
+		"[tags: files, safety]",  // tags
+		"draft-policy", "先起草再发送", // 第二个技能
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("描述应包含 %q, got: %s", want, desc)
@@ -403,15 +403,15 @@ func TestReadSkillRefDedupe(t *testing.T) {
 // TestParseReadSkillRefInput 验证 L3 参数解析：JSON 双字段、缺字段、非法。
 func TestParseReadSkillRefInput(t *testing.T) {
 	cases := []struct {
-		input    string
-		skill    string
-		ref      string
-		ok       bool
+		input string
+		skill string
+		ref   string
+		ok    bool
 	}{
 		{`{"skill":"file-ops-policy","ref":"references/safety.md"}`, "file-ops-policy", "references/safety.md", true},
 		{`{"ref":"references/safety.md"}`, "", "", false}, // 缺 skill
-		{`{"skill":"x"}`, "", "", false},                   // 缺 ref
-		{`not-json`, "", "", false},                        // 非 JSON
+		{`{"skill":"x"}`, "", "", false},                  // 缺 ref
+		{`not-json`, "", "", false},                       // 非 JSON
 	}
 	for _, c := range cases {
 		skill, ref, ok := parseReadSkillRefInput(c.input)

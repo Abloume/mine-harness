@@ -48,21 +48,24 @@
 
 ---
 
-## 第 2 步 · 命令执行工具
+## 第 2 步 · 命令执行工具 ✅ 已完成（2026-10-06）
 
 **做什么**
-- `run_cmd`：`go build/test/vet`、`git status/diff` 等注册为工具
-- `context.WithTimeout` 超时控制（防命令挂死卡住主循环）
-- 输出截断（长输出只保留头尾，防爆上下文）——联动已有压缩机制
-- 写类命令（git commit/push、rm 等）走审批闸门
+- [x] `run_cmd`：`go build/test/vet`、`git status/diff` 等注册为工具（`internal/cmdagent`，独立包与内核解耦）— 已实现
+- [x] `context.WithTimeout` 超时控制（防命令挂死卡住主循环）— 已实现（Setpgid 进程组杀灭 + kill(-pid) + WaitDelay，实测踩坑：exec.Cmd 管道 EOF 等待让超时多等整个命令时长，见 README「命令执行工具要点」）
+- [x] 输出截断（长输出只保留头尾，防爆上下文）——联动已有压缩机制 — 已实现（头尾各半 + 显式截断标记）
+- [x] 写类命令（git commit/push、rm 等）走审批闸门 — 已实现（参数感知风险：`RiskOfArgs` 白名单降 RiskLow 自动放行、危险模式升 RiskHigh 强制审批、未知 RiskMedium）
 
 **Go 练习点**
-- `os/exec` 子进程（vs JS child_process）
-- `context` 超时取消（vs JS `Promise.race` + AbortController）
-- stdout/stderr 管道流式读取（vs JS stream）
+- `os/exec` 子进程（vs JS child_process）— 已实现（数组模式无 shell 免注入、Setpgid 进程组）
+- `context` 超时取消（vs JS `Promise.race` + AbortController）— 已实现（WithTimeout + Cancel + WaitDelay）
+- stdout/stderr 管道流式读取（vs JS stream）— 教学注释已覆盖（bytes.Buffer 收集 + 截断兜底，生产用 StdoutPipe 流式）
 
 **验证**
-- demo 在真实仓库跑 `go test` 并解析失败输出回填给模型
+- [x] demo 在真实仓库跑 `go test` 并解析失败输出回填给模型 — `-demo cmd`：go vet 真实执行（自动放行）→ git status 真实输出 → rm -rf 被审批拒绝（RiskHigh）
+- [x] 超时用例（sh 脚本 sleep 5 + timeout 1 → 1.01s 终止）、退出码回填、截断、路径/风险判定 — `cmdagent_test.go` 10 个测试全绿
+
+> 实现要点与踩坑已记录在 README「命令执行工具要点」节。
 
 ---
 
