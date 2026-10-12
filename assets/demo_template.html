@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>品牌宣传月</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; font-family:"PingFang SC",-apple-system,sans-serif; }
+  body { width:375px; margin:0 auto; background:#E4E8FC; background-image:linear-gradient(180deg,#E4E8FC 0%,#D5E0FA 55%,#C8D2FC 100%); min-height:100vh; }
+  .status { display:flex; justify-content:space-between; align-items:center; padding:14px 20px 4px; font-size:12px; color:#1E3A6E; }
+  .status .right { display:flex; gap:5px; align-items:center; }
+  .titlebar { padding:6px 20px 12px; }
+  .titlebar .title { font-size:17px; font-weight:500; color:#161619; }
+  .titlebar .sub { font-size:12px; font-weight:400; color:#6774BA; margin-top:3px; }
+  .tabs { display:flex; gap:3px; margin:8px 14px 0; }
+  .tab { width:168px; height:38px; border-radius:8px; font-size:14px; font-weight:500; display:flex; align-items:center; justify-content:center; }
+  .tab.active { background:linear-gradient(135deg,#5356F6 0%,#6B79FB 45%,#9FA8FD 100%); color:#FFFFFF; }
+  .tab { background:#FFFFFF; color:#2B2B36; }
+  .search { margin:12px 20px; padding:11px 14px; background:#FFFFFF; border-radius:24px; font-size:14px; font-weight:400; color:#9DB4D8; box-shadow:0 2px 8px rgba(33,115,209,.10); }
+  .cats { display:flex; gap:14px; padding:0 20px; font-size:12px; font-weight:500; line-height:17px; color:#002E70; }
+  .cats b { color:#002E70; font-weight:500; }
+  .section { padding:14px 20px 6px; display:flex; justify-content:space-between; align-items:baseline; }
+  .section .name { font-size:14px; font-weight:500; color:#1A1C28; }
+  .section .count { font-size:14px; font-weight:400; color:#002E70; }
+  .card { margin:8px 20px; background:transparent; border:1px solid #FFFFFF; border-radius:22px; padding:16px 14px; display:flex; align-items:center; gap:14px; box-shadow:0 5px 14px rgba(41,23,234,.14), inset 0 3px 12px rgba(41,23,234,.05); }
+  .badge { width:40px; height:40px; border-radius:50%; flex:none; display:flex; align-items:center; justify-content:center;
+           background:transparent; color:#2917EA; font-size:20px; font-weight:600; }
+  .card .name { font-size:16px; font-weight:500; line-height:16px; color:#002E70; }
+  .card .desc { font-size:12px; font-weight:400; color:#5976A9; margin-top:4px; }
+  .share { margin-left:auto; flex:none; min-width:77px; text-align:center; font-size:12px; font-weight:500; color:#5976A9;
+           border:1px solid rgba(89,118,169,.45); border-radius:12px; padding:7px 12px; background:#FFFFFF; }
+</style>
+</head>
+<body>
+  <div class="status"><span>9:41</span><span class="right"><span>▂▄▆█</span><span>▦</span></span></div>
+  <div class="titlebar">
+    <div class="title">品牌宣传月</div>
+    <div class="sub">示例品牌 · 能力支持 &gt;</div>
+  </div>
+  <div class="tabs"><span class="tab active">产品目录</span><span class="tab">活动日程</span></div>
+  <div class="search">搜产品名/宣传思路，如「示例」「模板」</div>
+  <div class="cats">按清单顺序·全部 N　<b>分类一 N</b>　<b>分类二</b></div>
+
+  <div class="section"><span class="name">分类一</span><span class="count">3个</span></div>
+  <div class="card"><div class="badge">01</div><div><div class="name">示例产品 A</div><div class="desc">产品简介占位文字一</div></div><span class="share">去分享 ↗</span></div>
+  <div class="card"><div class="badge">02</div><div><div class="name">示例产品 B</div><div class="desc">产品简介占位文字二</div></div><span class="share">去分享 ↗</span></div>
+  <div class="card"><div class="badge">03</div><div><div class="name">示例产品 C</div><div class="desc">产品简介占位文字三</div></div><span class="share">去分享 ↗</span></div>
+
+  <div class="section"><span class="name">分类二</span><span class="count">2个</span></div>
+  <div class="card"><div class="badge">01</div><div><div class="name">示例产品 D</div><div class="desc">产品简介占位文字四</div></div><span class="share">去分享 ↗</span></div>
+  <div class="card"><div class="badge">02</div><div><div class="name">示例产品 E</div><div class="desc">产品简介占位文字五</div></div><span class="share">去分享 ↗</span></div>
+</body>
+</html>

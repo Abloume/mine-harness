@@ -1,8 +1,9 @@
-// mine-harness 入口：十六个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd
+// mine-harness 入口：十八个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web
 package main
 
 import (
+	_ "embed" // 内置模板兜底：编译期把 assets/demo_template.html 打进二进制
 	"flag"
 	"fmt"
 	"os"
@@ -13,11 +14,13 @@ import (
 	"mine-harness/internal/agent"
 	"mine-harness/internal/cmdagent"
 	"mine-harness/internal/eval"
+	"mine-harness/internal/figmaagent"
 	"mine-harness/internal/fsagent"
+	"mine-harness/internal/webagent"
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -52,6 +55,10 @@ func main() {
 		runDemoFS(*verbose)
 	case "cmd":
 		runDemoCMD(*verbose)
+	case "figma":
+		runDemoFigma(*verbose)
+	case "web":
+		runDemoWeb(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -882,6 +889,126 @@ func runDemoCMD(verbose bool) {
 		})),
 	)
 	showResult(a.Run("先跑 go vet 检查 fsagent 包，再看 git 状态，最后删掉 backup 目录"))
+}
+
+// runDemoFigma 演示第 3 步 Figma 接入（internal/figmaagent）：
+// 真实读取 Figma 设计稿（fileKey 从 .env 的 FIGMA_FILE_KEY 读取，不写死在代码里）——
+// 画布结构 → 目标页面节点详情 → 导出 PNG。
+// token 从 .env 的 FIGMA_TOKEN 读取（同 ARK_API_KEY 模式，.env 已被 git 忽略）。
+// 风险分级演示：get_node/get_variables 纯读（RiskNone）自动放行；
+// figma_export_image 为 RiskMedium，执行前进入人工审批闸门（CLIApprover 问 y/n）——
+// 这就是"导图任务交由用户评审"在内核审批点的落地：拒绝则 fail-closed 不导出。
+func runDemoFigma(verbose bool) {
+	loadEnv(".env")
+	token := os.Getenv("FIGMA_TOKEN")
+	if token == "" {
+		fmt.Println("缺少 FIGMA_TOKEN：export FIGMA_TOKEN=xxx 或写入项目根 .env（已被 git 忽略）")
+		return
+	}
+
+	reg := agent.NewRegistry()
+	// fileKey 取自用户提供的链接：figma.com/design/<fileKey>/<标题>，从 .env 读取避免泄露
+	fileKey := os.Getenv("FIGMA_FILE_KEY")
+	if fileKey == "" {
+		fmt.Println("缺少 FIGMA_FILE_KEY：写入项目根 .env（已被 git 忽略）")
+		return
+	}
+	for _, t := range figmaagent.NewTools(fileKey, token).All() {
+		reg.Register(t)
+	}
+
+	// 脚本：先看画布结构 → 深入"产品目录页" → 导出页面 PNG。
+	// 注：figma_get_variables 端点在 Free 计划 token 下返回 403（缺
+	// file_variables:read scope，实测确认），故成功闭环里不放该步骤；
+	// 颜色规范可从 get_node 的 fills 提取（见输出中的"填充=#RRGGBB"）。
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "figma_get_node", ToolInput: `{"ids":"0:1"}`},
+		{ToolName: "figma_get_node", ToolInput: `{"ids":"52:3253","max_depth":2}`},
+		{ToolName: "figma_export_image", ToolInput: `{"ids":"52:3253","format":"png"}`},
+		{Content: "已完成：读取画布结构、产品目录页节点树（含填充颜色规范），并导出页面 PNG。"},
+	})
+
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(5),
+		agent.WithVerbose(verbose),
+		// 导图人工评审：export_image 达审批阈值后由 CLIApprover 问询（y 放行）。
+		// 拒绝 → fail-closed 不执行，模型收到"未授权"回填并停止该动作；
+		// 生产环境可换任意 Approver 实现（自动策略/远端审批）。
+		agent.WithApprover(agent.NewCLIApprover()),
+	)
+	showResult(a.Run("读取设计稿：先看画布结构，再深入产品目录页，最后导出页面 PNG"))
+}
+
+// demoWebTemplate 是"生成代码"产物的模板版页面（可安全提交 GitHub：
+// 品牌宣传月 / 示例品牌 · 能力支持 / 示例产品 A-E / 分类一·二，无公司信息）。
+// 本地真实版设计稿还原存于 webdemo/design.html（git 忽略，runDemoWeb 优先读取）；
+// 模板经 //go:embed 在编译期打进二进制，用于无本地文件时兜底——单文件分发
+// 也自带资源。第 4 步"模型生成代码"由 fsagent.write_file 驱动（PLAN 阶段 A），
+// 本 demo 聚焦阶段 B 的 serve_dir + screenshot 自动化闭环。
+//
+// JS/TS ↔ Go 差异：TS 里模板资源通常靠 bundler（webpack raw-loader / Vite ?raw）
+// 内联成字符串，或运行时 fs.readFile；Go 用 //go:embed 编译期打包进二进制——
+// 运行时不依赖文件系统，二进制自包含。代价是改动模板文件必须重新编译。
+//go:embed assets/demo_template.html
+var demoWebTemplate string
+
+// runDemoWeb 演示第 3 步前端场景能力闭环（阶段 B）：
+//
+//	Figma 设计稿 → 生成 HTML → serve_dir 起本地预览 → 无头 Chrome 截屏落盘。
+//
+// 链路真实执行：设计稿来自真实 API，预览服务真实可访问，截屏是真实渲染产物
+// （webdemo/shot.png）。第 4 步"模型生成代码"在本 demo 以预置 HTML 代替
+// （fsagent.write_file 已具备该能力，见 fs 场景）。
+func runDemoWeb(verbose bool) {
+	loadEnv(".env")
+	token := os.Getenv("FIGMA_TOKEN")
+
+	// 生成代码（阶段 A 能力）：把设计稿还原成静态页，落盘到 webdemo/
+	webDir := filepath.Join(".", "webdemo")
+	if err := os.MkdirAll(webDir, 0o755); err != nil {
+		fmt.Println("建 webdemo 目录失败:", err)
+		return
+	}
+	// 本地真实版优先：webdemo/design.html 由脱敏流程落盘（git 忽略），
+	// 不存在时回退到内置模板 demoWebTemplate（assets/demo_template.html 经
+	// //go:embed 打进二进制，可安全提交 GitHub、任何环境可跑通）。
+	pageHTML := demoWebTemplate
+	if raw, err := os.ReadFile(filepath.Join(webDir, "design.html")); err == nil {
+		pageHTML = string(raw)
+		fmt.Println("使用本地真实版 design.html（未提交，仅本地）")
+	} else {
+		fmt.Println("未找到 design.html，使用内置模板 demoWebTemplate（可提交）")
+	}
+	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte(pageHTML), 0o644); err != nil {
+		fmt.Println("写 index.html 失败:", err)
+		return
+	}
+	fmt.Println("已生成页面: webdemo/index.html")
+
+	reg := agent.NewRegistry()
+	if fileKey := os.Getenv("FIGMA_FILE_KEY"); token != "" && fileKey != "" {
+		for _, t := range figmaagent.NewTools(fileKey, token).All() {
+			reg.Register(t)
+		}
+	}
+	for _, t := range webagent.NewTools(".").All() {
+		reg.Register(t)
+	}
+
+	// 脚本：读设计稿结构（可选）→ 起预览 → 截屏回看。
+	// serve 固定端口 8321（占用会报错提示）；screenshot 375 宽模拟移动端。
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "figma_get_node", ToolInput: `{"ids":"104:17791","max_depth":1}`},
+		{ToolName: "serve_dir", ToolInput: `{"dir":"webdemo","port":8321}`},
+		{ToolName: "screenshot", ToolInput: `{"url":"http://127.0.0.1:8321/","out":"webdemo/shot.png","width":375}`},
+		{Content: "已完成：读取设计稿结构、起本地预览服务，并将还原页面截屏保存为 webdemo/shot.png。"},
+	})
+
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(5),
+		agent.WithVerbose(verbose),
+	)
+	showResult(a.Run("读取活动主页面设计稿结构，起本地预览服务，对还原的页面截图"))
 }
 
 func showResult(r agent.RunResult) {
