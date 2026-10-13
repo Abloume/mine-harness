@@ -47,6 +47,7 @@ func (p *dirSkillProvider) List() []agent.SkillMeta {
 			Name:        strings.TrimSpace(meta["name"]),
 			Description: strings.TrimSpace(meta["description"]),
 			Tags:        splitTags(meta["tags"]),
+			Paths:       splitTags(meta["paths"]), // 缺口 C：适用目录 glob（空 = 全局）
 		})
 	}
 	return out

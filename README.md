@@ -35,8 +35,8 @@
 
 ## 当前进度（2026-10-13）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http` 二十一个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输」，
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path` 二十四个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域」，
 前七个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
 
 - **智谱**：需 `ZHIPU_API_KEY`，写入项目根 `.env`（已被 `.gitignore` 排除）；模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`。
@@ -215,6 +215,32 @@ token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 
   （本包工具全部同步执行）。`-demo mcp-http` 实测：真实端口起 HTTP Server →
   HTTPClient 连接发现 14 工具 → 主循环调外部 read_file 读真实文件 →
   server Push tools/list_changed，SSE 订阅打印收到。
+
+## 短期缺口落地（2026-10-13 反思回写）
+
+来源：`reflections/` 视角一/二/三的「先补」结论——三个缺口不依赖第 5 步，
+已全部落地（PLAN 状态 ✅），配套 demo `validate` / `skill-history` / `skill-path`。
+
+- **工具返回结果 schema 校验（缺口 A，`tools.go` + `loop.go`）**：`Tool` 新增可选
+  `ResultValidator func(output string) error`（nil = 不校验，向后兼容）；内核在
+  工具执行成功后、结果回填上下文**之前**调用 `Registry.ValidateResult`——校验失败
+  的原文**不进上下文**，回填明确错误（"工具返回结果未通过校验: …"），并计入
+  重试预算（`guard.retryHit`）。与循环检测分工：同参重复永远先被循环检测拦截
+  （精确重复），校验重试预算兜"换了目标仍连续失败"。`-demo validate` 实测：
+  模型两次收到校验错误后给出"建议人工检查"而非假成功。
+- **Skill History 短期工作记忆（缺口 B，`skillhistory.go` + `loop.go`）**：环形
+  buffer（容量 8）记录最近工具调用（工具名/参数摘要 60 字符/成败，失败含校验
+  失败）；**上下文压缩触发时**注入「已尝试」快照 system 消息（快照未变化不
+  重复注入）——模型看到"之前试过什么、结果如何"，避免**语义重复**的失败路径
+  （循环检测只拦精确重复）。不改 Summarizer 接口（快照是独立 system 消息而非
+  摘要的一部分，机制边界更清晰）。`-demo skill-history` 实测：低预算触发压缩，
+  快照含 step1 成功 + step2 失败两条记录注入 system。
+- **Skill 路径作用域（缺口 C，`skill.go` + `skillhost.go` + `loop.go`）**：
+  `SkillMeta` 新增 `Paths []string`（适用目录 glob，空 = 全局，向后兼容）；
+  宿主侧 `FilterCatalogByPath` 收窄常驻候选清单（模型"看目录"时选不到不适用
+  技能），内核 `runLoadSkill` 二次兜底（contextPath 不匹配 → 拒绝加载，区分
+  "技能不存在"与"不适用"两类错误）；`BuildLoadSkillDescription` 输出 paths
+  标注。`-demo skill-path` 实测：候选收窄 + 内核拒绝 + 命中路径加载成功三连。
 
 ## 约定
 

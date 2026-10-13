@@ -178,6 +178,12 @@ type Agent struct {
 	skillProvider SkillProvider   // 宿主提供的技能发现器（nil = 未启用 B 方案）
 	loadedSkills  map[string]bool // 已注入过的技能名（去重：同一规范只进一次上下文）
 	loadedRefs    map[string]bool // 已注入过的引用 key（"skill/ref" 去重）
+	contextPath   string          // 当前任务的上下文路径（缺口 C：skill 路径作用域判定基准）
+
+	// Skill History 短期工作记忆（缺口 B）：环形 buffer 记录最近工具调用，
+	// 压缩时注入快照 system 消息，防「语义重复」的失败路径。
+	skillHistory   *SkillHistory
+	lastHistorySnap string // 上次注入的快照（相同则不重复注入，防刷屏）
 
 	history []Message
 }
@@ -225,6 +231,17 @@ func WithSkillProvider(sp SkillProvider) Option {
 	return func(a *Agent) { a.skillProvider = sp }
 }
 
+// WithContextPath 设置当前任务的上下文路径（缺口 C：Skill 路径作用域判定基准）。
+// 声明了 Paths 的技能只在其适用目录内可加载；空串 = 不限制（向后兼容）。
+func WithContextPath(p string) Option {
+	return func(a *Agent) { a.contextPath = p }
+}
+
+// WithSkillHistory 替换默认的短期工作记忆（自定义容量；nil 或 size<=0 禁用）。
+func WithSkillHistory(h *SkillHistory) Option {
+	return func(a *Agent) { a.skillHistory = h }
+}
+
 // NewAgent 构造一个 Agent，默认 maxSteps=10、budget=4096、verbose=false。
 func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 	a := &Agent{
@@ -239,6 +256,7 @@ func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 		denialLimit:       3,
 		loadedSkills:      map[string]bool{},
 		loadedRefs:        map[string]bool{},
+		skillHistory:      NewSkillHistory(8),
 	}
 	for _, o := range opts {
 		o(a)
@@ -286,6 +304,23 @@ func (a *Agent) Run(task string) RunResult {
 				} else {
 					log.Printf("[step %d] 上下文压缩：估算 token=%d > 预算 %d（mock 无 usage，估算兜底），压缩后估算 token=%d",
 						step, MessagesTokens(a.history), a.tokenBudget, MessagesTokens(a.history))
+				}
+			}
+			// 缺口 B：压缩后注入「已尝试」短期工作记忆快照——模型看到
+			// 之前试过哪些操作、结果如何，就不会语义重复同一失败路径
+			// （循环检测只拦精确重复，这里拦"换参数/换工具再来一遍"）。
+			// 快照作为独立 system 消息（不改 Summarizer 接口），只在新
+			// 快照与上次不同时注入，防刷屏。
+			if a.skillHistory != nil {
+				if snap := a.skillHistory.String(); snap != "" && snap != a.lastHistorySnap {
+					a.history = append(a.history, Message{
+						Role:    roleSystem,
+						Content: "【已尝试】最近工具调用历史（含失败，供参考避免重复）：\n" + snap,
+					})
+					a.lastHistorySnap = snap
+					if a.verbose {
+						log.Printf("[step %d] 注入 Skill History 快照（%d 条调用记录）", step, len(a.skillHistory.Snapshot()))
+					}
 				}
 			}
 		}
@@ -428,16 +463,27 @@ func (a *Agent) Run(task string) RunResult {
 				wg.Wait()
 				for i, it := range items {
 					res := results[i]
+					ok := res.err == nil
 					if res.err != nil {
 						if a.guard.retryHit(it.name, it.input) {
 							return RunResult{Steps: step, Status: StatusAborted,
 								Reason: fmt.Sprintf("重试超预算：%s 连续失败超过 %d 次", it.name, a.guard.retryLimit)}
 						}
 						res.out = fmt.Sprintf("工具调用失败: %v", res.err)
+					} else if verr := a.registry.ValidateResult(it.name, res.out); verr != nil {
+						// 缺口 A：结果未通过 schema 校验——不进上下文原文，
+						// 回填明确错误并计入重试预算（防模型「以为成功了」）
+						ok = false
+						if a.guard.retryHit(it.name, it.input) {
+							return RunResult{Steps: step, Status: StatusAborted,
+								Reason: fmt.Sprintf("重试超预算：%s 结果校验连续失败超过 %d 次", it.name, a.guard.retryLimit)}
+						}
+						res.out = fmt.Sprintf("工具返回结果未通过校验: %v", verr)
 					}
 					if a.verbose {
 						log.Printf("[step %d] tool_result ← %s", step, res.out)
 					}
+					a.recordHistory(step, it.name, it.input, ok)
 					a.history = append(a.history,
 						Message{Role: roleTool, Content: res.out, ToolCallID: it.tc.ID})
 				}
@@ -455,16 +501,26 @@ func (a *Agent) Run(task string) RunResult {
 					continue
 				}
 				out, err := a.registry.Call(it.name, it.input)
+				ok := err == nil
 				if err != nil {
 					if a.guard.retryHit(it.name, it.input) {
 						return RunResult{Steps: step, Status: StatusAborted,
 							Reason: fmt.Sprintf("重试超预算：%s 连续失败超过 %d 次", it.name, a.guard.retryLimit)}
 					}
 					out = fmt.Sprintf("工具调用失败: %v", err)
+				} else if verr := a.registry.ValidateResult(it.name, out); verr != nil {
+					// 缺口 A：结果未通过 schema 校验（同上，顺序执行路径）
+					ok = false
+					if a.guard.retryHit(it.name, it.input) {
+						return RunResult{Steps: step, Status: StatusAborted,
+							Reason: fmt.Sprintf("重试超预算：%s 结果校验连续失败超过 %d 次", it.name, a.guard.retryLimit)}
+					}
+					out = fmt.Sprintf("工具返回结果未通过校验: %v", verr)
 				}
 				if a.verbose {
 					log.Printf("[step %d] tool_result ← %s", step, out)
 				}
+				a.recordHistory(step, it.name, it.input, ok)
 				a.history = append(a.history,
 					Message{Role: roleTool, Content: out, ToolCallID: it.tc.ID})
 			}
@@ -501,6 +557,28 @@ func (a *Agent) runLoadSkill(step int, tc ToolCall) {
 		a.appendTool(tc.ID, "load_skill 参数无效：应为 {\"name\":\"技能名\"} 或直接给技能名。")
 		return
 	}
+	// 缺口 C：路径作用域校验。技能声明了适用目录而当前上下文路径不在其中
+	// → 拒绝加载（即使宿主侧候选清单被绕过/描述过期，内核仍兜底拦截）。
+	// 同时区分"技能不存在"与"不适用"两类错误，模型得到的指引不同。
+	if a.contextPath != "" {
+		catalog := a.skillProvider.List()
+		var meta *SkillMeta
+		for i := range catalog {
+			if catalog[i].Name == name {
+				meta = &catalog[i]
+				break
+			}
+		}
+		if meta == nil {
+			a.appendTool(tc.ID, fmt.Sprintf("技能 %s 不存在或不在可用清单中，请改用其他技能或直接完成任务。", name))
+			return
+		}
+		if !SkillAllowedForPath(*meta, a.contextPath) {
+			a.appendTool(tc.ID, fmt.Sprintf("技能 %s 仅适用于目录范围 %v，当前上下文路径 %s 不在其内，请改用其他技能或直接完成任务。",
+				name, meta.Paths, a.contextPath))
+			return
+		}
+	}
 	if a.loadedSkills[name] {
 		a.appendTool(tc.ID, fmt.Sprintf("技能 %s 已加载过，其规范已在系统上下文中，无需重复加载。", name))
 		return
@@ -525,6 +603,15 @@ func (a *Agent) runLoadSkill(step int, tc ToolCall) {
 // appendTool 以 tool 角色回填一条结果（协议闭合用，对应真实 API 的 tool 消息）。
 func (a *Agent) appendTool(toolCallID, content string) {
 	a.history = append(a.history, Message{Role: roleTool, Content: content, ToolCallID: toolCallID})
+}
+
+// recordHistory 把一次普通工具调用记入短期工作记忆（缺口 B）。
+// 特殊通道（load_skill / read_skill_ref）不记录：它们有独立的去重机制
+// （loadedSkills / loadedRefs），重复防护已覆盖，无需再进历史快照。
+func (a *Agent) recordHistory(step int, name, input string, ok bool) {
+	if a.skillHistory != nil {
+		a.skillHistory.Record(step, name, input, ok)
+	}
 }
 
 // runReadSkillRef 处理 read_skill_ref 特殊通道（L3 按需引用）。

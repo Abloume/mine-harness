@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -86,10 +87,58 @@ type SkillProvider interface {
 
 // SkillMeta 是技能的常驻元数据（第一层）。正文不进这里——正文太重，
 // 只按需加载。Tags 是可选分类标签，辅助模型匹配（如 files/safety）。
+//
+// Paths 是可选路径作用域（缺口 C）：glob 模式列表（相对项目根），声明该技能
+// 适用的目录/文件范围（如 internal/mcpserver/**）。空 = 全局适用（向后兼容）。
+// 宿主拼候选清单时用 FilterCatalogByPath 收窄；内核 load_skill 时再校验兜底。
 type SkillMeta struct {
 	Name        string
 	Description string
 	Tags        []string
+	Paths       []string // 可选：适用目录 glob 模式（空 = 全局）
+}
+
+// pathMatchesPatterns 判定路径 p 是否命中任一 glob 模式（filepath.Match）。
+// 空模式集 = 全局适用（返回 true，向后兼容未声明 Paths 的技能）。
+//
+// JS/TS ↔ Go 差异：JS 用 micromatch 等库做 glob；Go 标准库自带
+// path/filepath.Match（单模式）——多模式就逐个试，无需第三方依赖。
+func pathMatchesPatterns(patterns []string, p string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	for _, pat := range patterns {
+		if ok, _ := filepath.Match(pat, p); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// SkillAllowedForPath 判断技能是否适用于上下文路径（内核 load_skill 时校验）。
+// contextPath 为空 = 不限制（向后兼容：未启用路径作用域的 Agent 行为不变）。
+func SkillAllowedForPath(s SkillMeta, path string) bool {
+	if path == "" {
+		return true
+	}
+	return pathMatchesPatterns(s.Paths, path)
+}
+
+// FilterCatalogByPath 按上下文路径过滤技能清单（缺口 C）：声明了 Paths 且
+// 当前路径不命中的技能**不进候选**——模型"看目录"时就不会选到不适用技能
+// （收窄选择面，减少误触发）。宿主在拼 load_skill 描述前调用；
+// 内核 load_skill 的校验是第二道保险。
+func FilterCatalogByPath(catalog []SkillMeta, path string) []SkillMeta {
+	if path == "" {
+		return catalog
+	}
+	out := make([]SkillMeta, 0, len(catalog))
+	for _, s := range catalog {
+		if pathMatchesPatterns(s.Paths, path) {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // BuildLoadSkillDescription 把技能清单拼进 load_skill 工具的 Description：
@@ -106,6 +155,9 @@ func BuildLoadSkillDescription(catalog []SkillMeta) string {
 		b.WriteString("- " + s.Name)
 		if len(s.Tags) > 0 {
 			b.WriteString(" [tags: " + strings.Join(s.Tags, ", ") + "]")
+		}
+		if len(s.Paths) > 0 {
+			b.WriteString(" [paths: " + strings.Join(s.Paths, ", ") + "]")
 		}
 		if s.Description != "" {
 			b.WriteString(" — " + s.Description)

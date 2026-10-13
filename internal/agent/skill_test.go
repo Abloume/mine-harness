@@ -421,3 +421,95 @@ func TestParseReadSkillRefInput(t *testing.T) {
 		}
 	}
 }
+
+// ---- 缺口 C · Skill 路径作用域 ----
+
+// TestFilterCatalogByPath 候选收窄：声明 Paths 且当前路径不命中的技能
+// 不进候选；未声明 Paths 的技能始终在候选（全局适用）。
+func TestFilterCatalogByPath(t *testing.T) {
+	catalog := []SkillMeta{
+		{Name: "global", Description: "全局技能"},
+		{Name: "mcpsrv", Paths: []string{"internal/mcpserver/**"}},
+		{Name: "frontend", Paths: []string{"web/**"}},
+	}
+	got := FilterCatalogByPath(catalog, "internal/mcpserver/mcpserver.go")
+	names := map[string]bool{}
+	for _, s := range got {
+		names[s.Name] = true
+	}
+	if !names["global"] || !names["mcpsrv"] {
+		t.Fatalf("命中路径的技能应保留, got %v", names)
+	}
+	if names["frontend"] {
+		t.Fatal("未命中路径的技能不应进候选")
+	}
+}
+
+// TestSkillPathScopingBlocksLoad 内核 load_skill 兜底：上下文路径不在
+// 技能适用范围内 → 拒绝加载（即使模型硬调 load_skill）。
+func TestSkillPathScopingBlocksLoad(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(NewLoadSkillTool())
+
+	sp := &stubSkillProvider{
+		skills: map[string]string{"policy": "# 规范\n仅在 cmd 目录适用"},
+		meta:   []SkillMeta{{Name: "policy", Paths: []string{"cmd/**"}}},
+	}
+	// 上下文在 internal/mcpserver（不在 cmd/**）：加载被拒
+	llm := NewMockLLM([]MockDecision{
+		{ToolName: LoadSkillToolName, ToolInput: `{"name":"policy"}`},
+		{Content: "完成。"},
+	})
+	a := NewAgent(llm, reg, WithMaxSteps(4),
+		WithSkillProvider(sp), WithContextPath("internal/mcpserver"))
+	a.Run("任务")
+
+	blocked := false
+	for _, m := range a.History() {
+		if m.Role == roleTool && strings.Contains(m.Content, "仅适用于目录范围") {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Fatal("路径不匹配时 load_skill 应被拒绝")
+	}
+
+	// 上下文在 cmd/tools（命中 cmd/**）：加载成功，正文进 system
+	llm2 := NewMockLLM([]MockDecision{
+		{ToolName: LoadSkillToolName, ToolInput: `{"name":"policy"}`},
+		{Content: "完成。"},
+	})
+	a2 := NewAgent(llm2, reg, WithMaxSteps(4),
+		WithSkillProvider(sp), WithContextPath("cmd/tools"))
+	a2.Run("任务")
+	loaded := false
+	for _, m := range a2.History() {
+		if m.Role == roleSystem && strings.Contains(m.Content, "仅在 cmd 目录适用") {
+			loaded = true
+		}
+	}
+	if !loaded {
+		t.Fatal("路径命中时 load_skill 应成功加载")
+	}
+}
+
+// TestSkillPathScopingGlobalWhenNoPaths 未声明 Paths 的技能 + 任意上下文
+// 路径都可加载（向后兼容：旧技能不受路径作用域影响）。
+func TestSkillPathScopingGlobalWhenNoPaths(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(NewLoadSkillTool())
+	sp := &stubSkillProvider{
+		skills: map[string]string{"policy": "# 规范\n全局适用"},
+		meta:   []SkillMeta{{Name: "policy"}}, // 无 Paths
+	}
+	llm := NewMockLLM([]MockDecision{
+		{ToolName: LoadSkillToolName, ToolInput: `{"name":"policy"}`},
+		{Content: "完成。"},
+	})
+	a := NewAgent(llm, reg, WithMaxSteps(4),
+		WithSkillProvider(sp), WithContextPath("internal/mcpserver"))
+	res := a.Run("任务")
+	if res.Status != StatusCompleted {
+		t.Fatalf("无 Paths 技能应全局可用, got %s: %s", res.Status, res.Reason)
+	}
+}

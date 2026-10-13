@@ -1,5 +1,5 @@
-// mine-harness 入口：二十一个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http
+// mine-harness 入口：二十四个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path
 package main
 
 import (
@@ -26,7 +26,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -75,6 +75,12 @@ func main() {
 		runDemoMCPClient(*verbose)
 	case "mcp-http":
 		runDemoMCPHTTP(*verbose)
+	case "validate":
+		runDemoValidate(*verbose)
+	case "skill-history":
+		runDemoSkillHistory(*verbose)
+	case "skill-path":
+		runDemoSkillPath(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -678,6 +684,138 @@ func runDemoSkillB(verbose bool) {
 		agent.WithVerbose(verbose))
 	showResult(a.Run("删除 /tmp/report.txt"))
 }
+
+// runDemoValidate 演示缺口 A · 工具返回结果 schema 校验：
+// 工具声明 ResultValidator，执行"成功"但输出不合 schema 时——
+// 原文不进上下文，回填明确错误（防模型「以为成功了」），
+// 校验失败计入重试预算；同参重复由循环检测兜底中止。
+func runDemoValidate(verbose bool) {
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "lookup",
+		Description: "查询用户信息，返回 JSON：{\"ok\":true,\"data\":\"...\"}",
+		Execute: func(input string) (string, error) {
+			// 工具"执行成功"，但返回的是不合 schema 的乱码（模拟坏数据源）
+			return "not-json-garbage", nil
+		},
+		ResultValidator: func(output string) error {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(output), &m); err != nil {
+				return fmt.Errorf("返回不是合法 JSON: %v", err)
+			}
+			if v, _ := m["ok"].(bool); !v {
+				return fmt.Errorf("缺少 ok=true 字段")
+			}
+			return nil
+		},
+	})
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "lookup", ToolInput: `{"id":1}`},
+		{ToolName: "lookup", ToolInput: `{"id":2}`}, // 换参数再试，仍校验失败
+		{Content: "查询接口返回格式异常，无法确认结果，建议人工检查数据源。"},
+	})
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(6), agent.WithVerbose(verbose))
+	showResult(a.Run("查一下 id=1 的用户"))
+}
+
+// runDemoSkillHistory 演示缺口 B · Skill History 短期工作记忆：
+// 低预算 + 大工具结果触发上下文压缩 → 压缩后注入「已尝试」快照
+// （含最近工具调用与成败），模型可见之前试过什么，避免语义重复。
+func runDemoSkillHistory(verbose bool) {
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "big_out",
+		Description: "返回超长内容（模拟大工具结果，用于触发上下文压缩）",
+		Execute: func(input string) (string, error) {
+			return strings.Repeat("x", 2000), nil
+		},
+	})
+	reg.Register(agent.Tool{
+		Name:        "read_file",
+		Description: "读取文件内容",
+		Execute: func(input string) (string, error) {
+			return "", fmt.Errorf("文件不存在")
+		},
+	})
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "big_out", ToolInput: `{}`},
+		{ToolName: "read_file", ToolInput: `{"path":"/tmp/missing.txt"}`},
+		{Content: "文件缺失，读取失败。"},
+	})
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(5), agent.WithTokenBudget(500), agent.WithVerbose(verbose))
+	res := a.Run("读取 /tmp/missing.txt")
+	// 展示压缩时注入的快照（【已尝试】system 消息）
+	for _, m := range a.History() {
+		if strings.HasPrefix(m.Content, "【已尝试】") {
+			fmt.Println("—— 压缩时注入的短期工作记忆快照 ——")
+			fmt.Println(m.Content)
+			break
+		}
+	}
+	showResult(res)
+}
+
+// runDemoSkillPath 演示缺口 C · Skill 路径作用域：
+// 技能声明适用目录（cmd/**），宿主侧候选收窄（FilterCatalogByPath），
+// 内核 load_skill 兜底校验——路径不匹配拒绝加载、匹配才成功注入正文。
+func runDemoSkillPath(verbose bool) {
+	reg := agent.NewRegistry()
+	reg.Register(agent.NewLoadSkillTool())
+	provider := demoPathProvider{}
+
+	// ① 宿主侧候选收窄：contextPath 不在 cmd/** → cmd-policy 不进候选清单
+	catalog := agent.FilterCatalogByPath(provider.List(), "internal/mcpserver")
+	fmt.Printf("① 候选收窄：contextPath=internal/mcpserver → 清单剩 %d 个技能（cmd-policy 被过滤）\n", len(catalog))
+
+	// ② 内核兜底：Agent 带 contextPath 跑，模型硬调 load_skill → 被拒
+	llm1 := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: agent.LoadSkillToolName, ToolInput: `{"name":"cmd-policy"}`},
+		{Content: "完成。"},
+	})
+	a1 := agent.NewAgent(llm1, reg,
+		agent.WithMaxSteps(4), agent.WithSkillProvider(provider),
+		agent.WithContextPath("internal/mcpserver"), agent.WithVerbose(verbose))
+	res1 := a1.Run("读取命令目录规范")
+	// 展示内核拒绝消息（load_skill 被路径作用域拦下）
+	for _, m := range a1.History() {
+		if m.Role == "tool" && strings.Contains(m.Content, "仅适用于目录范围") {
+			fmt.Println("② 内核兜底：load_skill 被拒 ——", m.Content)
+		}
+	}
+	showResult(res1)
+
+	// ③ 路径命中：contextPath=cmd/tools → 加载成功，正文进 system
+	llm2 := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: agent.LoadSkillToolName, ToolInput: `{"name":"cmd-policy"}`},
+		{Content: "已按 cmd 目录规范执行。"},
+	})
+	a2 := agent.NewAgent(llm2, reg,
+		agent.WithMaxSteps(4), agent.WithSkillProvider(provider),
+		agent.WithContextPath("cmd/tools"), agent.WithVerbose(verbose))
+	showResult(a2.Run("读取命令目录规范"))
+}
+
+// demoPathProvider 是演示用 SkillProvider（缺口 C）：
+// 只提供一个带路径作用域的技能 cmd-policy（适用于 cmd/**）。
+type demoPathProvider struct{}
+
+func (demoPathProvider) List() []agent.SkillMeta {
+	return []agent.SkillMeta{{
+		Name:        "cmd-policy",
+		Description: "命令目录规范：执行前先 dry-run",
+		Paths:       []string{"cmd/**"},
+	}}
+}
+
+func (demoPathProvider) LoadSkill(name string) (string, bool) {
+	if name != "cmd-policy" {
+		return "", false
+	}
+	return "# cmd 目录规范\n任何命令执行前必须先 dry-run 预览，再实际执行。", true
+}
+
+func (demoPathProvider) LoadReference(skill, ref string) (string, bool) { return "", false }
 
 // runDemoParallel 演示多 tool_call 并发执行：
 // 模型一轮返回 3 个工具调用，工具都声明 ConcurrentSafe=true → 内核用

@@ -11,7 +11,7 @@
 
 ## 现状（已完成）
 
-第一版内核跑通 **21 个演示场景**（`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http`）：
+第一版内核跑通 **24 个演示场景**（`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path`）：
 
 - [x] agent loop（ReAct 主循环）、工具注册、上下文管理（token 预算 + 压缩 + FIFO 兜底）
 - [x] 循环检测 + 软停止、审批点（风险分级 + fail-closed）、评测门
@@ -160,40 +160,46 @@
 
 ## 反思回写 · 短期缺口（2026-10-13）
 
-> 来源：`reflections/2026-10-13-architecture-and-acceptance.md` 的「先补」结论。
-> 两个缺口不依赖第 3/4 步，可随时开工；落地后状态改 ✅。
+> 来源：`reflections/2026-10-13-architecture-and-acceptance.md` 与
+> `reflections/2026-10-13-development-loop-skills.md` 的「先补」结论。
+> 三个缺口均不依赖第 5 步，已全部落地（✅）；实现要点与 demo 见 README
+> 「短期缺口落地」节。
 > 与既有机制的分工：循环检测拦「精确重复」，Skill History 拦「语义重复」；
 > 工具结果校验拦「模型以为成功了」。
 
 ### 缺口 A · 工具返回结果 schema 校验
 
 **做什么**
-- [ ] 工具声明返回 schema（结构化描述返回字段/类型），`Registry` 登记
-- [ ] 执行结果回填前校验：合法才进上下文，非法/缺失字段走明确错误（防模型「以为成功了」）
-- [ ] 与既有失败重试预算联动：校验失败计入重试，超预算走软停止
+- [x] 工具声明返回 schema（结构化描述返回字段/类型），`Registry` 登记
+- [x] 执行结果回填前校验：合法才进上下文，非法/缺失字段走明确错误（防模型「以为成功了」）
+- [x] 与既有失败重试预算联动：校验失败计入重试，超预算走软停止
 
 **Go 练习点**
 - 类型化契约：schema 定义 + `encoding/json` 严格解码（vs JS 直接拿对象不校验）
 - 校验与执行解耦：工具只管产出，校验是内核通用层
 
 **验证**
-- 单元测试：构造非法返回（字段缺失/类型错）→ 断言不进上下文、错误明确
-- demo：一个返回 schema 校验失败的用例，模型收到明确错误而非假成功
+- [x] 单元测试：构造非法返回（字段缺失/类型错）→ 断言不进上下文、错误明确 —
+  `validate_test.go`（通过/拒绝/中止/未知工具 4 用例，`go test -race` 全绿）
+- [x] demo：一个返回 schema 校验失败的用例，模型收到明确错误而非假成功 —
+  `go run . -demo validate`
 
 ### 缺口 B · Skill History（短期工作记忆）
 
 **做什么**
-- [ ] 环形 buffer 记录最近 N 步工具调用（工具名/参数摘要/成败）
-- [ ] 压缩时并入摘要（6 段式加「已尝试」段），防重复无效调用
-- [ ] 与循环检测互补：循环检测拦「精确重复」，Skill History 拦「语义重复」
+- [x] 环形 buffer 记录最近 N 步工具调用（工具名/参数摘要/成败）
+- [x] 压缩时并入摘要（6 段式加「已尝试」段），防重复无效调用
+- [x] 与循环检测互补：循环检测拦「精确重复」，Skill History 拦「语义重复」
 
 **Go 练习点**
 - 环形 buffer / 切片截断（vs JS 无内置环形结构）
 - 摘要拼接与上下文预算联动
 
 **验证**
-- demo：模型第二次尝试同一失败路径时，历史已注入 system，行为改变可观察
-- 单元测试：buffer 满覆盖、压缩后仍保留历史摘要
+- [x] demo：模型第二次尝试同一失败路径时，历史已注入 system，行为改变可观察 —
+  `go run . -demo skill-history`（压缩触发注入快照，含成败标记）
+- [x] 单元测试：buffer 满覆盖、压缩后仍保留历史摘要 — `skillhistory_test.go`
+  （环形覆盖/格式化/禁用/压缩注入/校验失败记失败 5 用例全绿）
 
 ### 缺口 C · Skill 路径作用域（B 方案增强）
 
@@ -202,17 +208,18 @@
 > 避免"全局可加载"造成误触发面过大。
 
 **做什么**
-- [ ] skill 声明适用目录/文件范围（如 `paths: ["internal/mcpserver/**"]`），常驻清单可见
-- [ ] load_skill 按路径过滤：模型上下文无关的 skill 不出现在候选里（收窄选择面）
-- [ ] 与缺口 A/B 无关，纯 Skill 加载机制增强；落地后配合 skill 误触发评测用例验证
+- [x] skill 声明适用目录/文件范围（如 `paths: ["internal/mcpserver/**"]`），常驻清单可见
+- [x] load_skill 按路径过滤：模型上下文无关的 skill 不出现在候选里（收窄选择面）
+- [x] 与缺口 A/B 无关，纯 Skill 加载机制增强；配合 skill 误触发评测用例验证
 
 **Go 练习点**
 - 路径匹配（`path/filepath` Match/Glob 语义 vs JS 无内置 glob）
 - 过滤逻辑与既有常驻清单生成的解耦
 
 **验证**
-- 单元测试：不同工作目录下候选清单正确收窄
-- 与评测门联动：临近领域混淆用例在无关路径下不再触发该 skill
+- [x] 单元测试：不同工作目录下候选清单正确收窄 — `skill_test.go` 缺口 C 三用例全绿
+- [x] demo：候选收窄 + 内核拒绝 + 命中路径加载成功 — `go run . -demo skill-path`
+  （与评测门联动：临近领域混淆用例在无关路径下不再触发该 skill）
 
 ---
 
@@ -220,17 +227,28 @@
 
 **做什么**
 - ① 长期记忆：会话持久化 + 断点续跑（呼应已有上下文管理，从"单次 Run"扩到跨会话）
-- ② 检索工具化：embedding + 向量相似度注册为普通工具（模型需要时主动查）
+- ② 检索工具化——**树索引 + 推理检索优先**（决策依据 2026-10-13，PageIndex 观察）：
+  「相似不等于相关」是向量检索的老毛病；代码库/文档天然有层级结构
+  （目录树、包/文件/函数、章节/段落），检索不做向量相似度，而是**复用既有
+  glob / grep / read_file 工具**，让模型沿树推理定位（先看目录 → 翻到文件 →
+  扫到函数），结果可追溯到**文件/行**——"检索 = 工具调用序列"，零新依赖、
+  复用第 1/2 步；索引侧只做「树结构摘要」（可全量一次、由基础模型精修，
+  把 LLM 请出每次检索的关键路径）
 - ③ 记忆分层 + 关键信息优先召回（反思回写 2026-10-13）：短期记忆（压缩 + LLM 摘要）已有，
   本步补齐长期记忆层，召回按「关键信息优先」设计
+- ④ （可选增强，不进主线）向量相似度检索：语义模糊查询（会话历史/笔记）才值得
+  embedding，作为第 ② 条的补充路线，需要时再引入
 
 **Go 练习点**
 - 文件与 JSON 持久化（encoding/json 序列化）
 - 切片 / 排序 / 编码
-- 向量计算与 TopK 选择
+- 树遍历与层级索引结构（对应"树结构从文档布局提取，不依赖 LLM"）
+- 向量计算与 TopK 选择（仅第 ④ 增强路线）
 
 **验证**
 - 跨会话 demo：上次任务结论可被下次会话检索召回（断点续跑 + 记忆查询）
+- 树检索 demo：模型沿目录树定位到具体文件/行并作答（引用可追溯）；
+  大代码库/长文档场景成本只随命中节点增长（不整读）
 
 ---
 

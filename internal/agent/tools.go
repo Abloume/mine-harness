@@ -11,12 +11,19 @@ import "fmt"
 // ConcurrentSafe 声明工具是否线程安全：同一轮多 tool_call 时，只有全部
 // 声明并发安全的工具才会被 goroutine 并行执行；未声明（false）的工具
 // 保持顺序执行——并发是优化，正确性优先（工具可能共享可变状态）。
+//
+// ResultValidator 可选地声明"返回结果校验器"（缺口 A：工具返回结果 schema
+// 校验）：工具执行成功后、结果回填上下文之前，内核调用它校验输出
+// （如必须是合法 JSON 且含关键字段）。返回非 nil 表示校验失败——该结果
+// **不进上下文**，回填明确错误并计入重试预算（防模型"以为成功了"）。
+// nil = 不校验（向后兼容：现有工具默认不声明，行为不变）。
 type Tool struct {
-	Name           string
-	Description    string
-	BaseRisk       RiskLevel                          // 基础风险级别（RiskNone..RiskHigh），默认 0 即 RiskNone
-	ConcurrentSafe bool                               // 声明并发安全后参与并行执行
-	Execute        func(input string) (string, error) // 简化：JSON 字符串进、字符串出
+	Name            string
+	Description     string
+	BaseRisk        RiskLevel                          // 基础风险级别（RiskNone..RiskHigh），默认 0 即 RiskNone
+	ConcurrentSafe  bool                               // 声明并发安全后参与并行执行
+	Execute         func(input string) (string, error) // 简化：JSON 字符串进、字符串出
+	ResultValidator func(output string) error          // 可选：返回结果 schema 校验（nil = 不校验）
 }
 
 // Registry 是工具注册表：模型只能调用已注册的工具——这本身就是一层护栏
@@ -74,4 +81,18 @@ func (r *Registry) Call(name, input string) (string, error) {
 		return "", fmt.Errorf("未知工具: %s（护栏拦截，模型不能调用未注册工具）", name)
 	}
 	return t.Execute(input)
+}
+
+// ValidateResult 在工具执行成功后调用：校验返回结果是否满足工具声明的
+// schema（ResultValidator）。未注册工具 / 未声明校验器返回 nil（放行）。
+//
+// JS/TS ↔ Go 差异：TS 常在 async 工具内部自行 throw 校验错误；这里刻意把
+// "工具只管产出、校验是内核通用层"拆开——校验失败与执行失败是两类错误，
+// 前者提示"结果格式不对"，后者提示"动作没做成"，模型收到的文案不同。
+func (r *Registry) ValidateResult(name, output string) error {
+	t, ok := r.tools[name]
+	if !ok || t.ResultValidator == nil {
+		return nil
+	}
+	return t.ResultValidator(output)
 }
