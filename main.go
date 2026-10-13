@@ -1,5 +1,5 @@
-// mine-harness 入口：二十四个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path
+// mine-harness 入口：二十五个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session
 package main
 
 import (
@@ -22,11 +22,12 @@ import (
 	"mine-harness/internal/figmaagent"
 	"mine-harness/internal/fsagent"
 	"mine-harness/internal/mcpserver"
+	"mine-harness/internal/memory"
 	"mine-harness/internal/webagent"
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -81,6 +82,8 @@ func main() {
 		runDemoSkillHistory(*verbose)
 	case "skill-path":
 		runDemoSkillPath(*verbose)
+	case "session":
+		runDemoSession(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -816,6 +819,76 @@ func (demoPathProvider) LoadSkill(name string) (string, bool) {
 }
 
 func (demoPathProvider) LoadReference(skill, ref string) (string, bool) { return "", false }
+
+// runDemoSession 演示第 5 步阶段一 · 会话持久化 + 断点续跑：
+// Run1 完成任务并把对话历史 JSON 落盘（internal/memory.SessionStore，
+// 原子写）；Run2 用**新的 Agent 实例**加载历史作为初始上下文继续——
+// 模型上下文延续上次 Run 的探索与结论，不必重述。
+// 对比无持久化：Run2 若从零开始，上次结论就丢了。
+func runDemoSession(verbose bool) {
+	store, err := memory.NewSessionStore("sessions")
+	if err != nil {
+		fmt.Println("会话存储初始化失败:", err)
+		return
+	}
+	const sessionID = "demo-session"
+
+	readGoMod := agent.Tool{
+		Name:        "read_file",
+		Description: "读取文件内容",
+		Execute: func(input string) (string, error) {
+			return "module mine-harness\n\ngo 1.27.1\n\nrequire (\n\tgithub.com/go-rod/rod v0.116.2 // indirect\n)", nil
+		},
+	}
+
+	// Run1：调研并得出结论，把历史落盘
+	reg1 := agent.NewRegistry()
+	reg1.Register(readGoMod)
+	llm1 := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "read_file", ToolInput: `{"path":"go.mod"}`},
+		{Content: "结论：mine-harness 使用 Go 1.27.1，主要依赖 go-rod（间接依赖）。"},
+	})
+	a1 := agent.NewAgent(llm1, reg1, agent.WithMaxSteps(5), agent.WithVerbose(verbose))
+	showResult(a1.Run("读取 go.mod，确认 Go 版本与主要依赖"))
+	if err := store.Save(sessionID, a1.History()); err != nil {
+		fmt.Println("保存会话失败:", err)
+		return
+	}
+	fmt.Printf("—— 会话已持久化：%d 条消息 → sessions/%s.json\n\n", len(a1.History()), sessionID)
+
+	// Run2：新 Agent 实例，加载历史继续（断点续跑）
+	msgs, ok, err := store.Load(sessionID)
+	if err != nil {
+		fmt.Println("加载会话失败:", err)
+		return
+	}
+	if !ok {
+		fmt.Println("会话不存在（不应发生）")
+		return
+	}
+	last := lastAssistantAnswer(msgs)
+	fmt.Printf("—— 恢复 %d 条消息，上次结论：%s\n", len(msgs), last)
+
+	reg2 := agent.NewRegistry()
+	reg2.Register(readGoMod) // 工具重新登记（能力不持久，上下文持久）
+	llm2 := agent.NewMockLLM([]agent.MockDecision{
+		{Content: "根据恢复的会话历史，直接汇报：Go 1.27.1，无需重复探索。"},
+	})
+	a2 := agent.NewAgent(llm2, reg2,
+		agent.WithMaxSteps(3), agent.WithInitialHistory(msgs), agent.WithVerbose(verbose))
+	showResult(a2.Run("继续上次调研：直接汇报结论"))
+}
+
+// lastAssistantAnswer 提取历史里最后一条非工具调用的 assistant 文本
+// （展示"上次结论被恢复进上下文"）。
+func lastAssistantAnswer(msgs []agent.Message) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" && len(msgs[i].ToolCalls) == 0 && msgs[i].Content != "" {
+			return msgs[i].Content
+		}
+	}
+	return "(无)"
+}
 
 // runDemoParallel 演示多 tool_call 并发执行：
 // 模型一轮返回 3 个工具调用，工具都声明 ConcurrentSafe=true → 内核用

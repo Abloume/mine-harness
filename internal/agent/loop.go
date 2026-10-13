@@ -182,8 +182,13 @@ type Agent struct {
 
 	// Skill History 短期工作记忆（缺口 B）：环形 buffer 记录最近工具调用，
 	// 压缩时注入快照 system 消息，防「语义重复」的失败路径。
-	skillHistory   *SkillHistory
+	skillHistory    *SkillHistory
 	lastHistorySnap string // 上次注入的快照（相同则不重复注入，防刷屏）
+
+	// initialHistory 是断点续跑（第 5 步阶段一）的初始上下文：
+	// 由会话持久化恢复（internal/memory），Run 时只追加本次 user 消息，
+	// 不再重建 system 首条——模型上下文延续上次 Run 的探索与结论。
+	initialHistory []Message
 
 	history []Message
 }
@@ -242,6 +247,16 @@ func WithSkillHistory(h *SkillHistory) Option {
 	return func(a *Agent) { a.skillHistory = h }
 }
 
+// WithInitialHistory 设置断点续跑的初始上下文（第 5 步阶段一）：
+// 传入的 history 必须已含 system 首条（即会话持久化恢复出的完整历史）。
+// Run 时不再重建 system 消息，只追加本次 user 任务——上下文延续上次 Run。
+// 约定：guard（循环检测）/审批计数等"本轮护栏"状态不随历史恢复
+// （跨会话不该继承，新 Run 是新护栏）；B 方案已加载技能可从 history
+// 的 system 消息推导（[已加载技能规范 X] 前缀），无需单独序列化。
+func WithInitialHistory(msgs []Message) Option {
+	return func(a *Agent) { a.initialHistory = msgs }
+}
+
 // NewAgent 构造一个 Agent，默认 maxSteps=10、budget=4096、verbose=false。
 func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 	a := &Agent{
@@ -272,10 +287,17 @@ func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 //
 // 审批点在循环检测之后、工具执行之前：先防"重复空转"，再防"越权动作"。
 func (a *Agent) Run(task string) RunResult {
-	a.history = append(a.history,
-		Message{Role: roleSystem, Content: "You are a helpful agent. 可以调用工具完成任务，拿到结果后给出最终回答。"},
-		Message{Role: roleUser, Content: task},
-	)
+	if len(a.initialHistory) > 0 {
+		// 断点续跑：恢复的初始历史已含 system 首条与上次对话，
+		// 只追加本次 user 消息（复制防外部修改影响运行状态）。
+		a.history = append([]Message{}, a.initialHistory...)
+		a.history = append(a.history, Message{Role: roleUser, Content: task})
+	} else {
+		a.history = append(a.history,
+			Message{Role: roleSystem, Content: "You are a helpful agent. 可以调用工具完成任务，拿到结果后给出最终回答。"},
+			Message{Role: roleUser, Content: task},
+		)
+	}
 
 	for step := 1; step <= a.maxSteps; step++ {
 		// 0. 上下文预算检查：超预算先做摘要压缩（context.go 的 CompactContext），

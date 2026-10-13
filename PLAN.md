@@ -11,7 +11,7 @@
 
 ## 现状（已完成）
 
-第一版内核跑通 **24 个演示场景**（`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path`）：
+第一版内核跑通 **25 个演示场景**（`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session`）：
 
 - [x] agent loop（ReAct 主循环）、工具注册、上下文管理（token 预算 + 压缩 + FIFO 兜底）
 - [x] 循环检测 + 软停止、审批点（风险分级 + fail-closed）、评测门
@@ -227,6 +227,8 @@
 
 **做什么**
 - ① 长期记忆：会话持久化 + 断点续跑（呼应已有上下文管理，从"单次 Run"扩到跨会话）
+  — ✅ 已实现（`internal/memory` SessionStore JSON 落盘 + `WithInitialHistory`
+  断点续跑，`-demo session`；实现要点见 README「第 5 步阶段一落地」节）
 - ② 检索工具化——**树索引 + 推理检索优先**（决策依据 2026-10-13，PageIndex 观察）：
   「相似不等于相关」是向量检索的老毛病；代码库/文档天然有层级结构
   （目录树、包/文件/函数、章节/段落），检索不做向量相似度，而是**复用既有
@@ -246,7 +248,9 @@
 - 向量计算与 TopK 选择（仅第 ④ 增强路线）
 
 **验证**
-- 跨会话 demo：上次任务结论可被下次会话检索召回（断点续跑 + 记忆查询）
+- [x] 跨会话 demo：上次任务结论可被下次会话检索召回（断点续跑 + 记忆查询）—
+  `go run . -demo session`（5 条消息落盘 → 新实例恢复 → 直接汇报）；
+  单元测试 memory 4 用例 + resume 3 用例全绿
 - 树检索 demo：模型沿目录树定位到具体文件/行并作答（引用可追溯）；
   大代码库/长文档场景成本只随命中节点增长（不整读）
 

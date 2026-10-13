@@ -35,8 +35,8 @@
 
 ## 当前进度（2026-10-13）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path` 二十四个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域」，
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session` 二十五个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑」，
 前七个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
 
 - **智谱**：需 `ZHIPU_API_KEY`，写入项目根 `.env`（已被 `.gitignore` 排除）；模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`。
@@ -241,6 +241,27 @@ token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 
   技能），内核 `runLoadSkill` 二次兜底（contextPath 不匹配 → 拒绝加载，区分
   "技能不存在"与"不适用"两类错误）；`BuildLoadSkillDescription` 输出 paths
   标注。`-demo skill-path` 实测：候选收窄 + 内核拒绝 + 命中路径加载成功三连。
+
+## 第 5 步阶段一落地 · 会话持久化 + 断点续跑（2026-10-13）
+
+来源：PLAN 第 5 步 ①（长期记忆地基）。内核从"单次 Run"扩到"跨会话"。
+
+- **`internal/memory`（新包）**：`SessionStore` 把 Agent 对话历史
+  （`[]agent.Message`）JSON 落盘，每会话一个文件（`sessions/<id>.json`）。
+  原子写（同目录 temp + rename，与 fsagent 同模式）：写一半崩溃不留半截
+  文件；会话 ID 只允许字母数字与 `-_`（拼路径，防穿越）；`Load` 对不存在的
+  会话返回 ok=false（首次续跑前本来就没文件）。依赖边界：import
+  internal/agent 的消息类型（学习项目允许；生产框架会把消息模型放独立
+  schema 包防循环依赖）。
+- **断点续跑（`loop.go`）**：`WithInitialHistory(msgs)` 把恢复的历史作为
+  初始上下文——`Run` 只追加本次 user 消息，不重建 system 首条（历史已含）。
+  约定：guard（循环检测）/审批计数等**本轮护栏状态不随历史恢复**（跨会话
+  不该继承，新 Run 是新护栏）；B 方案已加载技能可从 history 的 system 消息
+  （`[已加载技能规范 X]` 前缀）推导，无需单独序列化。
+- `-demo session` 实测：Run1 完成任务 → 5 条消息落盘 → 新 Agent 实例加载
+  恢复 → 直接汇报上次结论（无需重述探索过程）。
+- 单元测试：`internal/memory/session_test.go` 4 用例（往返/缺失/List/原子覆盖）、
+  `internal/agent/resume_test.go` 3 用例（恢复续跑/向后兼容/不污染外部切片）全绿。
 
 ## 约定
 
