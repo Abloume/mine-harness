@@ -99,31 +99,36 @@
 
 ---
 
-## 第 4 步 · MCP 适配层（外部 Agent 互通）
+## 第 4 步 · MCP 适配层（外部 Agent 互通） 🚧 进行中（2026-10-13：Server 方向完成）
 
 > 形态决策（见文末）：**形态 A（对话式任务 Agent）优先**，AI IDE 待触发。
 > MCP 是"外部 Agent 用上 harness 能力"的标准互通层——Codex 等支持 MCP 的
 > 宿主可直接调用 harness 的工具；harness 也能接入外部工具服务。
 
 **做什么**
-- **MCP Server（对外暴露）**：把 `Registry` 注册的工具映射为 MCP 工具
-  （JSON-RPC 2.0 over stdio：`tools/list` + `tools/call`）——Codex / 支持 MCP
-  的 IDE / 任何 MCP client 都能直接调用 harness 的工具集
-- **MCP Client（对内接入）**：harness 作为 client 调用外部 MCP server
+- [x] **MCP Server（对外暴露）**：`internal/mcpserver` 把 `Registry` 注册的工具映射为
+  MCP 工具（JSON-RPC 2.0 over stdio：`initialize` / `ping` / `tools/list` /
+  `tools/call`；未知方法回 -32601；notification 不响应）— 已实现
+  - 参数映射兼容两形态：`arguments.input`（JSON 字符串）直传；或 arguments
+    直接是参数对象 → 整体序列化进 Execute（任何 MCP 宿主零成本接入）
+  - 工具执行失败 → `isError:true` + 错误进 content（协议层不回 error）；
+    未知工具复用 Registry 白名单护栏
+  - `go run . -demo mcp`：脚本化外部 client 调真实 fsagent 读文件闭环
+- [ ] **MCP Client（对内接入）**：harness 作为 client 调用外部 MCP server
   （浏览器、Figma、数据库等第三方工具），注册成普通工具进主循环
-- 工具 schema 转换：Go 工具签名 ↔ MCP JSON Schema 输入定义
-- 第 3 步前端能力（预览/截屏/Figma）优先以 MCP 形式注册——一套实现，
+- [x] 工具 schema 转换：Go 工具签名 ↔ MCP JSON Schema 输入定义 — 已实现
+- [ ] 第 3 步前端能力（预览/截屏/Figma）优先以 MCP 形式注册——一套实现，
   harness 自用 + 外部 Agent 共用
 
 **Go 练习点**
-- JSON-RPC 2.0 协议实现（stdio 传输层）
-- 协议映射：内部工具模型 ↔ 标准 schema（等价于把内部接口翻译成公共契约）
-- 双向角色：同一套工具层分别做 server / client 两个方向
+- [x] JSON-RPC 2.0 协议实现（stdio 传输层）— 已实现（bufio.Scanner 按行 + 注入 io.Reader/Writer）
+- [x] 协议映射：内部工具模型 ↔ 标准 schema（等价于把内部接口翻译成公共契约）— 已实现
+- [ ] 双向角色：同一套工具层分别做 server / client 两个方向
 
 **验证**
-- demo：harness 起 MCP server，用 MCP client（Codex 或简单 JSON-RPC 客户端）
-  调用真实文件读取工具
-- 反向：harness 作为 client 调外部 MCP server 完成一次查询
+- [x] demo：harness 起 MCP server，用 MCP client（脚本化 JSON-RPC 客户端）
+  调用真实文件读取工具 — `go run . -demo mcp`
+- [ ] 反向：harness 作为 client 调外部 MCP server 完成一次查询
 
 ---
 

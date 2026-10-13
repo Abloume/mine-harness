@@ -1,9 +1,11 @@
-// mine-harness 入口：十八个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web
+// mine-harness 入口：十九个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 适配层"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp
 package main
 
 import (
+	"bytes"
 	_ "embed" // 内置模板兜底：编译期把 assets/demo_template.html 打进二进制
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"mine-harness/internal/eval"
 	"mine-harness/internal/figmaagent"
 	"mine-harness/internal/fsagent"
+	"mine-harness/internal/mcpserver"
 	"mine-harness/internal/webagent"
 )
 
@@ -63,6 +66,8 @@ func main() {
 		runDemoPlan(*verbose)
 	case "stack":
 		runDemoStack(*verbose)
+	case "mcp":
+		runDemoMCP(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -1093,4 +1098,53 @@ func runDemoStack(verbose bool) {
 	})
 	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(2), agent.WithVerbose(verbose))
 	showResult(a.Run("感知当前工程的技术栈，判断前端代码生成目标（html / react / 其他）"))
+}
+
+// runDemoMCP 演示 PLAN 第 4 步 MCP 适配层——MCP Server（对外暴露）：
+// 把 harness 注册的真实工具（fsagent 读类工具）以 MCP 工具形式暴露，
+// 由"外部 MCP client"（脚本化的 JSON-RPC 请求）调用。
+//
+// 演示链路：
+//
+//	initialize（握手）→ tools/list（外部 Agent 感知工具清单）
+//	→ tools/call read_file 读真实文件（arguments 直接对象参数）
+//	→ tools/call 未知工具（复用 harness 工具白名单护栏）
+//
+// JS/TS ↔ Go 对比：TS 的 Node 生态有官方 @modelcontextprotocol/sdk；
+// Go 手写 JSON-RPC 2.0 + stdio 传输（本 demo 的 mcpserver 包）——
+// 协议只有 tools/list + tools/call 两个核心方法，理解传输层比引 SDK 更重要。
+func runDemoMCP(verbose bool) {
+	reg := agent.NewRegistry()
+	// 暴露真实文件工具（仓库根）——MCP client 能读 harness 所在工程的文件
+	for _, t := range fsagent.NewTools(".").All() {
+		reg.Register(t)
+	}
+
+	// 脚本化"外部 MCP client"：模拟 Codex/Claude Code 对 harness 的调用序列
+	script := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"external-agent","version":"1.0"}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"go.mod"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"not_registered","arguments":{}}}`,
+	}, "\n")
+
+	out := &bytes.Buffer{}
+	srv := mcpserver.New(reg, strings.NewReader(script), out)
+	if verbose {
+		fmt.Println("[mcp] 外部 MCP client 连接 harness（JSON-RPC 2.0 over stdio）")
+	}
+	if err := srv.Run(); err != nil {
+		fmt.Println("MCP server 运行失败:", err)
+		return
+	}
+
+	// 逐行打印协议响应（缩进 JSON，便于阅读）
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var pretty bytes.Buffer
+		if err := json.Indent(&pretty, []byte(line), "  ", "  "); err != nil {
+			fmt.Println(line)
+			continue
+		}
+		fmt.Println(pretty.String())
+	}
 }
