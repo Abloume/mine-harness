@@ -23,12 +23,16 @@ import (
 
 // MemoryEntry 是一条持久化的长期记忆（MemoryItem + 持久化元数据）。
 // ID 与 CreatedAt 由存储侧生成；Content/Category/Source 来自提取器。
+// UsageCount / LastRecalled 是反馈闭环字段（改进二）：被召回即回写——
+// "使用即强化"（lazy 验证），长期低使用条目可被 Prune 过期清理。
 type MemoryEntry struct {
-	ID        string    `json:"id"`
-	Content   string    `json:"content"`
-	Category  string    `json:"category"`
-	Source    string    `json:"source"`
-	CreatedAt time.Time `json:"created_at"`
+	ID           string    `json:"id"`
+	Content      string    `json:"content"`
+	Category     string    `json:"category"`
+	Source       string    `json:"source"`
+	CreatedAt    time.Time `json:"created_at"`
+	UsageCount   int       `json:"usage_count"`
+	LastRecalled time.Time `json:"last_recalled_at,omitempty"`
 }
 
 // MemoryStore 是长期记忆存储（实现 agent.MemoryStore 窄接口）。
@@ -112,6 +116,9 @@ func (s *MemoryStore) Add(item agent.MemoryItem) error {
 
 // Recall 按任务召回相关记忆（实现 agent.MemoryStore；关键信息优先排序，
 // 返回最多 limit 条；limit<=0 返回空）。
+// 反馈闭环：**命中关键词**的条目才回写 UsageCount+1 / LastRecalled
+// （"被召回"=因为相关才被召回；limit 凑数返回的无关条目不算被用上，
+// 避免错误强化噪音）——精确版需模型侧确认引用，见 reflections 改造方案 3。
 func (s *MemoryStore) Recall(query string, limit int) ([]agent.MemoryItem, error) {
 	if limit <= 0 {
 		return nil, nil
@@ -120,8 +127,10 @@ func (s *MemoryStore) Recall(query string, limit int) ([]agent.MemoryItem, error
 	defer s.mu.Unlock()
 	terms := strings.Fields(strings.ToLower(query))
 	type scored struct {
+		idx   int
 		e     MemoryEntry
 		score float64
+		hit   int
 	}
 	scoreds := make([]scored, 0, len(s.entries))
 	for i, e := range s.entries {
@@ -133,14 +142,18 @@ func (s *MemoryStore) Recall(query string, limit int) ([]agent.MemoryItem, error
 		}
 		score := float64(hit) * 2
 		score += categoryWeight(e.Category)
+		// 反馈强化（改进二）：被召回次数越多权重越高（使用即验证）
+		score += float64(e.UsageCount) * 0.1
 		// 新鲜度：越新排越前（索引越小越新，用倒序加分）
 		score += float64(len(s.entries)-i) * 0.01
-		scoreds = append(scoreds, scored{e: e, score: score})
+		scoreds = append(scoreds, scored{idx: i, e: e, score: score, hit: hit})
 	}
 	sort.SliceStable(scoreds, func(a, b int) bool {
 		return scoreds[a].score > scoreds[b].score
 	})
 	out := make([]agent.MemoryItem, 0, limit)
+	now := time.Now()
+	updated := false
 	for _, sc := range scoreds {
 		if len(out) >= limit {
 			break
@@ -150,6 +163,15 @@ func (s *MemoryStore) Recall(query string, limit int) ([]agent.MemoryItem, error
 			Category: sc.e.Category,
 			Source:   sc.e.Source,
 		})
+		// 命中即强化：仅关键词命中的条目回写（凑数返回不回写）
+		if sc.hit > 0 {
+			s.entries[sc.idx].UsageCount++
+			s.entries[sc.idx].LastRecalled = now
+			updated = true
+		}
+	}
+	if updated {
+		_ = s.persist()
 	}
 	return out, nil
 }
@@ -162,6 +184,29 @@ func (s *MemoryStore) List() []MemoryEntry {
 	copy(out, s.entries)
 	sort.SliceStable(out, func(a, b int) bool { return out[a].CreatedAt.After(out[b].CreatedAt) })
 	return out
+}
+
+// Prune 过期清理（反馈闭环 · 长期未使用淘汰）：
+// 删除「创建超过 olderThan 且被召回次数 < minUsage」的条目——从未被用上的
+// 记忆视为噪音，可被回收（记忆库只增不减的问题由此闭环）。
+func (s *MemoryStore) Prune(minUsage int, olderThan time.Duration) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := time.Now().Add(-olderThan)
+	kept := s.entries[:0]
+	removed := 0
+	for _, e := range s.entries {
+		if e.CreatedAt.Before(cutoff) && e.UsageCount < minUsage {
+			removed++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if removed > 0 {
+		s.entries = kept
+		return removed, s.persist()
+	}
+	return 0, nil
 }
 
 // categoryWeight 记忆类别权重（关键信息优先的"关键"定义）。
@@ -187,24 +232,81 @@ func shortID(s string) string {
 	return fmt.Sprintf("%08x", h)
 }
 
-// HeuristicExtractor 是默认记忆提取器（实现 agent.MemoryExtractor）：
-// 从会话历史中提取最后一条"最终回答"（assistant 非工具调用消息）作为
-// conclusion 记忆——启发式零成本（不调 LLM），可被 LLM 版替换
-// （同 Summarizer 的替换模式）。
+// EventExtractor 是事件信号提取器（改进一 · 反思改造方案 1）：
+// 从步骤账本中提取"改变了世界"的动作——非只读且执行成功的工具调用
+// （写/审批/外部调用）→ decision 类记忆。
+// 依据：账本事件比最终回答可靠——回答可能含糊，动作已发生（OK=true 由
+// 内核记账）；类别 decision 使 Recall 权重高于普通 detail。
+type EventExtractor struct {
+	maxInput int // Input 摘要最大长度（默认 80）
+}
+
+// NewEventExtractor 构造事件信号提取器。
+func NewEventExtractor() *EventExtractor {
+	return &EventExtractor{maxInput: 80}
+}
+
+// Extract 提取决策/变更记忆（实现 agent.MemoryExtractor 的组成部分）。
+// 每条非只读成功动作产出一条 decision：Content="已执行 <工具>(<入参摘要>)"，
+// Source 定位到账本步骤号（可追溯回原始执行）。
+func (e *EventExtractor) Extract(msgs []agent.Message, ledger []agent.StepRecord, sessionID string) []agent.MemoryItem {
+	var items []agent.MemoryItem
+	for _, rec := range ledger {
+		if !rec.OK || rec.SideEffect == agent.SideReadonly {
+			continue // 只读/失败的动作不改变世界
+		}
+		in := rec.Input
+		if len(in) > e.maxInput {
+			in = in[:e.maxInput] + "…"
+		}
+		items = append(items, agent.MemoryItem{
+			Content:  "已执行 " + rec.Name + "(" + in + ")",
+			Category: "decision",
+			Source:   fmt.Sprintf("session:%s/step%d", sessionID, rec.Step),
+		})
+	}
+	return items
+}
+
+// DefaultExtractor 是默认组合提取器：Heuristic（回答 → conclusion）
+// + Event（账本 → decision）——两类信号都沉淀，覆盖"结论"与"决策"
+// 两种最高价值记忆（类别权重都是 2 分）。
+type DefaultExtractor struct {
+	heuristic *HeuristicExtractor
+	events    *EventExtractor
+}
+
+// NewDefaultExtractor 构造默认组合提取器（推荐用法）。
+func NewDefaultExtractor() *DefaultExtractor {
+	return &DefaultExtractor{heuristic: NewHeuristicExtractor(), events: NewEventExtractor()}
+}
+
+// Extract 组合两条通道（实现 agent.MemoryExtractor）。
+func (d *DefaultExtractor) Extract(msgs []agent.Message, ledger []agent.StepRecord, sessionID string) []agent.MemoryItem {
+	out := d.heuristic.Extract(msgs, ledger, sessionID)
+	out = append(out, d.events.Extract(msgs, ledger, sessionID)...)
+	return out
+}
+
+// HeuristicExtractor 是回答类记忆提取器（DefaultExtractor 的组成部分，
+// 也可单独使用）：从会话历史中提取最后一条"最终回答"（assistant 非工具
+// 调用消息）作为 conclusion 记忆——启发式零成本（不调 LLM），可被 LLM 版
+// 替换（同 Summarizer 的替换模式）。ledger 参数为接口对齐，启发式不使用
+// （回答类记忆与动作无关）。
 type HeuristicExtractor struct {
 	maxLen int // 记忆内容最大长度（默认 200）
 }
 
-// NewHeuristicExtractor 构造默认提取器。
+// NewHeuristicExtractor 构造回答类提取器。
 func NewHeuristicExtractor() *HeuristicExtractor {
 	return &HeuristicExtractor{maxLen: 200}
 }
 
-// Extract 提取关键记忆（实现 agent.MemoryExtractor）。
+// Extract 提取关键记忆（实现 agent.MemoryExtractor 的组成部分）。
 // 提取策略（启发式）：
 //   - 最后一条 assistant 非工具消息 = 本次会话的结论 → conclusion 条目；
 //   - 找不到结论（如被中止）→ 返回空（不沉淀垃圾记忆）。
-func (e *HeuristicExtractor) Extract(msgs []agent.Message, sessionID string) []agent.MemoryItem {
+func (e *HeuristicExtractor) Extract(msgs []agent.Message, _ []agent.StepRecord, sessionID string) []agent.MemoryItem {
 	content := ""
 	for i := len(msgs) - 1; i >= 0; i-- {
 		m := msgs[i]

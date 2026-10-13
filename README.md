@@ -329,28 +329,36 @@ token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 
   原子写落盘（与 SessionStore 同款 temp+rename）；`Add` 按 (内容,类别) 去重
   （幂等）；**`Recall` 关键信息优先排序**：查询词命中数 ×2 + 类别权重
   （conclusion/decision 2 分 > constraint/preference 1.5 分 > detail 1 分）
-  + 新鲜度降序。
-- **`memory.HeuristicExtractor`**：默认记忆提取器（实现 agent 窄接口）——
-  取最后一条最终回答为 conclusion 记忆，零成本不调 LLM；可换 LLM 版
-  （同 Summarizer 替换模式）。局限如实：会提取所有最终回答（含元回答），
-  低价值记忆靠 Recall 排序衰减。
+  + 反馈强化（UsageCount×0.1）+ 新鲜度降序。
+- **记忆提取器（改进一 · 事件信号）**：
+  - `HeuristicExtractor`：回答类——最后一条最终回答 → conclusion；
+  - `EventExtractor`：事件类——账本中**非只读且成功**的工具调用
+    （写/审批）→ decision（"改变了世界"的动作比回答可靠，来源定位到
+    账本步骤号 stepN）；
+  - `DefaultExtractor`（推荐）：组合两者——一次会话沉淀"结论 + 决策"
+    两类最高价值记忆。
+- **反馈闭环（改进二 · 使用即验证）**：`MemoryEntry` 带
+  `UsageCount` / `LastRecalledAt`；`Recall` **仅关键词命中的条目**回写
+  （凑数返回的无关条目不算被用上，避免强化噪音）；权重随使用次数提升；
+  `Prune(minUsage, olderThan)` 过期清理从未被用上的记忆。
 - **Agent 集成（`internal/agent/memory.go`）**：`WithMemoryStore` /
   `WithMemoryExtractor` / `WithMemoryRecallLimit`（默认 3 条）/ `WithSessionID`
   （来源标注）。Run 开始 `recallMemory` 注入【记忆召回】system 消息；
   Run 结束 `settleMemory` 只在 **completed** 时沉淀（中止/取消的会话
-  无可靠结论，不污染长期记忆）。
+  无可靠结论，不污染长期记忆）；提取器同时拿到消息流 + 步骤账本。
 - **依赖方向**：agent 只定义窄接口（`MemoryStore` / `MemoryExtractor`），
   memory 包实现——Go 惯例 consumer 定义接口，避免循环依赖
   （memory 需要 import agent 消息类型）。
-- `-demo memory-recall` 实测：会话1 调研 → 沉淀 1 条 conclusion →
-  会话2 **新实例不带完整历史** → 仅召回记忆注入 → 直接汇报
-  （未恢复阶段一的 5 条消息，只注入记忆条目）。
-- 单元测试：`memory/memory_test.go` 4 用例（召回排序/去重/落盘往返/提取器）
-  + `agent/recall_test.go` 4 用例（召回注入/未配置不注入/completed 沉淀/
-  aborted 不沉淀）全绿。
-- **已知局限（沉淀判据）**：当前提取器为占位实现——"最后一条最终回答
-  全收"，无复用价值判断，demo 中元回答也会入库；改造方向（三问判据 +
-  三类信号 + 事件信号优先）见 `reflections/2026-10-13-memory-settling-criteria.md`。
+- `-demo memory-recall` 实测：会话1 调研 + 写结论文件 → 沉淀 2 条
+  （decision 写动作 + conclusion 回答）→ 会话2 **新实例不带完整历史**
+  → 仅召回记忆注入 → 直接汇报（未恢复阶段一的 5 条消息）。
+- 单元测试：`memory/memory_test.go` 7 用例（召回排序/去重/落盘往返/
+  回答提取/事件提取/反馈回写/过期清理）+ `agent/recall_test.go` 4 用例
+  （召回注入/未配置不注入/completed 沉淀/aborted 不沉淀）全绿。
+- **已知局限（改造待办）**：显式标注通道（LLM 版提取器按 memory_worth
+  收，启发式降为兜底）、语义去重、元回答过滤（启发式如实提取所有最终
+  回答，低价值记忆靠 Recall 排序衰减）——见
+  `reflections/2026-10-13-memory-settling-criteria.md` 改造方案 2/5。
 
 ## 约定
 

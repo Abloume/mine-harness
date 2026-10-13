@@ -40,10 +40,11 @@ type MemoryStore interface {
 	Recall(query string, limit int) ([]MemoryItem, error)
 }
 
-// MemoryExtractor 从会话历史提取关键记忆（短期 → 长期的沉淀器）。
+// MemoryExtractor 从会话历史 + 步骤账本提取关键记忆（短期 → 长期的沉淀器）。
+// ledger 是事件信号源（改进一：写/审批等副作用动作比最终回答更可靠）；
 // 与 Summarizer 同模式：默认启发式实现，可换成调 LLM 的版本。
 type MemoryExtractor interface {
-	Extract(msgs []Message, sessionID string) []MemoryItem
+	Extract(msgs []Message, ledger []StepRecord, sessionID string) []MemoryItem
 }
 
 // recallLimit 默认召回上限（条数）：一次 Run 最多注入的记忆条目——
@@ -76,12 +77,13 @@ func (a *Agent) recallMemory(task string) {
 
 // settleMemory 在 Run 结束时把本次会话的关键信息沉淀进长期记忆。
 // 只在 completed 时沉淀（被中止的会话没有可靠结论，不该污染长期记忆）；
+// 提取器同时拿到消息流与步骤账本（事件信号：写/审批动作 → 决策记忆）；
 // 提取器产出多条目时逐条写入，单条失败不阻塞其余。
 func (a *Agent) settleMemory(status string) {
 	if status != StatusCompleted || a.memoryStore == nil || a.memoryExtractor == nil {
 		return
 	}
-	items := a.memoryExtractor.Extract(a.history, a.sessionID)
+	items := a.memoryExtractor.Extract(a.history, a.ledger, a.sessionID)
 	for _, it := range items {
 		if err := a.memoryStore.Add(it); err != nil && a.verbose {
 			log.Printf("记忆沉淀失败: %v", err)

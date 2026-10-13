@@ -283,9 +283,11 @@
   目录分数传播路线不抄**
 - ③ 记忆分层 + 关键信息优先召回（反思回写 2026-10-13）— ✅ 已实现：
   短期（压缩+LLM 摘要）已有；中期（阶段一 SessionStore 整历史）；本步补齐
-  **长期层** MemoryStore（memories.json 原子写、Add 幂等去重）+ HeuristicExtractor
-  + Agent 集成（Run 开始按任务召回注入【记忆召回】，completed 才沉淀；
-  Recall 关键信息优先：关键词命中 ×2 + 类别权重 conclusion/decision > detail）
+  **长期层** MemoryStore（memories.json 原子写、Add 幂等去重）+ 提取器
+  （DefaultExtractor = 回答→conclusion + 账本事件→decision）+ Agent 集成
+  （Run 开始按任务召回注入【记忆召回】，completed 才沉淀；Recall 关键信息
+  优先：关键词命中 ×2 + 类别权重 + **反馈强化 UsageCount×0.1** + 新鲜度；
+  命中回写 UsageCount / LastRecalledAt，Prune 过期清理）
   — `-demo memory-recall`；实现要点见 README「第 5 步③落地」节
 - ④ （可选增强，不进主线）向量相似度检索：语义模糊查询（会话历史/笔记）才值得
   embedding，作为第 ② 条的补充路线，需要时再引入。定位细化（OpenViking 观察）：
@@ -307,9 +309,10 @@
   `go run . -demo tree`（browse→overview→read 定位 RunWithContext@loop.go:307；
   成本只随命中节点增长：74 节点索引 / 17052 行全量，只读 1 个文件全文）；
   `internal/tree` 7 用例全绿
-- [x] 记忆分层 demo：会话1 沉淀 conclusion → 会话2 新实例不带完整历史，
-  仅召回记忆注入作答 — `go run . -demo memory-recall`（未恢复阶段一 5 条消息，
-  只注入记忆条目；memory 4 用例 + agent recall 4 用例全绿）
+- [x] 记忆分层 demo：会话1 沉淀 conclusion + decision（写动作事件信号）→
+  会话2 新实例不带完整历史，仅召回记忆注入作答 — `go run . -demo memory-recall`
+  （未恢复阶段一 5 条消息，只注入记忆条目；命中回写 UsageCount 反馈闭环；
+  memory 7 用例 + agent recall 4 用例全绿）
 
 ---
 

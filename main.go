@@ -1157,10 +1157,12 @@ func parseTreePath(input string) (string, error) {
 }
 
 // runDemoMemoryRecall 演示第 5 步③ · 记忆分层 + 关键信息优先召回：
-//   - 会话1（s1）：完成任务 → Run 结束把关键信息（最终结论）沉淀进长期记忆
-//     MemoryStore（memories.json 原子写落盘）；
+//   - 会话1（s1）：完成任务（含一次写入动作）→ Run 结束用组合提取器
+//     DefaultExtractor 沉淀两类关键记忆：最终回答 → conclusion；
+//     账本中写动作 → decision（事件信号，改进一）——memories.json 落盘；
 //   - 会话2（s2）：**新 Agent 实例、不带完整历史** → Run 开始按任务召回
-//     相关记忆条目注入 system（【记忆召回】）→ 模型直接作答。
+//     相关记忆条目注入 system（【记忆召回】）→ 模型直接作答；
+//     命中条目回写 UsageCount（反馈闭环，改进二）。
 // 与阶段一（-demo session）对照：整历史恢复 vs 关键记忆召回——
 // 召回成本与历史长度无关（只召回 limit 条），token 更省。
 func runDemoMemoryRecall(verbose bool) {
@@ -1169,7 +1171,7 @@ func runDemoMemoryRecall(verbose bool) {
 		fmt.Println("长期记忆存储初始化失败:", err)
 		return
 	}
-	ex := memory.NewHeuristicExtractor()
+	ex := memory.NewDefaultExtractor()
 
 	readGoMod := agent.Tool{
 		Name: "read_file", Description: "读取文件内容", SideEffect: agent.SideReadonly,
@@ -1177,21 +1179,29 @@ func runDemoMemoryRecall(verbose bool) {
 			return "module mine-harness\n\ngo 1.27.1\n\nrequire (\n\tgithub.com/go-rod/rod v0.116.2 // indirect\n)", nil
 		},
 	}
+	writeGoMod := agent.Tool{
+		Name: "write_file", Description: "写入文件", SideEffect: agent.SideIrreversible,
+		Execute: func(input string) (string, error) {
+			return "已写入 memory/demo-go-version.md", nil
+		},
+	}
 
-	// 会话1：调研并得出结论，沉淀长期记忆
+	// 会话1：调研 → 写结论文件 → 沉淀 conclusion + decision 两类记忆
 	{
 		reg := agent.NewRegistry()
 		reg.Register(readGoMod)
+		reg.Register(writeGoMod)
 		llm := agent.NewMockLLM([]agent.MockDecision{
 			{ToolName: "read_file", ToolInput: `{"path":"go.mod"}`},
-			{Content: "结论：mine-harness 使用 Go 1.27.1，主要依赖 go-rod（间接依赖）。"},
+			{ToolName: "write_file", ToolInput: `{"path":"memory/demo-go-version.md","content":"Go 1.27.1"}`},
+			{Content: "结论：mine-harness 使用 Go 1.27.1，主要依赖 go-rod（间接依赖），已写入结论文件。"},
 		})
 		a := agent.NewAgent(llm, reg,
 			agent.WithMaxSteps(5), agent.WithVerbose(verbose),
 			agent.WithMemoryStore(store), agent.WithMemoryExtractor(ex),
 			agent.WithSessionID("s1"))
-		fmt.Println("===== 会话1（s1）：调研并沉淀长期记忆 =====")
-		showResult(a.Run("读取 go.mod，确认 Go 版本与主要依赖"))
+		fmt.Println("===== 会话1（s1）：调研 + 写文件，沉淀结论与决策 =====")
+		showResult(a.Run("读取 go.mod，确认 Go 版本，并把结论写入 memory/demo-go-version.md"))
 		fmt.Printf("—— 长期记忆已沉淀 %d 条：\n", len(store.List()))
 		for _, e := range store.List() {
 			fmt.Printf("  [%s] %s（来源: %s）\n", e.Category, e.Content, e.Source)
@@ -1203,8 +1213,9 @@ func runDemoMemoryRecall(verbose bool) {
 	{
 		reg := agent.NewRegistry()
 		reg.Register(readGoMod)
+		reg.Register(writeGoMod)
 		llm := agent.NewMockLLM([]agent.MockDecision{
-			{Content: "根据【记忆召回】直接汇报：Go 1.27.1，无需重复探索。"},
+			{Content: "根据【记忆召回】直接汇报：Go 1.27.1，结论文件已写入，无需重复探索。"},
 		})
 		a := agent.NewAgent(llm, reg,
 			agent.WithMaxSteps(3), agent.WithVerbose(verbose),
@@ -1213,10 +1224,10 @@ func runDemoMemoryRecall(verbose bool) {
 		fmt.Println("===== 会话2（s2）：新实例，仅召回关键记忆作答 =====")
 		showResult(a.Run("上次调研的 Go 版本结论是什么？直接汇报"))
 		recalled, _ := store.Recall("Go", 3)
-		// 注意：启发式提取器如实提取所有最终回答（含会话2 的元回答），
-		// 低价值记忆靠 Recall 排序衰减；生产可换 LLM 版提取器过滤。
+		// 反馈闭环：本次命中（Go）条目 UsageCount 已回写；元回答沉淀与否
+		// 看提取器实现（DefaultExtractor 仍如实提取所有最终回答，
+		// 低价值记忆靠召回排序衰减，可换 LLM 版提取器过滤）。
 		fmt.Printf("—— 成本对比：会话2 未恢复整段历史（阶段一 5 条消息），只召回 %d 条记忆条目注入上下文\n", len(recalled))
-		fmt.Printf("   （含本会话刚沉淀的 1 条：启发式提取器如实提取所有最终回答，低价值记忆靠召回排序衰减）\n")
 	}
 }
 

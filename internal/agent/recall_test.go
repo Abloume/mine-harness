@@ -37,7 +37,7 @@ func (s *stubMemory) Recall(query string, limit int) ([]MemoryItem, error) {
 // stubExtractor 返回固定条目的提取器（测试用）。
 type stubExtractor struct{ items []MemoryItem }
 
-func (e *stubExtractor) Extract(msgs []Message, sessionID string) []MemoryItem {
+func (e *stubExtractor) Extract(msgs []Message, ledger []StepRecord, sessionID string) []MemoryItem {
 	return e.items
 }
 
