@@ -1100,38 +1100,78 @@ func runDemoStack(verbose bool) {
 	showResult(a.Run("感知当前工程的技术栈，判断前端代码生成目标（html / react / 其他）"))
 }
 
+// buildFullRegistry 组装 MCP 对外暴露的完整工具集：
+// 文件（fsagent）+ 命令（cmdagent）+ 前端场景（webagent）+ Figma（figmaagent）。
+// 覆盖 PLAN 第 4 步目标"第 3 步前端能力优先以 MCP 形式注册——一套实现，
+// harness 自用 + 外部 Agent 共用"。
+//
+// Figma 工具需要 token：从 .env 读取 FIGMA_TOKEN / FIGMA_FILE_KEY，
+// 缺失时跳过注册并提示（MCP client 的 tools/list 里就没有 figma_* 工具）。
+func buildFullRegistry(verbose bool) *agent.Registry {
+	reg := agent.NewRegistry()
+	for _, t := range fsagent.NewTools(".").All() {
+		reg.Register(t)
+	}
+	for _, t := range cmdagent.NewTools(".").All() {
+		reg.Register(t)
+	}
+	for _, t := range webagent.NewTools(".").All() {
+		reg.Register(t)
+	}
+	loadEnv(".env")
+	fileKey := os.Getenv("FIGMA_FILE_KEY")
+	token := os.Getenv("FIGMA_TOKEN")
+	if fileKey == "" || token == "" {
+		if verbose {
+			fmt.Println("[mcp] 未配置 FIGMA_FILE_KEY / FIGMA_TOKEN（写入项目根 .env），跳过 Figma 工具注册")
+		}
+		return reg
+	}
+	for _, t := range figmaagent.NewTools(fileKey, token).All() {
+		reg.Register(t)
+	}
+	return reg
+}
+
 // runDemoMCP 演示 PLAN 第 4 步 MCP 适配层——MCP Server（对外暴露）：
-// 把 harness 注册的真实工具（fsagent 读类工具）以 MCP 工具形式暴露，
+// 把 harness 注册的真实工具（文件/命令/前端预览/Figma）以 MCP 工具形式暴露，
 // 由"外部 MCP client"（脚本化的 JSON-RPC 请求）调用。
 //
 // 演示链路：
 //
-//	initialize（握手）→ tools/list（外部 Agent 感知工具清单）
-//	→ tools/call read_file 读真实文件（arguments 直接对象参数）
-//	→ tools/call 未知工具（复用 harness 工具白名单护栏）
+//	initialize（握手）→ tools/list（全量工具清单，含 risk 风险透出）
+//	→ tools/call read_file 读真实文件（RiskNone 直接放行）
+//	→ tools/call serve_dir 起本地预览（前端工具 MCP 可用：起服务→返回端口）
+//	→ tools/call write_file（RiskMedium → 注入的审批函数拦截，isError）
 //
 // JS/TS ↔ Go 对比：TS 的 Node 生态有官方 @modelcontextprotocol/sdk；
 // Go 手写 JSON-RPC 2.0 + stdio 传输（本 demo 的 mcpserver 包）——
 // 协议只有 tools/list + tools/call 两个核心方法，理解传输层比引 SDK 更重要。
 func runDemoMCP(verbose bool) {
-	reg := agent.NewRegistry()
-	// 暴露真实文件工具（仓库根）——MCP client 能读 harness 所在工程的文件
-	for _, t := range fsagent.NewTools(".").All() {
-		reg.Register(t)
-	}
+	reg := buildFullRegistry(verbose)
 
 	// 脚本化"外部 MCP client"：模拟 Codex/Claude Code 对 harness 的调用序列
 	script := strings.Join([]string{
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"external-agent","version":"1.0"}}}`,
 		`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
 		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"go.mod"}}}`,
-		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"not_registered","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"serve_dir","arguments":{"dir":"webdemo"}}}`,
+		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"tmp-demo.txt","content":"mcp demo"}}}`,
 	}, "\n")
 
 	out := &bytes.Buffer{}
 	srv := mcpserver.New(reg, strings.NewReader(script), out)
+	// 注入审批：写类工具（write_file/edit_file/figma_export_image）走人工评审——
+	// 演示"外部 Agent 也要过 harness 的审批闸门"（MCP 暴露不等于放开风险工具）
+	srv.SetApprover(func(toolName, args string) bool {
+		if toolName == "write_file" || toolName == "edit_file" || toolName == "figma_export_image" {
+			fmt.Printf("[审批] %s(%s) → 拒绝（演示：写类工具需人工评审，外部 Agent 触发审批闸门）\n", toolName, args)
+			return false
+		}
+		return true
+	})
 	if verbose {
-		fmt.Println("[mcp] 外部 MCP client 连接 harness（JSON-RPC 2.0 over stdio）")
+		fmt.Println("[mcp] 外部 MCP client 连接 harness（JSON-RPC 2.0 over stdio，工具集 = 文件+命令+前端+Figma）")
 	}
 	if err := srv.Run(); err != nil {
 		fmt.Println("MCP server 运行失败:", err)

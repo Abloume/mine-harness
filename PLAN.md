@@ -113,12 +113,19 @@
     直接是参数对象 → 整体序列化进 Execute（任何 MCP 宿主零成本接入）
   - 工具执行失败 → `isError:true` + 错误进 content（协议层不回 error）；
     未知工具复用 Registry 白名单护栏
-  - `go run . -demo mcp`：脚本化外部 client 调真实 fsagent 读文件闭环
+  - 风险透出：tools/list 带 `risk` 字段（none/low/medium/high，源自工具作者声明的
+    BaseRisk）——外部 Agent 在调用前就能感知副作用等级
+  - 审批注入：`SetApprover` 复用 harness 审批纪律——写类/导图工具（write_file /
+    edit_file / figma_export_image 等 RiskMedium+）可被人工评审拦截
+    （approver 拒绝 → isError:true，工具不执行）
+  - `go run . -demo mcp`：脚本化外部 client 调全量工具（文件+命令+前端+Figma，
+    buildFullRegistry 组装，缺 token 跳过 figma 并提示）
 - [ ] **MCP Client（对内接入）**：harness 作为 client 调用外部 MCP server
   （浏览器、Figma、数据库等第三方工具），注册成普通工具进主循环
 - [x] 工具 schema 转换：Go 工具签名 ↔ MCP JSON Schema 输入定义 — 已实现
-- [ ] 第 3 步前端能力（预览/截屏/Figma）优先以 MCP 形式注册——一套实现，
-  harness 自用 + 外部 Agent 共用
+- [x] 第 3 步前端能力（预览/截屏/Figma）优先以 MCP 形式注册——一套实现，
+  harness 自用 + 外部 Agent 共用 — 已实现（webagent serve_dir/screenshot +
+  figmaagent 5 工具纳入 buildFullRegistry；-demo mcp 实测 serve_dir 起预览成功）
 
 **Go 练习点**
 - [x] JSON-RPC 2.0 协议实现（stdio 传输层）— 已实现（bufio.Scanner 按行 + 注入 io.Reader/Writer）

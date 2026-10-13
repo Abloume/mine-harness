@@ -204,3 +204,130 @@ func TestParseError(t *testing.T) {
 		t.Errorf("error.code = %v，期望 -32700", errObj["code"])
 	}
 }
+
+// TestToolsListRisk 验证 tools/list 透出工具风险级别（外部 Agent 可见副作用等级）。
+func TestToolsListRisk(t *testing.T) {
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "read_only",
+		Description: "读操作",
+		BaseRisk:    agent.RiskNone,
+		Execute:     func(string) (string, error) { return "ok", nil },
+	})
+	reg.Register(agent.Tool{
+		Name:        "write_risky",
+		Description: "写操作",
+		BaseRisk:    agent.RiskMedium,
+		Execute:     func(string) (string, error) { return "ok", nil },
+	})
+	s := New(reg, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`), &bytes.Buffer{})
+	out := &bytes.Buffer{}
+	s.out = out
+	if err := s.Run(); err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		Result struct {
+			Tools []toolSchema `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &resp); err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]string{}
+	for _, ts := range resp.Result.Tools {
+		byName[ts.Name] = ts.Risk
+	}
+	if byName["read_only"] != "none" {
+		t.Errorf("read_only risk = %q，期望 none", byName["read_only"])
+	}
+	if byName["write_risky"] != "medium" {
+		t.Errorf("write_risky risk = %q，期望 medium", byName["write_risky"])
+	}
+}
+
+// TestRiskName 验证内核 RiskLevel → MCP 字符串标签映射。
+func TestRiskName(t *testing.T) {
+	cases := []struct {
+		level agent.RiskLevel
+		want  string
+	}{
+		{agent.RiskNone, "none"},
+		{agent.RiskLow, "low"},
+		{agent.RiskMedium, "medium"},
+		{agent.RiskHigh, "high"},
+		{agent.RiskLevel(99), "none"}, // 未知级别兜底 none
+	}
+	for _, c := range cases {
+		if got := riskName(c.level); got != c.want {
+			t.Errorf("riskName(%d) = %q，期望 %q", c.level, got, c.want)
+		}
+	}
+}
+
+// TestCallApproverRejected 验证审批注入：approver 拒绝 → 工具不执行，isError=true。
+func TestCallApproverRejected(t *testing.T) {
+	reg := agent.NewRegistry()
+	executed := false
+	reg.Register(agent.Tool{
+		Name:        "write_file",
+		Description: "写文件",
+		BaseRisk:    agent.RiskMedium,
+		Execute: func(string) (string, error) {
+			executed = true
+			return "written", nil
+		},
+	})
+	out := &bytes.Buffer{}
+	s := New(reg, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"x"}}}`), out)
+	s.SetApprover(func(name, args string) bool { return false }) // 一律拒绝
+	if err := s.Run(); err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &resp); err != nil {
+		t.Fatal(err)
+	}
+	res := respResult(t, resp)
+	if res["isError"] != true {
+		t.Errorf("审批拒绝后 isError 应为 true")
+	}
+	text := res["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "审批拒绝") {
+		t.Errorf("错误文案应含'审批拒绝'，实际 %q", text)
+	}
+	if executed {
+		t.Errorf("审批拒绝后工具不应执行")
+	}
+}
+
+// TestCallApproverPassed 验证审批通过后工具正常执行。
+func TestCallApproverPassed(t *testing.T) {
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:        "write_file",
+		Description: "写文件",
+		BaseRisk:    agent.RiskMedium,
+		Execute:     func(string) (string, error) { return "written", nil },
+	})
+	out := &bytes.Buffer{}
+	s := New(reg, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"x"}}}`), out)
+	s.SetApprover(func(name, args string) bool { return true }) // 审批放行
+	if err := s.Run(); err != nil {
+		t.Fatal(err)
+	}
+	res := respResult(t, respMap(t, out))
+	if res["isError"] != false {
+		t.Errorf("审批通过后 isError 应为 false")
+	}
+}
+
+// respMap 解析单行响应为 map。
+func respMap(t *testing.T, out *bytes.Buffer) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &m); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+	return m
+}

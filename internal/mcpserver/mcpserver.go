@@ -41,9 +41,10 @@ const (
 // Server 是 stdio 传输的 MCP server：读 in（默认 os.Stdin）按行解析
 // JSON-RPC 请求，处理后在 out（默认 os.Stdout）写响应。
 type Server struct {
-	reg *agent.Registry // 工具白名单：只暴露已注册工具（复用 harness 护栏）
-	in  io.Reader
-	out io.Writer
+	reg      *agent.Registry                  // 工具白名单：只暴露已注册工具（复用 harness 护栏）
+	approver func(toolName, args string) bool // 可选审批函数；nil = 外部 Agent 全权调用
+	in       io.Reader
+	out      io.Writer
 }
 
 // New 构造 MCP server。reg 为 nil 时创建空注册表（tools/list 返回空数组，
@@ -60,6 +61,30 @@ func New(reg *agent.Registry, in io.Reader, out io.Writer) *Server {
 		out = os.Stdout // 默认真实 stdout；测试注入 bytes.Buffer
 	}
 	return &Server{reg: reg, in: in, out: out}
+}
+
+// SetApprover 注入审批函数：tools/call 执行前先问审批（工具作者声明的
+// BaseRisk 透出在 tools/list 的 risk 字段，外部 Agent 可见）。
+// 审批返回 false → 工具不执行，isError=true 提示需人工审批。
+// 默认 nil：MCP 语义是外部 Agent 显式调用工具，全权放行；
+// 注入后即可复用 harness 的"写类/导图走人工评审"纪律。
+func (s *Server) SetApprover(approver func(toolName, args string) bool) {
+	s.approver = approver
+}
+
+// riskName 把内核 RiskLevel（iota 枚举）映射为 MCP 可见的字符串标签，
+// 随 tools/list 的 inputSchema 一起透出——外部 Agent 能感知每个工具的风险级别。
+func riskName(l agent.RiskLevel) string {
+	switch l {
+	case agent.RiskLow:
+		return "low"
+	case agent.RiskMedium:
+		return "medium"
+	case agent.RiskHigh:
+		return "high"
+	default:
+		return "none"
+	}
 }
 
 // rpcRequest 是 JSON-RPC 2.0 请求。id 为 nil 表示 notification（无需响应）。
@@ -136,14 +161,12 @@ func (s *Server) handleMessage(msg []byte) []byte {
 }
 
 // toolSchema 是 MCP 工具描述：name/description/inputSchema（JSON Schema 子集）。
-// harness 工具入参是"一个 JSON 字符串"，映射成 MCP 的 object 参数：
-//   - 外部 client 传 {"input":"{...}"}：input 字段原样进 Execute；
-//   - 外部 client 直接传 {"path":"..."}：整个 arguments 序列化进 Execute。
-//
-// 两种都接受，方便任何 MCP 宿主零成本接入（不必知道 harness 的 input 约定）。
+// risk 字段透出工具作者声明的 BaseRisk（none/low/medium/high）——外部 Agent
+// 在 tools/list 阶段就能感知每个工具的副作用等级，与 harness 审批纪律对齐。
 type toolSchema struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	Risk        string `json:"risk"`
 	InputSchema any    `json:"inputSchema"`
 }
 
@@ -154,6 +177,7 @@ func (s *Server) toolSchemas() []toolSchema {
 		out = append(out, toolSchema{
 			Name:        t.Name,
 			Description: t.Description,
+			Risk:        riskName(t.BaseRisk),
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -180,6 +204,17 @@ func (s *Server) handleToolCall(id int, params map[string]any) []byte {
 	input, err := inputFromParams(params)
 	if err != nil {
 		return s.errResp(id, -32602, "Invalid params: "+err.Error())
+	}
+	// 审批闸门：注入 approver 后，执行前先问人工评审（写类/导图工具 RiskMedium+）。
+	// 默认 nil 放行（MCP 语义 = 外部 Agent 显式调用工具）。
+	if s.approver != nil && !s.approver(name, input) {
+		return s.okResp(id, map[string]any{
+			"content": []map[string]any{{
+				"type": "text",
+				"text": "工具 " + name + " 已被审批拒绝（需人工评审）：停止该动作，不要尝试效果等价的替代操作",
+			}},
+			"isError": true,
+		})
 	}
 	out, callErr := s.reg.Call(name, input)
 	content := []map[string]any{{"type": "text", "text": out}}
