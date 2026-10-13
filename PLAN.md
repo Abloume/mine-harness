@@ -11,7 +11,7 @@
 
 ## 现状（已完成）
 
-第一版内核跑通 **19 个演示场景**（`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp`）：
+第一版内核跑通 **21 个演示场景**（`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http`）：
 
 - [x] agent loop（ReAct 主循环）、工具注册、上下文管理（token 预算 + 压缩 + FIFO 兜底）
 - [x] 循环检测 + 软停止、审批点（风险分级 + fail-closed）、评测门
@@ -195,6 +195,25 @@
 - demo：模型第二次尝试同一失败路径时，历史已注入 system，行为改变可观察
 - 单元测试：buffer 满覆盖、压缩后仍保留历史摘要
 
+### 缺口 C · Skill 路径作用域（B 方案增强）
+
+> 来源：`reflections/2026-10-13-development-loop-skills.md` 的「先补」结论。
+> 外部实践确认 skill 只在相关目录激活（path scoping）是常被漏掉的参数；
+> 避免"全局可加载"造成误触发面过大。
+
+**做什么**
+- [ ] skill 声明适用目录/文件范围（如 `paths: ["internal/mcpserver/**"]`），常驻清单可见
+- [ ] load_skill 按路径过滤：模型上下文无关的 skill 不出现在候选里（收窄选择面）
+- [ ] 与缺口 A/B 无关，纯 Skill 加载机制增强；落地后配合 skill 误触发评测用例验证
+
+**Go 练习点**
+- 路径匹配（`path/filepath` Match/Glob 语义 vs JS 无内置 glob）
+- 过滤逻辑与既有常驻清单生成的解耦
+
+**验证**
+- 单元测试：不同工作目录下候选清单正确收窄
+- 与评测门联动：临近领域混淆用例在无关路径下不再触发该 skill
+
 ---
 
 ## 第 5 步 · 记忆与检索（RAG 接入）
@@ -221,6 +240,13 @@
 - 把日常开发流程封装为 Skill（复用第 1/2/3 步真实工具 + 既有 `load_skill` 渐进加载）：
   修复 bug / 改功能 / 跑测试修失败 / **前端视觉验证**（起服务 → 截屏 → 给视觉模型核对），
   流程 = 复现 → 定位 → 修改 → 验证
+- **双循环结构**（反思回写 2026-10-13）：外层循环 = 规划（拆需求/定 what·why·how、
+  切 ticket，低频、事关方向）；内层循环 = 实现（一个 ticket 一轮：加载上下文 →
+  规划实现 → 写码 → 验证 → 复核，高频、占满日常）——内层产物即第 7 步的
+  TaskEnvelope 切片，两层频率与职责分离
+- **validation-first**（反思回写 2026-10-13）：实现计划先产出「验证清单」
+  （单测/边界/lint/手动/视觉核对），agent 照着写、照着跑、照着改——对终点具体、
+  对手段放权；验证清单复用既有评测门 + 视觉验证机制
 - Skill 只写"何时加载、加载什么"，正文按需注入 system（机制已在）
 - 工作流按状态机思路设计（反思回写 2026-10-13）：节点级可重试（沿用软停止语义）、
   分支失败有回滚路径，不做成线性 Chain——防单点失败拖垮整条链路
@@ -242,6 +268,9 @@
 - 层间信封契约（反思回写 2026-10-13）：TaskEnvelope（目标/输入/约束/验收标准）+
   ResultEnvelope（产物/证据/状态/错误）Go 结构体；决定权留 Planner（重试/重派/降级），
   Worker 无状态、只拿任务切片、报错原样返回
+- 环境工程（反思回写 2026-10-13）：并行前先做环境隔离——per-agent worktree
+  （fsagent root 演进为每 Worker 独立工作目录，对应外部实践 worktree-create/merge
+  思路），防互相踩踏、隔离依赖与产物
 
 **Go 练习点**
 - 多实例并发编排
@@ -256,8 +285,11 @@
 ## 第 8 步 · 可观测性与评测深化
 
 **做什么**
-- ① 结构化轨迹导出（JSON）+ 回放工具
-- ② 评测集扩充：对抗用例（绕过审批、循环诱导）+ 成功率门槛 CI 门禁
+- ① 结构化轨迹导出（JSON）+ 回放工具——记录关键节点断言，含「模型为何选/不选某
+  skill」（反思回写 2026-10-13：选择可观测，防"AI 选工具用户看不到备选"）
+- ② 评测集扩充：对抗用例（绕过审批、循环诱导）+ **skill 误触发用例**
+  （临近领域混淆：看起来很像但根本不该加载该 Skill 的请求，反思回写 2026-10-13）
+  + 成功率门槛 CI 门禁
 
 **Go 练习点**
 - 表驱动测试、`testing` 包、基准测试（benchmark）
