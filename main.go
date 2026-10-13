@@ -1,5 +1,5 @@
-// mine-harness 入口：二十五个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session
+// mine-harness 入口：二十六个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel
 package main
 
 import (
@@ -7,6 +7,7 @@ import (
 	"context"
 	_ "embed" // 内置模板兜底：编译期把 assets/demo_template.html 打进二进制
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -27,7 +28,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -84,6 +85,8 @@ func main() {
 		runDemoSkillPath(*verbose)
 	case "session":
 		runDemoSession(*verbose)
+	case "cancel":
+		runDemoCancel(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -888,6 +891,150 @@ func lastAssistantAnswer(msgs []agent.Message) string {
 		}
 	}
 	return "(无)"
+}
+
+// runDemoCancel 演示协作式取消契约（缺口 D）：
+// 外部取消信号（context）→ cancel_requested → 任务在安全检查点停止 →
+// 按执行日志逆序补偿可补偿步骤 → 状态如实分级。
+// 三个场景覆盖副作用三分类 + 两种尴尬时刻：
+//   场景1 可补偿：请求发出后响应返回前取消（read_order 内触发）→
+//     reserve_stock 已执行并记账 → 取消收尾逆序释放 → canceled
+//   场景2 不可逆：外部成功后本地落账前取消（create_refund 内触发）→
+//     退款单已创建 → 状态如实 partially_completed（不假装回滚）
+//   场景3 补偿失败：补偿动作本身失败 → needs_review（人工接管入口）
+func runDemoCancel(verbose bool) {
+	// 场景1：可补偿逆序收尾
+	{
+		var cancel context.CancelFunc
+		reg := agent.NewRegistry()
+		reg.Register(agent.Tool{
+			Name: "reserve_stock", Description: "预占库存",
+			SideEffect: agent.SideCompensatable,
+			Compensate: &agent.Compensation{Action: "释放预占库存",
+				Exec: func(input string) (string, error) { return "库存已释放", nil }},
+			Execute: func(input string) (string, error) { return "库存预占成功（占用 2 件 SKU-A）", nil },
+		})
+		reg.Register(agent.Tool{
+			Name: "read_order", Description: "查询订单", SideEffect: agent.SideReadonly,
+			Execute: func(input string) (string, error) {
+				cancel() // 竞态①：请求已发出、响应返回前用户点了取消
+				return "订单 #1：待支付", nil
+			},
+		})
+		ctx, c := context.WithCancel(context.Background())
+		cancel = c
+		llm := agent.NewMockLLM([]agent.MockDecision{
+			{ToolCalls: []agent.ToolCall{
+				{ID: "c1", Name: "reserve_stock", Input: `{"sku":"A","qty":2}`},
+				{ID: "c2", Name: "read_order", Input: `{"id":"1"}`},
+			}},
+		})
+		a := agent.NewAgent(llm, reg, agent.WithMaxSteps(5), agent.WithVerbose(verbose))
+		fmt.Println("===== 场景1 · 可补偿步骤（请求发出后响应前取消）=====")
+		res := a.RunWithContext(ctx, "预占库存并查询订单")
+		showCancelResult(res)
+	}
+
+	// 场景2：不可逆如实上报
+	{
+		var cancel context.CancelFunc
+		reg := agent.NewRegistry()
+		reg.Register(agent.Tool{
+			Name: "create_refund", Description: "创建退款单",
+			SideEffect: agent.SideIrreversible,
+			Execute: func(input string) (string, error) {
+				cancel() // 竞态②：退款单已在外部创建成功，本地落账前用户取消
+				return "退款单 REF-001 已创建（支付系统已受理）", nil
+			},
+		})
+		ctx, c := context.WithCancel(context.Background())
+		cancel = c
+		llm := agent.NewMockLLM([]agent.MockDecision{
+			{ToolName: "create_refund", ToolInput: `{"order":"1","amount":199}`},
+		})
+		a := agent.NewAgent(llm, reg, agent.WithMaxSteps(5), agent.WithVerbose(verbose))
+		fmt.Println("===== 场景2 · 不可逆步骤（外部成功后本地落账前取消）=====")
+		res := a.RunWithContext(ctx, "为订单 #1 创建退款")
+		showCancelResult(res)
+	}
+
+	// 场景3：补偿失败 → 人工接管
+	{
+		var cancel context.CancelFunc
+		reg := agent.NewRegistry()
+		reg.Register(agent.Tool{
+			Name: "reserve_stock", Description: "预占库存",
+			SideEffect: agent.SideCompensatable,
+			Compensate: &agent.Compensation{Action: "释放预占库存",
+				Exec: func(input string) (string, error) {
+					return "", errors.New("库存系统超时，释放失败")
+				}},
+			Execute: func(input string) (string, error) { return "库存预占成功", nil },
+		})
+		reg.Register(agent.Tool{
+			Name: "read_order", Description: "查询订单", SideEffect: agent.SideReadonly,
+			Execute: func(input string) (string, error) { cancel(); return "订单 #1", nil },
+		})
+		ctx, c := context.WithCancel(context.Background())
+		cancel = c
+		llm := agent.NewMockLLM([]agent.MockDecision{
+			{ToolCalls: []agent.ToolCall{
+				{ID: "c1", Name: "reserve_stock", Input: `{"sku":"A"}`},
+				{ID: "c2", Name: "read_order", Input: `{"id":"1"}`},
+			}},
+		})
+		a := agent.NewAgent(llm, reg, agent.WithMaxSteps(5), agent.WithVerbose(verbose))
+		fmt.Println("===== 场景3 · 补偿失败（补偿执行一半再失败）=====")
+		res := a.RunWithContext(ctx, "预占库存并查询订单")
+		showCancelResult(res)
+	}
+}
+
+// showCancelResult 展示取消结果：状态 + 账本 + 补偿记录。
+func showCancelResult(res agent.RunResult) {
+	fmt.Printf("状态: %s  步数: %d\n", res.Status, res.Steps)
+	if res.Reason != "" {
+		fmt.Printf("原因: %s\n", res.Reason)
+	}
+	fmt.Printf("步骤账本（%d 条）：\n", len(res.Ledger))
+	for _, r := range res.Ledger {
+		comp := "—"
+		if r.SideEffect == agent.SideCompensatable {
+			if r.Compensated {
+				comp = "✅ 已补偿"
+			} else if r.CompensateErr != "" {
+				comp = "⚠ " + r.CompensateErr
+			} else {
+				comp = "未补偿"
+			}
+		}
+		fmt.Printf("  [%d] %s(%s) 副作用=%s 结果=%v 请求标识=%s %s\n",
+			r.Step, r.Name, r.Input, sideName(r.SideEffect), r.OK, r.InputHash, comp)
+	}
+	if len(res.Compensations) > 0 {
+		fmt.Printf("补偿记录（%d 条，逆序执行）：\n", len(res.Compensations))
+		for _, c := range res.Compensations {
+			status := "✅"
+			if !c.OK {
+				status = "❌"
+			}
+			fmt.Printf("  %s %s(%s) err=%s\n", status, c.Name, c.InputHash, c.Err)
+		}
+	}
+	fmt.Println()
+}
+
+// sideName 副作用类型的人类可读名。
+func sideName(s agent.SideEffect) string {
+	switch s {
+	case agent.SideReadonly:
+		return "只读"
+	case agent.SideCompensatable:
+		return "可补偿"
+	case agent.SideIrreversible:
+		return "不可逆"
+	}
+	return "?"
 }
 
 // runDemoParallel 演示多 tool_call 并发执行：

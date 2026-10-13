@@ -2,6 +2,34 @@ package agent
 
 import "fmt"
 
+// SideEffect 描述工具调用的副作用类型（协作式取消契约 · 缺口 D）。
+//
+// 设计对齐外部实践的三分类：
+//   - Readonly：查询/读取，取消后直接结束，无需收尾；
+//   - Compensatable：会留下可撤销的影响（创建草稿、占用临时资源），
+//     必须声明 Compensation——任务取消时内核按执行日志逆序调用补偿；
+//   - Irreversible：影响外部系统且无法撤销（创建退款、发送消息），
+//     执行前内核做取消二次检查，执行后如实上报（不假装回滚成功）。
+//
+// 与 BaseRisk 分工：风险分级管「该不该做」（审批闸门，前置护栏），
+// 副作用类型管「做了之后怎么撤」（取消补偿，事后契约）——互不重叠。
+type SideEffect int
+
+const (
+	SideReadonly      SideEffect = iota // 只读：取消后直接结束
+	SideCompensatable                   // 可补偿：需声明 Compensation
+	SideIrreversible                    // 不可逆：执行前二次检查，执行后如实上报
+)
+
+// Compensation 是可补偿工具的补偿动作声明（副作用契约 · 缺口 D）。
+// Exec 与原 Execute 同签名（input 进、string 出）；任务取消时内核按
+// 执行日志逆序调用。补偿本身可能失败——内核记录尝试与错误，
+// 最终状态 needs_review 交还人工（不是假装回滚成功）。
+type Compensation struct {
+	Action string                             // 补偿动作的人类可读描述（账本/审计可见）
+	Exec   func(input string) (string, error) // 实际补偿执行
+}
+
 // Tool 描述一个可被模型调用的工具。
 //
 // BaseRisk 声明工具的静态基础风险（人定规则），运行时可按参数修正
@@ -17,6 +45,12 @@ import "fmt"
 // （如必须是合法 JSON 且含关键字段）。返回非 nil 表示校验失败——该结果
 // **不进上下文**，回填明确错误并计入重试预算（防模型"以为成功了"）。
 // nil = 不校验（向后兼容：现有工具默认不声明，行为不变）。
+//
+// SideEffect 声明副作用类型（缺口 D，默认 SideReadonly 向后兼容）；
+// Compensate 声明补偿动作（仅 SideCompensatable 有意义，nil = 未声明，
+// 取消时该步骤记入 needs_review 而非自动补偿）；
+// Idempotent 声明工具幂等（账本以 input 哈希为请求标识，超时/取消后可
+// 安全重试或查结果——真实实现由工具侧生成外部单号并支持按单号查询）。
 type Tool struct {
 	Name            string
 	Description     string
@@ -24,6 +58,9 @@ type Tool struct {
 	ConcurrentSafe  bool                               // 声明并发安全后参与并行执行
 	Execute         func(input string) (string, error) // 简化：JSON 字符串进、字符串出
 	ResultValidator func(output string) error          // 可选：返回结果 schema 校验（nil = 不校验）
+	SideEffect      SideEffect                         // 副作用类型（默认 SideReadonly）
+	Compensate      *Compensation                      // 补偿动作（仅 Compensatable；nil = 未声明）
+	Idempotent      bool                               // 声明幂等（账本请求标识可复用）
 }
 
 // Registry 是工具注册表：模型只能调用已注册的工具——这本身就是一层护栏
@@ -69,6 +106,33 @@ func (r *Registry) BaseRiskOf(name string) RiskLevel {
 func (r *Registry) IsConcurrentSafe(name string) bool {
 	t, ok := r.tools[name]
 	return ok && t.ConcurrentSafe
+}
+
+// SideEffectOf 返回工具声明的副作用类型；未注册/未声明返回 SideReadonly
+// （默认只读最安全：取消时无需收尾）。
+func (r *Registry) SideEffectOf(name string) SideEffect {
+	t, ok := r.tools[name]
+	if !ok {
+		return SideReadonly
+	}
+	return t.SideEffect
+}
+
+// CompensateOf 返回工具的补偿动作声明；未注册/未声明返回 (nil,false)。
+// 声明了 SideCompensatable 却没给 Compensate 的工具，取消时该步骤
+// 无法自动收尾 → 状态 needs_review（如实告知，不假装回滚）。
+func (r *Registry) CompensateOf(name string) (*Compensation, bool) {
+	t, ok := r.tools[name]
+	if !ok || t.Compensate == nil {
+		return nil, false
+	}
+	return t.Compensate, true
+}
+
+// IsIdempotent 查询工具是否声明幂等（账本请求标识可安全复用）。
+func (r *Registry) IsIdempotent(name string) bool {
+	t, ok := r.tools[name]
+	return ok && t.Idempotent
 }
 
 // Call 执行指定工具并返回结果。

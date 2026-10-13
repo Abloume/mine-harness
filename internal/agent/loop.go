@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -19,20 +20,11 @@ const (
 //
 // JS/TS ↔ Go 差异：TS 常用字符串字面量联合类型 "completed" | "aborted"；
 // Go 用 string 常量 + 注释约束，编译期没有穷尽检查。
+// 缺口 D 新增取消三态（见 cancel.go）：canceled / partially_completed / needs_review。
 const (
 	StatusCompleted = "completed"
 	StatusAborted   = "aborted"
 )
-
-// RunResult 是一次 Run 的完整结果。
-// 引入它是为了"软停止"：撞上限/循环命中不再是 error（不是异常），
-// 而是带状态的正常返回，调用方可以展示进度并交还用户继续指挥。
-type RunResult struct {
-	Answer string // 最终回答（仅在 completed 时有意义）
-	Steps  int
-	Status string // StatusCompleted / StatusAborted
-	Reason string // 中止原因（循环检测 / 步数超限 / 重试超预算）
-}
 
 // ToolTrace 记录一次工具调用，供循环检测比对。
 //
@@ -190,6 +182,15 @@ type Agent struct {
 	// 不再重建 system 首条——模型上下文延续上次 Run 的探索与结论。
 	initialHistory []Message
 
+	// 协作式取消契约（缺口 D）：
+	// ctx 是外部取消信号源（context 取消 → cancel_requested）；ledger 是
+	// 步骤账本（已执行工具调用的完整记录）；compensations 是取消收尾时
+	// 的补偿执行记录。三者只在 RunWithContext 生命周期内有效。
+	ctx              context.Context
+	cancelRequested  bool
+	ledger           []StepRecord
+	compensations    []CompensateRecord
+
 	history []Message
 }
 
@@ -280,13 +281,45 @@ func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 }
 
 // Run 执行任务并返回结果（可能完成，也可能被护栏软停止）。
+// 便捷入口：不支持外部取消；需要取消语义（协作式取消契约）用 RunWithContext。
+func (a *Agent) Run(task string) RunResult {
+	return a.RunWithContext(context.Background(), task)
+}
+
+// RunWithContext 执行任务并支持外部取消（协作式取消契约 · 缺口 D）。
+//
+// ctx.Done() 触发 cancel_requested：任务在下一个安全检查点停止，不领取
+// 新步骤；随后按执行日志逆序补偿可补偿步骤，不可逆步骤如实上报
+// （partially_completed / needs_review，不把"进程已停"冒充"外部世界已恢复"）。
+// ctx 为 nil 时等效 Run。
+//
+// 安全检查点位置（最多多完成一个可控单元，不截断在任意一行代码）：
+//   ① 每步顶部：取消后不开始新步骤；
+//   ② 工具执行前：取消后不领取新步骤（不可逆动作额外二次检查——执行前解决）；
+//   ③ 工具返回、记账之后：结果已落账，取消收尾不会遗漏（闭合
+//      "外部成功后本地落账前"的缝隙）。
 //
 // 这就是"agent loop"的核心，对应真实 harness 的一轮循环：
 //
 //	调模型 → 解析工具调用 → 循环检测 → 审批点 → 执行工具 → 回填结果 → 再调模型（直到结束）
 //
 // 审批点在循环检测之后、工具执行之前：先防"重复空转"，再防"越权动作"。
-func (a *Agent) Run(task string) RunResult {
+func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult) {
+	// 统一注入步骤账本与补偿记录：所有返回路径（completed / aborted /
+	// 取消三态）都携带"已发生动作的记录"——停止≠外部无记录。
+	defer func() {
+		res.Ledger = a.ledger
+		res.Compensations = a.compensations
+	}()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.ctx = ctx
+	a.cancelRequested = false
+	a.ledger = nil
+	a.compensations = nil
+
 	if len(a.initialHistory) > 0 {
 		// 断点续跑：恢复的初始历史已含 system 首条与上次对话，
 		// 只追加本次 user 消息（复制防外部修改影响运行状态）。
@@ -300,6 +333,11 @@ func (a *Agent) Run(task string) RunResult {
 	}
 
 	for step := 1; step <= a.maxSteps; step++ {
+		// 安全检查点①：外部取消后不开始新步骤（LLM 调用期间到达的
+		// 取消信号在此消费——模型调用本身不是副作用步骤，无需中断）。
+		if a.checkCancel() {
+			return a.finishCancel(step)
+		}
 		// 0. 上下文预算检查：超预算先做摘要压缩（context.go 的 CompactContext），
 		//    压缩不了才走 FIFO 兜底——对齐真实 harness 的 context compaction。
 		//    触发依据优先用**服务端真实 usage**（最近一次响应的 total_tokens，
@@ -469,6 +507,12 @@ func (a *Agent) Run(task string) RunResult {
 			}
 
 			if canParallel {
+				// 安全检查点②：执行前检查取消——取消后不启动并行批次
+				// （并行批次整体作为一个可控单元；批次内逐工具检查在
+				// 顺序路径，并发工具无共享状态，批次边界检查已足够）。
+				if a.checkCancel() {
+					return a.finishCancel(step)
+				}
 				if a.verbose {
 					log.Printf("[step %d] ⚡ 并行执行 %d 个工具调用", step, len(items))
 				}
@@ -502,6 +546,9 @@ func (a *Agent) Run(task string) RunResult {
 						}
 						res.out = fmt.Sprintf("工具返回结果未通过校验: %v", verr)
 					}
+					// 缺口 D：执行后立即记账（请求标识/结果/副作用类型）——
+					// 即使取消信号此刻到达，这一步已落账，收尾不会遗漏。
+					a.recordStep(step, it.name, it.input, ok)
 					if a.verbose {
 						log.Printf("[step %d] tool_result ← %s", step, res.out)
 					}
@@ -509,11 +556,27 @@ func (a *Agent) Run(task string) RunResult {
 					a.history = append(a.history,
 						Message{Role: roleTool, Content: res.out, ToolCallID: it.tc.ID})
 				}
+				// 安全检查点③：批次结果全部记账后再查取消——最多多完成
+				// 一个可控单元（本批次），不把状态截断在任意一行代码。
+				if a.checkCancel() {
+					return a.finishCancel(step)
+				}
 				continue
 			}
 
 			// 顺序执行（含特殊通道与未声明并发安全的工具）
 			for _, it := range items {
+				// 安全检查点②：执行前检查取消——取消后不领取新步骤。
+				// 注意在特殊通道判断之前：load_skill/read_skill_ref 虽无
+				// 外部副作用（只注入上下文），但取消时也不该继续加载。
+				if a.checkCancel() {
+					return a.finishCancel(step)
+				}
+				// 不可逆动作执行前二次检查（执行前解决原则）：即使刚查过，
+				// 进入不可逆动作前再确认一次——信号可能在两次检查之间到达。
+				if a.registry.SideEffectOf(it.name) == SideIrreversible && a.checkCancel() {
+					return a.finishCancel(step)
+				}
 				if it.tc.Name == LoadSkillToolName {
 					a.runLoadSkill(step, it.tc)
 					continue
@@ -539,12 +602,19 @@ func (a *Agent) Run(task string) RunResult {
 					}
 					out = fmt.Sprintf("工具返回结果未通过校验: %v", verr)
 				}
+				// 缺口 D：执行后立即记账——"外部成功后本地落账前"的缝隙
+				// 由记账闭合：即使此刻取消，账本已有该步骤，收尾不会遗漏。
+				a.recordStep(step, it.name, it.input, ok)
 				if a.verbose {
 					log.Printf("[step %d] tool_result ← %s", step, out)
 				}
 				a.recordHistory(step, it.name, it.input, ok)
 				a.history = append(a.history,
 					Message{Role: roleTool, Content: out, ToolCallID: it.tc.ID})
+				// 安全检查点③：记录结果后再检查取消——最多多完成一个可控单元。
+				if a.checkCancel() {
+					return a.finishCancel(step)
+				}
 			}
 			continue
 		}

@@ -35,8 +35,8 @@
 
 ## 当前进度（2026-10-13）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session` 二十五个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑」，
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel` 二十六个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约」，
 前七个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
 
 - **智谱**：需 `ZHIPU_API_KEY`，写入项目根 `.env`（已被 `.gitignore` 排除）；模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`。
@@ -262,6 +262,34 @@ token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 
   恢复 → 直接汇报上次结论（无需重述探索过程）。
 - 单元测试：`internal/memory/session_test.go` 4 用例（往返/缺失/List/原子覆盖）、
   `internal/agent/resume_test.go` 3 用例（恢复续跑/向后兼容/不污染外部切片）全绿。
+
+## 协作式取消契约落地（缺口 D · 2026-10-13）
+
+来源：`reflections/2026-10-13-cooperative-cancel.md`（视角四）。取消不是强杀，
+是受控状态转换；副作用先分类再补偿；不可逆执行前解决；状态如实。
+
+- **取消入口（`loop.go`）**：`RunWithContext(ctx, task)`——ctx.Done() 触发
+  cancel_requested，任务在安全检查点停止；`Run(task)` 保持原签名（委托
+  Background ctx，向后兼容）。安全检查点三处：①每步顶部（不开始新步骤）
+  ②工具执行前（不可逆动作额外二次检查）③工具返回记账后再查（最多多完成
+  一个可控单元）。
+- **副作用契约（`tools.go`）**：`Tool.SideEffect`（SideReadonly /
+  SideCompensatable / SideIrreversible，默认只读向后兼容）+ `Tool.Compensate`
+  （补偿动作声明）+ `Tool.Idempotent`（幂等声明）。与 BaseRisk 分工：
+  风险分级管「该不该做」（审批前置护栏），副作用类型管「做了之后怎么撤」。
+- **步骤账本 + 逆序补偿（`cancel.go`）**：每次工具执行后立即记账
+  （请求标识 InputHash / 结果 / 副作用类型 / 完成时间），闭合"外部成功后
+  本地落账前"的缝隙；取消收尾按执行日志**逆序**调用补偿动作（撤销栈）；
+  补偿失败记录尝试次数 → 状态 `needs_review`（人工接管），不假装回滚。
+- **状态如实分级**：`canceled`（无可逆残留）/ `partially_completed`（不可逆
+  已提交，如实告知）/ `needs_review`（补偿收不干净）——不把"进程已停"
+  冒充"外部世界已恢复"。账本经 RunResult.Ledger / Compensations 暴露
+  （completed/aborted 路径同样携带，喂第 8 步轨迹导出）。
+- `-demo cancel` 实测三场景：可补偿逆序收尾 → canceled；不可逆已提交 →
+  partially_completed；补偿失败 → needs_review（含尝试次数记录）。
+- 单元测试：`internal/agent/cancel_test.go` 8 用例（开始前取消/请求发出后
+  响应前取消/逆序补偿/不可逆 partial/不可逆执行前拦截/补偿失败/未声明补偿/
+  正常完成账本）全绿。
 
 ## 约定
 
