@@ -35,4 +35,8 @@ Thumbs.db
 webdemo/
 
 # 会话持久化产物（第 5 步阶段一 demo 生成，运行时数据非源码）
-sessions/
+# 注意：模式锚定根目录（/sessions/），否则会误伤 internal/ 下同名源码目录
+/sessions/
+
+# 长期记忆产物（第 5 步③ demo 生成，运行时数据非源码；同样锚定根目录）
+/memory/

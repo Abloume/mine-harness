@@ -191,6 +191,14 @@ type Agent struct {
 	ledger           []StepRecord
 	compensations    []CompensateRecord
 
+	// 第 5 步③ · 记忆分层：长期记忆层（跨会话关键记忆）。
+	// memoryStore/memoryExtractor 为窄接口（见 memory.go），memory 包实现；
+	// sessionID 是来源标注（记忆可追溯回原始会话）。
+	memoryStore       MemoryStore
+	memoryExtractor   MemoryExtractor
+	memoryRecallLimit int
+	sessionID         string
+
 	history []Message
 }
 
@@ -258,6 +266,31 @@ func WithInitialHistory(msgs []Message) Option {
 	return func(a *Agent) { a.initialHistory = msgs }
 }
 
+// WithMemoryStore 启用长期记忆层（第 5 步③ 记忆分层）：
+// Run 结束时把本次会话关键信息沉淀进 store（Extractor 提取）；
+// 新 Run 开始时按任务召回相关记忆注入 system 上下文——只召回关键信息，
+// 不恢复全部历史（与 WithInitialHistory 的"整历史恢复"形成分层对照）。
+func WithMemoryStore(s MemoryStore) Option {
+	return func(a *Agent) { a.memoryStore = s }
+}
+
+// WithMemoryExtractor 替换默认记忆提取器（默认 memory 包的启发式实现；
+// 可换成调 LLM 的版本，同 Summarizer 模式）。
+func WithMemoryExtractor(ex MemoryExtractor) Option {
+	return func(a *Agent) { a.memoryExtractor = ex }
+}
+
+// WithMemoryRecallLimit 设置每次 Run 的记忆召回上限（默认 3 条）。
+func WithMemoryRecallLimit(n int) Option {
+	return func(a *Agent) { a.memoryRecallLimit = n }
+}
+
+// WithSessionID 设置本次会话 ID（记忆来源标注：Source = 会话 ID + 定位，
+// 召回后模型可追溯回原始会话）。
+func WithSessionID(id string) Option {
+	return func(a *Agent) { a.sessionID = id }
+}
+
 // NewAgent 构造一个 Agent，默认 maxSteps=10、budget=4096、verbose=false。
 func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 	a := &Agent{
@@ -273,6 +306,7 @@ func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 		loadedSkills:      map[string]bool{},
 		loadedRefs:        map[string]bool{},
 		skillHistory:      NewSkillHistory(8),
+		memoryRecallLimit: recallLimitDefault,
 	}
 	for _, o := range opts {
 		o(a)
@@ -305,11 +339,14 @@ func (a *Agent) Run(task string) RunResult {
 //
 // 审批点在循环检测之后、工具执行之前：先防"重复空转"，再防"越权动作"。
 func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult) {
-	// 统一注入步骤账本与补偿记录：所有返回路径（completed / aborted /
-	// 取消三态）都携带"已发生动作的记录"——停止≠外部无记录。
+	// 统一收尾（所有返回路径）：
+	//   - 注入步骤账本与补偿记录（缺口 D）——停止≠外部无记录；
+	//   - completed 时把本次会话关键信息沉淀进长期记忆（第 5 步③）——
+	//     中止/取消的会话没有可靠结论，不污染长期记忆。
 	defer func() {
 		res.Ledger = a.ledger
 		res.Compensations = a.compensations
+		a.settleMemory(res.Status)
 	}()
 
 	if ctx == nil {
@@ -331,6 +368,11 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 			Message{Role: roleUser, Content: task},
 		)
 	}
+
+	// 第 5 步③：按任务召回长期记忆（关键信息优先），注入 system 上下文。
+	// 与 WithInitialHistory 对照：阶段一恢复"整历史"，本步只召回"关键记忆"——
+	// 跨会话的轻量延续，token 成本与历史长度无关。
+	a.recallMemory(task)
 
 	for step := 1; step <= a.maxSteps; step++ {
 		// 安全检查点①：外部取消后不开始新步骤（LLM 调用期间到达的

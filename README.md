@@ -35,8 +35,8 @@
 
 ## 当前进度（2026-10-13）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree` 二十七个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索」，
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall` 二十八个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索 / 长期记忆关键召回」，
 前七个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
 
 - **智谱**：需 `ZHIPU_API_KEY`，写入项目根 `.env`（已被 `.gitignore` 排除）；模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`。
@@ -315,6 +315,42 @@ token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 
 - 单元测试：`internal/tree/tree_test.go` 7 用例（构建+browse/忽略规则/
   browse 文件报错/目录与文件 overview/L2 行号/缺失路径/根路径错误/.env 防泄露）
   全绿。
+
+## 第 5 步③落地 · 记忆分层 + 关键信息优先召回（2026-10-13）
+
+来源：PLAN 第 5 步③（反思回写）。记忆分三层，本步补齐**长期层**：
+
+- **短期（working memory）**：本轮上下文——压缩 + LLM 摘要（既有机制）；
+- **中期（session）**：整段会话历史落盘——阶段一 SessionStore；
+- **长期（key memory）**：跨会话关键记忆——本步新增。**不恢复全部历史，
+  只按任务召回相关条目**（关键信息优先），成本与历史长度无关。
+
+- **`internal/memory.MemoryStore`（扩展）**：长期记忆存储，`memories.json`
+  原子写落盘（与 SessionStore 同款 temp+rename）；`Add` 按 (内容,类别) 去重
+  （幂等）；**`Recall` 关键信息优先排序**：查询词命中数 ×2 + 类别权重
+  （conclusion/decision 2 分 > constraint/preference 1.5 分 > detail 1 分）
+  + 新鲜度降序。
+- **`memory.HeuristicExtractor`**：默认记忆提取器（实现 agent 窄接口）——
+  取最后一条最终回答为 conclusion 记忆，零成本不调 LLM；可换 LLM 版
+  （同 Summarizer 替换模式）。局限如实：会提取所有最终回答（含元回答），
+  低价值记忆靠 Recall 排序衰减。
+- **Agent 集成（`internal/agent/memory.go`）**：`WithMemoryStore` /
+  `WithMemoryExtractor` / `WithMemoryRecallLimit`（默认 3 条）/ `WithSessionID`
+  （来源标注）。Run 开始 `recallMemory` 注入【记忆召回】system 消息；
+  Run 结束 `settleMemory` 只在 **completed** 时沉淀（中止/取消的会话
+  无可靠结论，不污染长期记忆）。
+- **依赖方向**：agent 只定义窄接口（`MemoryStore` / `MemoryExtractor`），
+  memory 包实现——Go 惯例 consumer 定义接口，避免循环依赖
+  （memory 需要 import agent 消息类型）。
+- `-demo memory-recall` 实测：会话1 调研 → 沉淀 1 条 conclusion →
+  会话2 **新实例不带完整历史** → 仅召回记忆注入 → 直接汇报
+  （未恢复阶段一的 5 条消息，只注入记忆条目）。
+- 单元测试：`memory/memory_test.go` 4 用例（召回排序/去重/落盘往返/提取器）
+  + `agent/recall_test.go` 4 用例（召回注入/未配置不注入/completed 沉淀/
+  aborted 不沉淀）全绿。
+- **已知局限（沉淀判据）**：当前提取器为占位实现——"最后一条最终回答
+  全收"，无复用价值判断，demo 中元回答也会入库；改造方向（三问判据 +
+  三类信号 + 事件信号优先）见 `reflections/2026-10-13-memory-settling-criteria.md`。
 
 ## 约定
 

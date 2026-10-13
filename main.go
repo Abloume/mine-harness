@@ -1,5 +1,5 @@
-// mine-harness 入口：二十七个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree
+// mine-harness 入口：二十八个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索 / 长期记忆关键召回"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall
 package main
 
 import (
@@ -29,7 +29,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -90,6 +90,8 @@ func main() {
 		runDemoCancel(*verbose)
 	case "tree":
 		runDemoTree(*verbose)
+	case "memory-recall":
+		runDemoMemoryRecall(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -1152,6 +1154,70 @@ func parseTreePath(input string) (string, error) {
 		req.Path = "."
 	}
 	return req.Path, nil
+}
+
+// runDemoMemoryRecall 演示第 5 步③ · 记忆分层 + 关键信息优先召回：
+//   - 会话1（s1）：完成任务 → Run 结束把关键信息（最终结论）沉淀进长期记忆
+//     MemoryStore（memories.json 原子写落盘）；
+//   - 会话2（s2）：**新 Agent 实例、不带完整历史** → Run 开始按任务召回
+//     相关记忆条目注入 system（【记忆召回】）→ 模型直接作答。
+// 与阶段一（-demo session）对照：整历史恢复 vs 关键记忆召回——
+// 召回成本与历史长度无关（只召回 limit 条），token 更省。
+func runDemoMemoryRecall(verbose bool) {
+	store, err := memory.NewMemoryStore("memory")
+	if err != nil {
+		fmt.Println("长期记忆存储初始化失败:", err)
+		return
+	}
+	ex := memory.NewHeuristicExtractor()
+
+	readGoMod := agent.Tool{
+		Name: "read_file", Description: "读取文件内容", SideEffect: agent.SideReadonly,
+		Execute: func(input string) (string, error) {
+			return "module mine-harness\n\ngo 1.27.1\n\nrequire (\n\tgithub.com/go-rod/rod v0.116.2 // indirect\n)", nil
+		},
+	}
+
+	// 会话1：调研并得出结论，沉淀长期记忆
+	{
+		reg := agent.NewRegistry()
+		reg.Register(readGoMod)
+		llm := agent.NewMockLLM([]agent.MockDecision{
+			{ToolName: "read_file", ToolInput: `{"path":"go.mod"}`},
+			{Content: "结论：mine-harness 使用 Go 1.27.1，主要依赖 go-rod（间接依赖）。"},
+		})
+		a := agent.NewAgent(llm, reg,
+			agent.WithMaxSteps(5), agent.WithVerbose(verbose),
+			agent.WithMemoryStore(store), agent.WithMemoryExtractor(ex),
+			agent.WithSessionID("s1"))
+		fmt.Println("===== 会话1（s1）：调研并沉淀长期记忆 =====")
+		showResult(a.Run("读取 go.mod，确认 Go 版本与主要依赖"))
+		fmt.Printf("—— 长期记忆已沉淀 %d 条：\n", len(store.List()))
+		for _, e := range store.List() {
+			fmt.Printf("  [%s] %s（来源: %s）\n", e.Category, e.Content, e.Source)
+		}
+		fmt.Println()
+	}
+
+	// 会话2：新实例、不带完整历史，仅靠记忆召回作答
+	{
+		reg := agent.NewRegistry()
+		reg.Register(readGoMod)
+		llm := agent.NewMockLLM([]agent.MockDecision{
+			{Content: "根据【记忆召回】直接汇报：Go 1.27.1，无需重复探索。"},
+		})
+		a := agent.NewAgent(llm, reg,
+			agent.WithMaxSteps(3), agent.WithVerbose(verbose),
+			agent.WithMemoryStore(store), agent.WithMemoryExtractor(ex),
+			agent.WithSessionID("s2"))
+		fmt.Println("===== 会话2（s2）：新实例，仅召回关键记忆作答 =====")
+		showResult(a.Run("上次调研的 Go 版本结论是什么？直接汇报"))
+		recalled, _ := store.Recall("Go", 3)
+		// 注意：启发式提取器如实提取所有最终回答（含会话2 的元回答），
+		// 低价值记忆靠 Recall 排序衰减；生产可换 LLM 版提取器过滤。
+		fmt.Printf("—— 成本对比：会话2 未恢复整段历史（阶段一 5 条消息），只召回 %d 条记忆条目注入上下文\n", len(recalled))
+		fmt.Printf("   （含本会话刚沉淀的 1 条：启发式提取器如实提取所有最终回答，低价值记忆靠召回排序衰减）\n")
+	}
 }
 
 // runDemoParallel 演示多 tool_call 并发执行：
