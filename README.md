@@ -31,11 +31,12 @@
 - [x] 豆包 API 接入（火山方舟 Ark，OpenAI 兼容——与智谱/DeepSeek 共用同一个 Provider，零协议改动）— `main.go` 的 `-demo doubao` / `-demo doubao-approval`
 - [x] 真实文件工具集（PLAN 第 1 步：`read_file` / `write_file` / `edit_file` / `glob` / `grep`，独立包 `internal/fsagent`，与内核解耦——机制归内核、工具归应用层）— 原子写入（同目录 temp + rename）、写前自动备份到 `backup/`（file-ops-policy 落地，备份失败即停止）、`filepath.IsLocal` 路径越界防护、edit 精确替换防幻觉（old 必须恰好出现一次）、glob/grep 跳过备份目录；读类 RiskNone 自动放行，写/编辑 RiskMedium 走审批闸门 — `-demo fs`
 - [x] 命令执行工具（PLAN 第 2 步：`run_cmd`，独立包 `internal/cmdagent`）— `context.WithTimeout` 超时 + **进程组杀灭**（Setpgid + kill(-pid)，实测踩坑见下）、输出截断保留头尾防爆上下文、**参数感知风险**（`RiskOfArgs`：白名单命令 go build/test/vet、git status/diff 等降 RiskLow 自动放行，rm/git push/curl/sudo 等危险模式升 RiskHigh 强制审批，未知命令 RiskMedium）— `-demo cmd`
+- [x] MCP 双向适配（PLAN 第 4 步：**Server 对外暴露** `internal/mcpserver/mcpserver.go`——Registry 工具映射为 MCP 工具，外部 Agent 可直接调用；**Client 对内接入** `internal/mcpserver/client.go`——外部 MCP server 的工具经 tools/list 发现、包装为普通工具注册进主循环，超时护栏 + 风险映射 + isError 转 error，实现要点见下）— `-demo mcp` / `-demo mcp-client`
 
 ## 当前进度（2026-10-13）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp` 十九个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 适配层」，
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client` 二十个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）」，
 前七个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
 
 - **智谱**：需 `ZHIPU_API_KEY`，写入项目根 `.env`（已被 `.gitignore` 排除）；模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`。
@@ -173,6 +174,31 @@ token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 
   error——与 JS child_process 的 exit code / throw 之分同理。
 - **输出截断保留头尾**：长输出头尾各半 + 显式"已截断 N 字符"标记——报错通常在
   结尾，头尾保真即可；与内核压缩机制同动机（防爆上下文）。
+
+**MCP 适配层实现要点（`internal/mcpserver`，PLAN 第 4 步）**：
+- **双向角色同包复用**：Server（`mcpserver.go`）与 Client（`client.go`）共用
+  `rpcRequest`/`rpcResponse` 协议结构——"一套协议，两个方向"是学习点：
+  Server 把 harness 工具翻译成 MCP 工具（外部 Agent 调用），Client 把外部
+  MCP 工具翻译回 harness 工具（注册进主循环）。传输双形态：`NewInMemory`
+  （net.Pipe 全内存互通，测试/demo 零依赖）+ `NewStdio`（起外部 server
+  子进程，生产形态；stderr 收集供调试——MCP 约定日志走 stderr，混入
+  stdout 会破坏按行解析）。
+- **超时护栏**：单次请求默认 30s（`time.Timer` + select 多路等待：响应/超时/
+  ctx 取消），防外部 server 挂死卡住主循环——"外部依赖不信任"，对齐
+  生产"下游服务超时"的处理。`WithTimeout` 可覆盖。
+- **风险映射**：外部工具透出 `risk` 字段（harness 扩展）则映射为对应
+  RiskLevel；**未声明一律保守 RiskMedium**（宁多送审、勿漏审）——外部工具
+  照样走 harness 审批闸门，"MCP 接入不等于放开风险"。`-demo mcp-client`
+  实测 read_file 等读类工具映射 RiskNone 自动放行、write_file/edit_file/
+  run_cmd 映射 RiskMedium 达审批阈值。
+- **isError 转 error**：MCP 约定工具执行失败是"业务结果"进 result
+  （`isError:true`），不是协议错误——Client 必须把它转成 error 回填，
+  模型看到失败而非"假成功"（与内核工具失败语义对齐）。
+- **并发安全不默认**：外部工具默认不声明 `ConcurrentSafe`（不知道对方是否
+  线程安全），内核自动顺序执行，正确性优先。
+- **响应路由**：常驻 reader goroutine + `pending map[int]chan` 按 JSON-RPC id
+  投递响应（标准 client 模式）；写请求前先登记 pending，防止"响应先到"
+  竞态；无 pending 的消息（server 主动通知）丢弃。
 
 ## 约定
 

@@ -20,7 +20,7 @@
       （B 方案 load_skill + 常驻清单 + L3 按需引用）、生成式 LLM 摘要器（6 段结构化 + 收敛护栏）
 - [x] 成本优化（额外完成）：摘要关 thinking、服务端 usage 触发压缩、隐式缓存红利
 - [x] 第 2 步命令执行（超时 + 进程组杀灭 + 参数感知风险）、第 3 步前端能力（预览/截屏/Figma）、
-      第 4 步 MCP Server（对外暴露）已落地——场景与实现要点见 README
+      第 4 步 MCP 双向适配（Server 暴露 + Client 接入）已落地——场景与实现要点见 README
 
 **下一步愿景**：工具集目前全是教学示例（`get_weather`、演示 `file_op`），
 补齐真实文件系统与命令执行能力后，harness 才能真正介入日常代码开发。
@@ -101,7 +101,7 @@
 
 ---
 
-## 第 4 步 · MCP 适配层（外部 Agent 互通） 🚧 进行中（2026-10-13：Server 方向完成）
+## 第 4 步 · MCP 适配层（外部 Agent 互通） ✅ 已完成（2026-10-13）
 
 > 形态决策（见文末）：**形态 A（对话式任务 Agent）优先**，AI IDE 待触发。
 > MCP 是"外部 Agent 用上 harness 能力"的标准互通层——Codex 等支持 MCP 的
@@ -122,8 +122,13 @@
     （approver 拒绝 → isError:true，工具不执行）
   - `go run . -demo mcp`：脚本化外部 client 调全量工具（文件+命令+前端+Figma，
     buildFullRegistry 组装，缺 token 跳过 figma 并提示）
-- [ ] **MCP Client（对内接入）**：harness 作为 client 调用外部 MCP server
-  （浏览器、Figma、数据库等第三方工具），注册成普通工具进主循环
+- [x] **MCP Client（对内接入）**：harness 作为 client 调用外部 MCP server
+  （浏览器、Figma、数据库等第三方工具），注册成普通工具进主循环 — 已实现
+  （`internal/mcpserver/client.go`：initialize 握手 / tools/list 发现映射为
+  agent.Tool / tools/call 执行；超时护栏默认 30s、风险映射（未声明保守
+  RiskMedium 照走审批闸门）、isError 转 error、并发安全不默认；
+  `NewInMemory` 内存互通 + `NewStdio` 起外部 server 子进程双传输形态；
+  实现要点见 README「MCP 适配层实现要点」）
 - [x] 工具 schema 转换：Go 工具签名 ↔ MCP JSON Schema 输入定义 — 已实现
 - [x] 第 3 步前端能力（预览/截屏/Figma）优先以 MCP 形式注册——一套实现，
   harness 自用 + 外部 Agent 共用 — 已实现（webagent serve_dir/screenshot +
@@ -132,12 +137,15 @@
 **Go 练习点**
 - [x] JSON-RPC 2.0 协议实现（stdio 传输层）— 已实现（bufio.Scanner 按行 + 注入 io.Reader/Writer）
 - [x] 协议映射：内部工具模型 ↔ 标准 schema（等价于把内部接口翻译成公共契约）— 已实现
-- [ ] 双向角色：同一套工具层分别做 server / client 两个方向
+- [x] 双向角色：同一套工具层分别做 server / client 两个方向 — 已实现
+  （同包复用 rpcRequest/rpcResponse，server.go ↔ client.go 互为镜像）
 
 **验证**
 - [x] demo：harness 起 MCP server，用 MCP client（脚本化 JSON-RPC 客户端）
   调用真实文件读取工具 — `go run . -demo mcp`
-- [ ] 反向：harness 作为 client 调外部 MCP server 完成一次查询
+- [x] 反向：harness 作为 client 调外部 MCP server 完成一次查询 — `go run . -demo mcp-client`
+  （net.Pipe 内存互通：client 发现 14 个外部工具 → 注册进主循环 → MockLLM 驱动
+  调外部 read_file 读取真实 go.mod；单元测试 5 个全绿，`go test -race` 无竞争）
 
 ---
 

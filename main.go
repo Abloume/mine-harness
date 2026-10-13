@@ -1,13 +1,15 @@
-// mine-harness 入口：十九个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 适配层"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp
+// mine-harness 入口：二十个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client
 package main
 
 import (
 	"bytes"
+	"context"
 	_ "embed" // 内置模板兜底：编译期把 assets/demo_template.html 打进二进制
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,7 +25,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -68,6 +70,8 @@ func main() {
 		runDemoStack(*verbose)
 	case "mcp":
 		runDemoMCP(*verbose)
+	case "mcp-client":
+		runDemoMCPClient(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -1186,5 +1190,90 @@ func runDemoMCP(verbose bool) {
 			continue
 		}
 		fmt.Println(pretty.String())
+	}
+}
+
+// runDemoMCPClient 演示 PLAN 第 4 步 MCP 适配层——MCP Client（对内接入）：
+// harness 作为 client 连接外部 MCP server，把外部工具发现并注册进主循环，
+// 由模型按普通工具调用——与 Server 方向互为镜像：
+// Server = 外部 Agent 用 harness 的能力；Client = harness 用外部服务的能力。
+//
+// 演示链路（net.Pipe 全内存互通，对端就是 harness 自己的 MCP Server，
+// 即"双向角色"的直观验证：同一套协议，Server/Client 各持一端）：
+//
+//	client initialize（握手）→ tools/list（发现外部工具，含 risk 透出）
+//	→ 注册进主循环 Registry → MockLLM 驱动调外部 read_file 读真实文件
+//	→ 最终回答
+//
+// 生产形态用 NewStdio 起外部 server 子进程（浏览器/Figma/数据库等第三方
+// MCP server）；demo 用内存互通，零外部依赖、可提交可复现。
+//
+// JS/TS ↔ Go 对比：TS 的 MCP 生态有官方 SDK（@modelcontextprotocol/sdk）；
+// 这里与 Server 方向共用同一套手写 JSON-RPC 2.0 协议结构（同包复用），
+// 理解"双向角色"比引 SDK 更重要。
+func runDemoMCPClient(verbose bool) {
+	// 对端：harness 自己的 MCP Server（文件+命令+前端，buildFullRegistry）
+	srvReg := buildFullRegistry(verbose)
+	srvSide, cliSide := net.Pipe()
+	srv := mcpserver.New(srvReg, srvSide, srvSide)
+	go func() {
+		if err := srv.Run(); err != nil && verbose {
+			fmt.Println("[mcp-client] MCP server 退出:", err)
+		}
+	}()
+	defer srvSide.Close()
+
+	cli := mcpserver.NewInMemory(cliSide, cliSide)
+	defer cli.Close()
+	ctx := context.Background()
+
+	if verbose {
+		fmt.Println("[mcp-client] harness 作为 MCP client 连接外部 MCP server（net.Pipe 内存互通）")
+	}
+	proto, err := cli.Initialize(ctx)
+	if err != nil {
+		fmt.Println("握手失败:", err)
+		return
+	}
+	tools, err := cli.ListTools(ctx)
+	if err != nil {
+		fmt.Println("工具发现失败:", err)
+		return
+	}
+	fmt.Printf("tools/list → 发现 %d 个外部工具（protocolVersion=%s）\n", len(tools), proto)
+	for _, t := range tools {
+		fmt.Printf("  - %s（风险 %s）\n", t.Name, riskLabel(t.BaseRisk))
+	}
+
+	// 外部工具注册进主循环：对模型来说就是普通工具，同样过循环检测、
+	// 审批闸门、重试预算——机制归内核，工具归应用层（外部服务也不例外）。
+	reg := agent.NewRegistry()
+	for _, t := range tools {
+		reg.Register(t)
+	}
+
+	// MockLLM 驱动主循环：调外部 read_file 读真实文件 → 最终回答。
+	// 链路：模型 → Registry → Client.Call → tools/call → 外部 Server → fsagent
+	mock := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "read_file", ToolInput: `{"path":"go.mod"}`},
+		{Content: "已通过 MCP 客户端连接外部 server，成功读取 go.mod。"},
+	})
+	a := agent.NewAgent(mock, reg, agent.WithVerbose(verbose))
+	showResult(a.Run("通过 MCP 客户端读取 go.mod 文件内容"))
+}
+
+// riskLabel 把内核风险级别显示为中文标签（demo 打印用）。
+func riskLabel(l agent.RiskLevel) string {
+	switch l {
+	case agent.RiskNone:
+		return "none（自动放行）"
+	case agent.RiskLow:
+		return "low"
+	case agent.RiskMedium:
+		return "medium（达审批阈值）"
+	case agent.RiskHigh:
+		return "high（强制审批）"
+	default:
+		return "unknown"
 	}
 }
