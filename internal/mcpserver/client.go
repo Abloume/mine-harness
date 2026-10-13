@@ -232,6 +232,14 @@ func (c *Client) ListTools(ctx context.Context) ([]agent.Tool, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseToolList(result, c.Call)
+}
+
+// parseToolList 把 tools/list 的 result 解析映射为 []agent.Tool。
+// 独立成包级函数：stdio Client 与 HTTP Client（http_client.go）共用，
+// 避免两份实现漂移（Go 练习点：提取公共逻辑，对应 TS 抽公共函数）。
+// call 参数注入各自的 tools/call 执行函数（stdio 传 c.Call、HTTP 传 hc.Call）。
+func parseToolList(result map[string]any, call func(ctx context.Context, name, input string) (string, error)) ([]agent.Tool, error) {
 	raw, ok := result["tools"].([]any)
 	if !ok {
 		return nil, fmt.Errorf("tools/list 返回结构异常：缺少 tools 数组")
@@ -260,8 +268,8 @@ func (c *Client) ListTools(ctx context.Context) ([]agent.Tool, error) {
 			Description: desc,
 			BaseRisk:    riskFromName(rt.Risk), // 未声明风险 → RiskMedium 保守进审批
 			Execute: func(input string) (string, error) {
-				// Tool.Execute 无 ctx 签名：内部超时由 c.timeout 兜底
-				return c.Call(context.Background(), name, input)
+				// Tool.Execute 无 ctx 签名：内部超时由各自 Client 的超时兜底
+				return call(context.Background(), name, input)
 			},
 		})
 	}
@@ -304,6 +312,13 @@ func (c *Client) Call(ctx context.Context, name, input string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return callResult(result, name)
+}
+
+// callResult 解析 tools/call 的 result：content 数组取 text 拼接，
+// isError=true 转 error（工具失败是业务结果不是协议错误）。
+// 独立成包级函数：stdio Client 与 HTTP Client 共用。
+func callResult(result map[string]any, name string) (string, error) {
 	text := contentText(result)
 	if isErr, _ := result["isError"].(bool); isErr {
 		return "", fmt.Errorf("外部 MCP 工具 %s 执行失败: %s", name, text)

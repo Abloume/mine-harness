@@ -31,12 +31,12 @@
 - [x] 豆包 API 接入（火山方舟 Ark，OpenAI 兼容——与智谱/DeepSeek 共用同一个 Provider，零协议改动）— `main.go` 的 `-demo doubao` / `-demo doubao-approval`
 - [x] 真实文件工具集（PLAN 第 1 步：`read_file` / `write_file` / `edit_file` / `glob` / `grep`，独立包 `internal/fsagent`，与内核解耦——机制归内核、工具归应用层）— 原子写入（同目录 temp + rename）、写前自动备份到 `backup/`（file-ops-policy 落地，备份失败即停止）、`filepath.IsLocal` 路径越界防护、edit 精确替换防幻觉（old 必须恰好出现一次）、glob/grep 跳过备份目录；读类 RiskNone 自动放行，写/编辑 RiskMedium 走审批闸门 — `-demo fs`
 - [x] 命令执行工具（PLAN 第 2 步：`run_cmd`，独立包 `internal/cmdagent`）— `context.WithTimeout` 超时 + **进程组杀灭**（Setpgid + kill(-pid)，实测踩坑见下）、输出截断保留头尾防爆上下文、**参数感知风险**（`RiskOfArgs`：白名单命令 go build/test/vet、git status/diff 等降 RiskLow 自动放行，rm/git push/curl/sudo 等危险模式升 RiskHigh 强制审批，未知命令 RiskMedium）— `-demo cmd`
-- [x] MCP 双向适配（PLAN 第 4 步：**Server 对外暴露** `internal/mcpserver/mcpserver.go`——Registry 工具映射为 MCP 工具，外部 Agent 可直接调用；**Client 对内接入** `internal/mcpserver/client.go`——外部 MCP server 的工具经 tools/list 发现、包装为普通工具注册进主循环，超时护栏 + 风险映射 + isError 转 error，实现要点见下）— `-demo mcp` / `-demo mcp-client`
+- [x] MCP 双向适配（PLAN 第 4 步：**Server 对外暴露** `internal/mcpserver/mcpserver.go`——Registry 工具映射为 MCP 工具，外部 Agent 可直接调用；**Client 对内接入** `internal/mcpserver/client.go`——外部 MCP server 的工具经 tools/list 发现、包装为普通工具注册进主循环，超时护栏 + 风险映射 + isError 转 error；**Streamable HTTP 传输** `internal/mcpserver/http.go` / `http_client.go`——POST JSON-RPC + GET SSE，对齐火山方舟 Remote MCP 接入形态，实现要点见下）— `-demo mcp` / `-demo mcp-client` / `-demo mcp-http`
 
 ## 当前进度（2026-10-13）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client` 二十个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）」，
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http` 二十一个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输」，
 前七个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
 
 - **智谱**：需 `ZHIPU_API_KEY`，写入项目根 `.env`（已被 `.gitignore` 排除）；模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`。
@@ -199,6 +199,22 @@ token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 
 - **响应路由**：常驻 reader goroutine + `pending map[int]chan` 按 JSON-RPC id
   投递响应（标准 client 模式）；写请求前先登记 pending，防止"响应先到"
   竞态；无 pending 的消息（server 主动通知）丢弃。
+- **Streamable HTTP 传输（`http.go` / `http_client.go`）**：与 stdio 并列的
+  第三传输形态——stdio 是进程内/本地（起子进程、管道通信），HTTP 是网络
+  形态（**火山方舟 Remote MCP 只支持 Streamable HTTP，不认 stdio**，云上
+  Agent 通过 URL 接入）。同一内核（`handleMessage`）双传输复用，"机制与
+  传输解耦"。Server 端：POST /mcp 同步处理 JSON-RPC（notification 回 202
+  Accepted 空 body）、GET /mcp 开 SSE 流 + `Push` 广播 server 主动消息
+  （tools/list_changed 等，`event: message\ndata: <json>`）。Client 端：
+  `NewHTTP(url)` POST 请求（`Accept: application/json, text/event-stream`）、
+  session id 自动跟随、`Subscribe` 可选 SSE 订阅。**踩坑**：notification
+  （initialized）必须**不带 id**（rpcRequest.ID 为 nil）——HTTPClient 第一版
+  误用带 id 的 request 发 initialized，Server 按 -32601 Method not found 回拒；
+  修复后专门抽 `sendNotification`（"发出即忘"，只检查 202/200）。简化点
+  （文档化）：多 session 隔离、"202 + SSE 延迟回响应"的异步模式未做
+  （本包工具全部同步执行）。`-demo mcp-http` 实测：真实端口起 HTTP Server →
+  HTTPClient 连接发现 14 工具 → 主循环调外部 read_file 读真实文件 →
+  server Push tools/list_changed，SSE 订阅打印收到。
 
 ## 约定
 

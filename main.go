@@ -1,5 +1,5 @@
-// mine-harness 入口：二十个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client
+// mine-harness 入口：二十一个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http
 package main
 
 import (
@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,7 +26,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -72,6 +73,8 @@ func main() {
 		runDemoMCP(*verbose)
 	case "mcp-client":
 		runDemoMCPClient(*verbose)
+	case "mcp-http":
+		runDemoMCPHTTP(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -1260,6 +1263,83 @@ func runDemoMCPClient(verbose bool) {
 	})
 	a := agent.NewAgent(mock, reg, agent.WithVerbose(verbose))
 	showResult(a.Run("通过 MCP 客户端读取 go.mod 文件内容"))
+}
+
+// runDemoMCPHTTP 演示 PLAN 第 4 步 Streamable HTTP（SSE）传输层：
+// 与 mcp-client 的 net.Pipe 内存管道不同，这里走真实 TCP + HTTP 栈——
+// 即"云上 Agent 通过 URL 接入 harness"的网络形态（火山方舟 Remote MCP
+// 只支持 Streamable HTTP，不认 stdio，这是对齐生产接入的关键一层）。
+//
+// 演示链路：
+//
+//	HTTP Server 起在真实端口 127.0.0.1:PORT/mcp（POST = JSON-RPC，GET = SSE）
+//	→ HTTPClient 连接（initialize 握手 + initialized 通知）
+//	→ tools/list 发现外部工具 → 注册进主循环
+//	→ MockLLM 驱动调外部 read_file 读真实文件
+//	→ server 主动 Push 一条 tools/list_changed 通知，SSE 订阅打印收到
+func runDemoMCPHTTP(verbose bool) {
+	srvReg := buildFullRegistry(verbose)
+	srv := mcpserver.New(srvReg, nil, nil)
+	hs := mcpserver.NewHTTPServer(srv)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0") // 随机空闲端口
+	if err != nil {
+		fmt.Println("监听端口失败:", err)
+		return
+	}
+	defer ln.Close()
+	go func() {
+		if err := http.Serve(ln, hs.Handler()); err != nil && verbose {
+			fmt.Println("[mcp-http] HTTP server 退出:", err)
+		}
+	}()
+	url := "http://" + ln.Addr().String() + "/mcp"
+	if verbose {
+		fmt.Println("[mcp-http] harness HTTP Server 已起:", url)
+		fmt.Println("[mcp-http] harness 作为 HTTPClient 连接（Streamable HTTP：POST=JSON-RPC，GET=SSE）")
+	}
+
+	cli := mcpserver.NewHTTP(url)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// SSE 订阅（goroutine）：接收 server 主动推送（tools/list_changed 等）
+	go func() {
+		if err := cli.Subscribe(ctx, func(msg map[string]any) {
+			if m, ok := msg["method"].(string); ok {
+				fmt.Println("[sse] 收到 server 推送:", m)
+			}
+		}); err != nil && verbose {
+			fmt.Println("[mcp-http] SSE 订阅结束:", err)
+		}
+	}()
+
+	proto, err := cli.Initialize(ctx)
+	if err != nil {
+		fmt.Println("握手失败:", err)
+		return
+	}
+	tools, err := cli.ListTools(ctx)
+	if err != nil {
+		fmt.Println("工具发现失败:", err)
+		return
+	}
+	fmt.Printf("tools/list → 发现 %d 个外部工具（protocolVersion=%s）\n", len(tools), proto)
+
+	// 外部工具注册进主循环（与 mcp-client 相同：走循环检测/审批/重试纪律）
+	reg := agent.NewRegistry()
+	for _, t := range tools {
+		reg.Register(t)
+	}
+	mock := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "read_file", ToolInput: `{"path":"go.mod"}`},
+		{Content: "已通过 Streamable HTTP 连接外部 server，成功读取 go.mod。"},
+	})
+	a := agent.NewAgent(mock, reg, agent.WithVerbose(verbose))
+	showResult(a.Run("通过 HTTP 客户端读取 go.mod 文件内容"))
+
+	// 演示 server → client 的 SSE 主动推送（MCP 标准通知：工具清单变化）
+	hs.Push(map[string]any{"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+	time.Sleep(200 * time.Millisecond) // 等订阅 goroutine 打印
 }
 
 // riskLabel 把内核风险级别显示为中文标签（demo 打印用）。

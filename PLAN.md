@@ -20,7 +20,7 @@
       （B 方案 load_skill + 常驻清单 + L3 按需引用）、生成式 LLM 摘要器（6 段结构化 + 收敛护栏）
 - [x] 成本优化（额外完成）：摘要关 thinking、服务端 usage 触发压缩、隐式缓存红利
 - [x] 第 2 步命令执行（超时 + 进程组杀灭 + 参数感知风险）、第 3 步前端能力（预览/截屏/Figma）、
-      第 4 步 MCP 双向适配（Server 暴露 + Client 接入）已落地——场景与实现要点见 README
+      第 4 步 MCP 双向适配（Server + Client + Streamable HTTP 传输）已落地——场景与实现要点见 README
 
 **下一步愿景**：工具集目前全是教学示例（`get_weather`、演示 `file_op`），
 补齐真实文件系统与命令执行能力后，harness 才能真正介入日常代码开发。
@@ -129,6 +129,12 @@
   RiskMedium 照走审批闸门）、isError 转 error、并发安全不默认；
   `NewInMemory` 内存互通 + `NewStdio` 起外部 server 子进程双传输形态；
   实现要点见 README「MCP 适配层实现要点」）
+- [x] **Streamable HTTP 传输层**：Server 端 POST /mcp 同步处理 JSON-RPC +
+  GET /mcp SSE 流（`Push` 广播 server 主动消息，如 tools/list_changed）；
+  Client 端 `NewHTTP(url)` POST 请求 + session id + 可选 SSE 订阅——对齐
+  火山方舟 Remote MCP（**只支持 Streamable HTTP，不认 stdio**）的接入形态，
+  同一内核（handleMessage）双传输复用 — 已实现（`internal/mcpserver/http.go` /
+  `http_client.go`；踩坑：notification 必须不带 id，见 README）
 - [x] 工具 schema 转换：Go 工具签名 ↔ MCP JSON Schema 输入定义 — 已实现
 - [x] 第 3 步前端能力（预览/截屏/Figma）优先以 MCP 形式注册——一套实现，
   harness 自用 + 外部 Agent 共用 — 已实现（webagent serve_dir/screenshot +
@@ -146,6 +152,9 @@
 - [x] 反向：harness 作为 client 调外部 MCP server 完成一次查询 — `go run . -demo mcp-client`
   （net.Pipe 内存互通：client 发现 14 个外部工具 → 注册进主循环 → MockLLM 驱动
   调外部 read_file 读取真实 go.mod；单元测试 5 个全绿，`go test -race` 无竞争）
+- [x] HTTP 形态：真实 TCP 端口起 HTTP Server + HTTPClient 跨网络全链路 +
+  SSE 主动推送接收 — `go run . -demo mcp-http`
+  （httptest 全链路/SSE/超时/isError 转 error 共 4 个测试全绿）
 
 ---
 
