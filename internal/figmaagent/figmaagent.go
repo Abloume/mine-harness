@@ -570,6 +570,30 @@ type PlanResult struct {
 	Assets       []AssetDecision
 	Tokens       []string
 	ReviewPoints []string
+	DataContract []DataField // 字段 → 数据源契约（文本节点逐一标注归属）
+}
+
+// DataSource 是字段数据源归属：前端生成时决定"写死 / mock / 占位 / 问你"。
+type DataSource string
+
+const (
+	// DataStatic 文案，属于设计本身 → 直接写死进组件（标题/按钮/标签/导航…）。
+	DataStatic DataSource = "STATIC"
+	// DataMock 运行时数据但暂未定接口 → 数据层 mock 占位（重复列表内的普通文本）。
+	DataMock DataSource = "MOCK"
+	// DataAPI 明确的服务端字段 → 前端占位 + 类型定义，接真实接口时替换 mock。
+	DataAPI DataSource = "API"
+	// DataPending 无法从设计稿判断归属 → 评审点，请用户确认（不静默猜）。
+	DataPending DataSource = "PENDING"
+)
+
+// DataField 是数据契约的条目：设计稿里的一个文本 → 数据源归属 + 依据。
+type DataField struct {
+	NodeID string
+	Name   string
+	Text   string
+	Source DataSource
+	Reason string
 }
 
 func (t *Tools) planPage(input string) (string, error) {
@@ -601,7 +625,7 @@ func (t *Tools) planPage(input string) (string, error) {
 	}
 
 	var pl PlanResult
-	collectPlan(*doc, maxDepth, &pl)
+	collectPlan(*doc, maxDepth, &pl, false)
 
 	// 技术栈未指定 → 评审点（不静默猜 html：猜错整段代码作废）
 	if strings.TrimSpace(req.TechStack) == "" {
@@ -642,6 +666,44 @@ func (t *Tools) planPage(input string) (string, error) {
 	}
 	for _, tk := range pl.Tokens {
 		fmt.Fprintf(&b, "  %s\n", tk)
+	}
+
+	// 数据契约段：字段 → 数据源（STATIC 写死 / MOCK 先 mock / API 占位 / PENDING 评审）。
+	// 这是"先用 Mock 数据即可"的落地——生成时按归属决定写死还是占位。
+	b.WriteString("\n── 数据契约（字段 → 数据源）──\n")
+	if len(pl.DataContract) == 0 {
+		b.WriteString("  （无文本节点）\n")
+	}
+	groups := []struct {
+		label string
+		src   DataSource
+	}{
+		{"STATIC（写死文案）", DataStatic},
+		{"MOCK（数据层占位，接 API 时替换）", DataMock},
+		{"API（服务端字段，前端占位）", DataAPI},
+		{"PENDING（需你评审）", DataPending},
+	}
+	for _, g := range groups {
+		rows := []DataField{}
+		for _, f := range pl.DataContract {
+			if f.Source == g.src {
+				rows = append(rows, f)
+			}
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "  %s:\n", g.label)
+		for _, f := range rows {
+			fmt.Fprintf(&b, "    [%s] %s「%s」%s\n", f.NodeID, f.Name, f.Text, f.Reason)
+		}
+	}
+
+	// Mock 数据建议段：MOCK/API 字段 → 可落盘的 mock.ts（interface + 样例数组），
+	// 生成页面时直接写数据层，接真实 API 时只替换这一处。
+	if m := buildMockSuggestion(&pl); m != "" {
+		b.WriteString("\n── Mock 数据建议（TS，MOCK/API 字段占位）──\n")
+		b.WriteString(m)
 	}
 
 	// React 组件化分支：位图资产 → import 挂载、页面层级 → 组件拆分建议
@@ -692,9 +754,11 @@ func safeAssetName(name string) string {
 	return b.String()
 }
 
-// collectPlan 递归汇总：位图进 Assets、评审点进 ReviewPoints、矢量/文本提取 token。
-// maxDepth 递减防爆；children 为空即叶子，不再下探。
-func collectPlan(n figmaNode, maxDepth int, pl *PlanResult) {
+// collectPlan 递归汇总：位图进 Assets、评审点进 ReviewPoints、矢量/文本提取 token、
+// 文本节点进 DataContract（数据源归属）。maxDepth 递减防爆；children 为空即叶子。
+// inRepeat 表示当前节点处于重复同构结构（列表/卡片网格）内——里面的文本大概率
+// 是运行时循环数据，不能当静态文案写死。
+func collectPlan(n figmaNode, maxDepth int, pl *PlanResult, inRepeat bool) {
 	d := decideAsset(n)
 	switch {
 	case d.Kind == AssetImage:
@@ -706,6 +770,16 @@ func collectPlan(n figmaNode, maxDepth int, pl *PlanResult) {
 	case d.Kind == AssetUnknown:
 		pl.ReviewPoints = append(pl.ReviewPoints,
 			fmt.Sprintf("[%s] %s：%s", d.NodeID, d.Name, d.ReviewNote))
+	case d.Kind == AssetText:
+		if df := classifyProvenance(n, inRepeat); df.Text != "" {
+			pl.DataContract = append(pl.DataContract, df)
+			if df.Source == DataPending {
+				pl.ReviewPoints = append(pl.ReviewPoints,
+					fmt.Sprintf("[%s] %s「%s」数据源待定：无法从设计稿判断是写死文案还是服务端数据，请确认",
+						df.NodeID, df.Name, df.Text))
+			}
+		}
+		fallthrough
 	case d.Kind == AssetVector || d.Kind == AssetText:
 		if c := fillColorHex(n.Fills); c != "" {
 			pl.Tokens = appendUnique(pl.Tokens, "颜色: "+c+"（"+n.Name+"）")
@@ -722,9 +796,185 @@ func collectPlan(n figmaNode, maxDepth int, pl *PlanResult) {
 	if len(n.Children) == 0 || maxDepth <= 0 {
 		return
 	}
-	for _, c := range n.Children {
-		collectPlan(c, maxDepth-1, pl)
+	// 重复同构结构检测：容器 children 里同一类型出现 ≥2 次（FRAME/GROUP/COMPONENT），
+	// 视为列表/卡片网格 → 这些子树内的文本默认数据循环（inRepeat=true 向下传播）。
+	repeatType := ""
+	if len(n.Children) >= 2 {
+		counts := map[string]int{}
+		for _, c := range n.Children {
+			counts[c.Type]++
+		}
+		for t, c := range counts {
+			if c >= 2 && (t == "FRAME" || t == "GROUP" || t == "COMPONENT") {
+				repeatType = t
+				break
+			}
+		}
 	}
+	for _, c := range n.Children {
+		collectPlan(c, maxDepth-1, pl, inRepeat || c.Type == repeatType)
+	}
+}
+
+// 字段语义关键词：命中 → 明确的服务端字段（API）。
+// 设计稿里的"名称/价格/描述/数量"是数据字段名，不是 UI 文案。
+var dataSemanticWords = []string{
+	"价格", "金额", "¥", "￥", "元", "数量", "销量", "库存", "编号", "日期",
+	"时间", "地址", "电话", "名称", "品名", "描述", "评价", "评分",
+}
+
+// UI 控件关键词：命中 → 静态文案（STATIC）。
+// 页面标题/按钮/Tab/标签属于设计的一部分，写死即可。
+var uiControlWords = []string{
+	"标题", "按钮", "Tab", "标签", "导航", "副标题", "提示", "徽标", "角标", "空态", "占位",
+}
+
+// classifyProvenance 判定一个文本节点的数据源归属。优先级从高到低：
+//  1. 节点名是 UI 控件 → STATIC（写死文案）
+//  2. 节点名/文本命中字段语义 → API（服务端字段，前端占位）
+//  3. 处于重复列表内 → MOCK（循环数据，先造 mock）
+//  4. 其他 → PENDING（评审点，不猜）
+//
+// 这个分类是"先用 Mock 数据即可"的落地：数据与文案边界清晰，接真实 API 时
+// 只改数据层，UI 结构零改动。
+func classifyProvenance(n figmaNode, inRepeat bool) DataField {
+	df := DataField{NodeID: n.ID, Name: n.Name, Text: strings.TrimSpace(n.Characters)}
+	if df.Text == "" {
+		return df // 空文本不产生契约
+	}
+	name := strings.ToLower(n.Name)
+	text := strings.ToLower(df.Text)
+
+	// 1) UI 控件 → STATIC（控件语义优先于其他信号）
+	for _, w := range uiControlWords {
+		if strings.Contains(name, strings.ToLower(w)) {
+			df.Source, df.Reason = DataStatic, "UI 控件文案（节点名含「"+w+"」），写死"
+			return df
+		}
+	}
+	// 2) 字段语义 → API
+	for _, w := range dataSemanticWords {
+		if strings.Contains(text, w) || strings.Contains(name, strings.ToLower(w)) {
+			df.Source, df.Reason = DataAPI, "字段语义（"+w+"）→ 服务端返回，前端占位"
+			return df
+		}
+	}
+	// 3) 重复列表内 → MOCK
+	if inRepeat {
+		df.Source, df.Reason = DataMock, "重复卡片/列表内的循环数据，先 mock 占位，接 API 时替换"
+		return df
+	}
+	// 4) 兜底 → PENDING
+	df.Source, df.Reason = DataPending, "无法从设计稿判断是文案还是服务端数据"
+	return df
+}
+
+// 字段语义 → TS 字段名映射：Figma 节点名（中文）转可运行的 interface 字段。
+// 未命中映射的字段用 field_N 占位并注明"按真实接口重命名"。
+var semanticToTSField = map[string]string{
+	"名称": "name", "品名": "name", "标题": "title", "价格": "price", "金额": "amount",
+	"数量": "quantity", "销量": "sales", "库存": "stock", "编号": "id", "日期": "date",
+	"时间": "time", "地址": "address", "电话": "phone", "描述": "description",
+	"说明": "description", "内容": "content", "标签": "tag", "状态": "status",
+	"评价": "rating", "评分": "rating",
+}
+
+// tsFieldName 把 Figma 字段名映射为 TS 标识符（无映射返回 ""，调用方给 field_N 兜底）。
+func tsFieldName(nodeName string) string {
+	for kw, en := range semanticToTSField {
+		if strings.Contains(nodeName, kw) {
+			return en
+		}
+	}
+	return ""
+}
+
+// mockGroup 是按 TS 字段名聚合的数据契约字段：en=字段名、label=原节点名、samples=样例值。
+type mockGroup struct {
+	en      string
+	label   string
+	samples []string
+}
+
+// buildMockSuggestion 把数据契约里的 MOCK/API 字段转成可落盘的 mock.ts 文本：
+//   - 全部字段出现次数一致（每条记录字段齐）→ 生成 interface + 对象数组；
+//   - 次数不一致 → 只生成 interface + 字段样例注释（让 LLM/开发者对齐填写）。
+//
+// 这是"先用 Mock 数据即可"的收尾：mock.ts 即数据层，接真实 API 只改这一处。
+func buildMockSuggestion(pl *PlanResult) string {
+	// 聚合：按 TS 字段名去重，样例值按出现顺序收集
+	groups := []*mockGroup{}
+	index := map[string]*mockGroup{}
+	for _, f := range pl.DataContract {
+		if f.Source != DataMock && f.Source != DataAPI {
+			continue
+		}
+		en := tsFieldName(f.Name)
+		if en == "" {
+			en = fmt.Sprintf("field_%d", len(groups)+1) // 无映射字段按序兜底
+		}
+		g, ok := index[en]
+		if !ok {
+			g = &mockGroup{en: en, label: f.Name}
+			groups = append(groups, g)
+			index[en] = g
+		}
+		g.samples = append(g.samples, f.Text)
+	}
+	if len(groups) == 0 {
+		return ""
+	}
+
+	// 记录对齐检测：每组样例数一致 → 可生成对象数组
+	k := len(groups[0].samples)
+	aligned := true
+	for _, g := range groups {
+		if len(g.samples) != k {
+			aligned = false
+			break
+		}
+	}
+
+	var b strings.Builder
+	if aligned && k > 0 {
+		// interface
+		b.WriteString("export interface " + mockInterfaceName(groups) + " {\n")
+		for _, g := range groups {
+			fmt.Fprintf(&b, "  %s: string // %s\n", g.en, g.label)
+		}
+		b.WriteString("}\n\n")
+		// 对象数组
+		fmt.Fprintf(&b, "export const %s: %s[] = [\n", mockListName(groups), mockInterfaceName(groups))
+		for j := 0; j < k; j++ {
+			fmt.Fprintf(&b, "  { ")
+			for i, g := range groups {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				fmt.Fprintf(&b, "%s: %q", g.en, g.samples[j])
+			}
+			b.WriteString(" },\n")
+		}
+		b.WriteString("]\n")
+		b.WriteString("// 接真实接口时: 用 API 响应类型替换此 mock 数据，字段名按响应重命名\n")
+	} else {
+		b.WriteString("// 字段样例（记录未对齐，按字段填值即可）\n")
+		for _, g := range groups {
+			fmt.Fprintf(&b, "// %s（%s）: %s\n", g.en, g.label, strings.Join(g.samples, " / "))
+		}
+		b.WriteString("// 接真实接口时: 替换为 API 响应类型与数据\n")
+	}
+	return b.String()
+}
+
+// mockInterfaceName / mockListName 生成 TS 标识符：列表名 → 首字段映射英文的 PascalCase。
+// 简化：无映射时用 MockData 兜底；标识符一律 ASCII（字段名来自中文节点名，不可直接做标识符）。
+func mockInterfaceName(groups []*mockGroup) string {
+	return "MockRecord"
+}
+
+func mockListName(groups []*mockGroup) string {
+	return "mockList"
 }
 
 // appendUnique 线性去重追加（token 集合小，O(n) 足够；JS 的 Set 在 Go 里

@@ -632,3 +632,188 @@ func TestSafeAssetName(t *testing.T) {
 		}
 	}
 }
+
+// samplePlanNodesData 是数据契约测试专用 mock：覆盖四类数据源归属——
+// UI 文案（标题/按钮）→ STATIC；字段语义（商品名称）→ API；
+// 重复卡片列表内的普通文本（说明）→ MOCK；歧义文本（活动说明）→ PENDING。
+func samplePlanNodesData(t *testing.T) string {
+	t.Helper()
+	doc := map[string]any{
+		"name": "活动主页面",
+		"nodes": map[string]any{
+			"104:17791": map[string]any{
+				"document": map[string]any{
+					"id": "104:17791", "name": "活动主页面", "type": "FRAME",
+					"children": []any{
+						map[string]any{
+							"id": "104:17793", "name": "标题", "type": "TEXT",
+							"characters": "品牌宣传月",
+						},
+						map[string]any{
+							"id": "104:17794", "name": "卡片列表", "type": "FRAME",
+							"children": []any{
+								// 卡片 ×2：同构 FRAME → 重复结构（数据循环）
+								map[string]any{
+									"id": "104:17801", "name": "卡片", "type": "FRAME",
+									"children": []any{
+										map[string]any{"id": "104:17802", "name": "商品名称", "type": "TEXT", "characters": "示例商品 A"},
+										map[string]any{"id": "104:17803", "name": "说明", "type": "TEXT", "characters": "大交易平台+12个业务线"},
+										map[string]any{"id": "104:17804", "name": "按钮", "type": "TEXT", "characters": "去分享"},
+									},
+								},
+								map[string]any{
+									"id": "104:17811", "name": "卡片", "type": "FRAME",
+									"children": []any{
+										map[string]any{"id": "104:17812", "name": "商品名称", "type": "TEXT", "characters": "示例商品 B"},
+										map[string]any{"id": "104:17813", "name": "说明", "type": "TEXT", "characters": "大交易平台+12个业务线"},
+										map[string]any{"id": "104:17814", "name": "按钮", "type": "TEXT", "characters": "去分享"},
+									},
+								},
+							},
+						},
+						map[string]any{
+							"id": "104:17820", "name": "活动说明", "type": "TEXT",
+							"characters": "活动倒计时 3 天",
+						},
+					},
+				},
+			},
+		},
+	}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestPlanPageDataContract 验证数据契约四分类：
+// 标题/按钮（UI 控件名）→ STATIC；商品名称（字段语义）→ API；
+// 重复卡片列表内说明 → MOCK；歧义文本 → PENDING + 评审点。
+func TestPlanPageDataContract(t *testing.T) {
+	tools := newMockTools(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, samplePlanNodesData(t))
+	})
+	out, err := tools.planPage(`{"node_id":"104:17791","tech_stack":"react"}`)
+	if err != nil {
+		t.Fatalf("计划失败: %v", err)
+	}
+	for _, want := range []string{
+		"── 数据契约（字段 → 数据源）──",
+		"STATIC（写死文案）",
+		`标题「品牌宣传月」`,
+		`按钮「去分享」`,
+		"API（服务端字段，前端占位）",
+		`商品名称「示例商品 A」字段语义（名称）`,
+		"MOCK（数据层占位，接 API 时替换）",
+		`说明「大交易平台+12个业务线」`,
+		"循环数据，先 mock 占位",
+		"PENDING（需你评审）",
+		`活动说明「活动倒计时 3 天」无法从设计稿判断`,
+		"数据源待定",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("数据契约应包含 %q，实际:\n%s", want, out)
+		}
+	}
+}
+
+// TestClassifyProvenance 单测分类纯函数：UI 词 > 字段语义 > 重复结构 > PENDING。
+func TestClassifyProvenance(t *testing.T) {
+	cases := []struct {
+		name     string
+		node     figmaNode
+		inRepeat bool
+		wantSrc  DataSource
+	}{
+		{"页面标题→STATIC", figmaNode{ID: "1", Name: "标题", Characters: "品牌宣传月"}, false, DataStatic},
+		{"按钮→STATIC", figmaNode{ID: "2", Name: "按钮", Characters: "去分享"}, true, DataStatic},
+		{"字段语义→API", figmaNode{ID: "3", Name: "商品名称", Characters: "示例商品 A"}, true, DataAPI},
+		{"价格→API", figmaNode{ID: "4", Name: "文本", Characters: "价格 ¥99"}, false, DataAPI},
+		{"重复列表内→MOCK", figmaNode{ID: "5", Name: "说明", Characters: "大交易平台+12个业务线"}, true, DataMock},
+		{"歧义→PENDING", figmaNode{ID: "6", Name: "活动说明", Characters: "活动倒计时 3 天"}, false, DataPending},
+	}
+	for _, c := range cases {
+		df := classifyProvenance(c.node, c.inRepeat)
+		if df.Source != c.wantSrc {
+			t.Errorf("%s：期望 %s，实际 %s（%s）", c.name, c.wantSrc, df.Source, df.Reason)
+		}
+	}
+}
+
+// TestBuildMockSuggestion 验证数据契约 → mock.ts 生成：
+// 记录对齐（每组字段样例数一致）→ interface + 对象数组；
+// 字段映射：商品名称→name、说明→description；无 MOCK/API 字段 → 空。
+func TestBuildMockSuggestion(t *testing.T) {
+	pl := &PlanResult{
+		DataContract: []DataField{
+			{NodeID: "1", Name: "商品名称", Text: "示例商品 A", Source: DataAPI},
+			{NodeID: "2", Name: "说明", Text: "大交易平台+12个业务线", Source: DataMock},
+			{NodeID: "3", Name: "商品名称", Text: "示例商品 B", Source: DataAPI},
+			{NodeID: "4", Name: "说明", Text: "大交易平台+12个业务线", Source: DataMock},
+			{NodeID: "5", Name: "标题", Text: "品牌宣传月", Source: DataStatic}, // STATIC 不参与
+		},
+	}
+	out := buildMockSuggestion(pl)
+	for _, want := range []string{
+		"export interface MockRecord {",
+		"  name: string // 商品名称",
+		"  description: string // 说明",
+		`{ name: "示例商品 A", description: "大交易平台+12个业务线" }`,
+		`{ name: "示例商品 B", description: "大交易平台+12个业务线" }`,
+		"export const mockList: MockRecord[] = [",
+		"接真实接口时",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("mock 建议应包含 %q，实际:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "品牌宣传月") {
+		t.Errorf("STATIC 字段不应进 mock 数据，实际:\n%s", out)
+	}
+}
+
+// TestBuildMockSuggestionNoData 无 MOCK/API 字段 → 空输出（纯文案页不需要 mock）。
+func TestBuildMockSuggestionNoData(t *testing.T) {
+	pl := &PlanResult{
+		DataContract: []DataField{
+			{NodeID: "1", Name: "标题", Text: "品牌宣传月", Source: DataStatic},
+			{NodeID: "2", Name: "按钮", Text: "去分享", Source: DataStatic},
+		},
+	}
+	if out := buildMockSuggestion(pl); out != "" {
+		t.Errorf("纯文案页不应生成 mock 建议，实际:\n%s", out)
+	}
+}
+
+// TestBuildMockSuggestionUnaligned 字段样例数不一致（记录未对齐）→
+// 降级为字段样例注释，不生成可能错位的对象数组。
+func TestBuildMockSuggestionUnaligned(t *testing.T) {
+	pl := &PlanResult{
+		DataContract: []DataField{
+			{NodeID: "1", Name: "商品名称", Text: "示例商品 A", Source: DataAPI},
+			{NodeID: "2", Name: "说明", Text: "大交易平台+12个业务线", Source: DataMock},
+			{NodeID: "3", Name: "商品名称", Text: "示例商品 B", Source: DataAPI}, // name×2，description×1 → 未对齐
+		},
+	}
+	out := buildMockSuggestion(pl)
+	if !strings.Contains(out, "记录未对齐") {
+		t.Errorf("未对齐时应降级为字段注释，实际:\n%s", out)
+	}
+	if strings.Contains(out, "export const mockList") {
+		t.Errorf("未对齐时不应生成对象数组，实际:\n%s", out)
+	}
+}
+
+// TestTSFieldName 字段语义 → TS 标识符映射。
+func TestTSFieldName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"商品名称", "name"}, {"名称", "name"}, {"价格", "price"}, {"说明", "description"},
+		{"描述", "description"}, {"数量", "quantity"}, {"日期", "date"}, {"自定义", ""},
+	}
+	for _, c := range cases {
+		if got := tsFieldName(c.in); got != c.want {
+			t.Errorf("tsFieldName(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+}
