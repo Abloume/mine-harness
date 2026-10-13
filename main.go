@@ -1,5 +1,5 @@
-// mine-harness 入口：二十六个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel
+// mine-harness 入口：二十七个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree
 package main
 
 import (
@@ -24,11 +24,12 @@ import (
 	"mine-harness/internal/fsagent"
 	"mine-harness/internal/mcpserver"
 	"mine-harness/internal/memory"
+	"mine-harness/internal/tree"
 	"mine-harness/internal/webagent"
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -87,6 +88,8 @@ func main() {
 		runDemoSession(*verbose)
 	case "cancel":
 		runDemoCancel(*verbose)
+	case "tree":
+		runDemoTree(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -1035,6 +1038,120 @@ func sideName(s agent.SideEffect) string {
 		return "不可逆"
 	}
 	return "?"
+}
+
+// runDemoTree 演示第 5 步阶段二 · 树索引 + 推理检索：
+// 构建项目自身目录树（L0/L1/L2 分层摘要）→ 注册 browse/overview/read
+// 检索工具 → 模型沿树推理定位（先看目录 → 下钻 → 翻文件 → 扫内容），
+// 最终回答引用真实 file:line。
+// 与 flat 向量检索的对比点：全程零 embedding；成本只随"命中路径上的
+// 节点"增长（browse/overview 只读摘要，read 才返回全文）。
+func runDemoTree(verbose bool) {
+	root, err := os.Getwd()
+	if err != nil {
+		fmt.Println("获取工作目录失败:", err)
+		return
+	}
+	idx, err := tree.NewTreeIndex(root, nil)
+	if err != nil {
+		fmt.Println("构建树索引失败:", err)
+		return
+	}
+
+	// 检索工具三件套：browse（L0 摘要）→ overview（L1 概览）→ read（L2 全文带行号）。
+	// 复用 Agent 既有工具协议（字符串入参/出参），零新依赖。
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name: "tree_browse", Description: "浏览目录：列出直接子项的一行摘要（L0），用于定位下钻方向",
+		SideEffect: agent.SideReadonly, ConcurrentSafe: true,
+		Execute: func(input string) (string, error) {
+			p, err := parseTreePath(input)
+			if err != nil {
+				return "", err
+			}
+			nodes, err := idx.Browse(p)
+			if err != nil {
+				return "", err
+			}
+			var b strings.Builder
+			for _, n := range nodes {
+				b.WriteString(n.L0 + "\n")
+			}
+			return b.String(), nil
+		},
+	})
+	reg.Register(agent.Tool{
+		Name: "tree_overview", Description: "查看节点概览（L1）：目录=子项清单，文件=头部+行数，用于确认是否继续下钻",
+		SideEffect: agent.SideReadonly, ConcurrentSafe: true,
+		Execute: func(input string) (string, error) {
+			p, err := parseTreePath(input)
+			if err != nil {
+				return "", err
+			}
+			return idx.Overview(p)
+		},
+	})
+	reg.Register(agent.Tool{
+		Name: "read_file", Description: "读取文件完整内容（L2，带行号），用于最终定位与引用",
+		SideEffect: agent.SideReadonly, ConcurrentSafe: true,
+		Execute: func(input string) (string, error) {
+			p, err := parseTreePath(input)
+			if err != nil {
+				return "", err
+			}
+			return idx.Read(p)
+		},
+	})
+
+	// 模型沿树推理的路径（MockLLM 脚本化决策；工具真实执行）：
+	// 看目录 → 下钻 internal/agent → 翻到 loop.go → 扫内容确认 RunWithContext 定义行
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "tree_browse", ToolInput: `{"path":"."}`},
+		{ToolName: "tree_browse", ToolInput: `{"path":"internal"}`},
+		{ToolName: "tree_browse", ToolInput: `{"path":"internal/agent"}`},
+		{ToolName: "tree_overview", ToolInput: `{"path":"internal/agent/loop.go"}`},
+		{ToolName: "read_file", ToolInput: `{"path":"internal/agent/loop.go"}`},
+		{Content: "定位完成。"},
+	})
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(8), agent.WithVerbose(verbose))
+	showResult(a.Run("在代码库里找到 RunWithContext 函数定义在哪个文件哪一行"))
+
+	// 展示"引用可追溯"：从模型实际读取过的全文里提取 RunWithContext 的真实行号
+	// （read_file 返回带行号，直接 grep——演示 file:line 证据可复核）。
+	content, err := idx.Read("internal/agent/loop.go")
+	if err == nil {
+		for _, line := range strings.Split(content, "\n") {
+			if strings.Contains(line, "func (a *Agent) RunWithContext") {
+				fields := strings.SplitN(line, ":", 2)
+				fmt.Printf("—— 引用可追溯：RunWithContext 定义于 internal/agent/loop.go:%s\n",
+					strings.TrimSpace(fields[0]))
+				break
+			}
+		}
+	}
+
+	// 展示"成本只随命中节点增长"：索引规模 vs 检索路径实际读取
+	fmt.Printf("—— 成本对比：树索引 %d 个节点 / 全量 %d 行；本次检索只读 1 个文件全文（loop.go），browse/overview 均只读摘要\n",
+		idx.Nodes(), idx.TotalLines())
+}
+
+// parseTreePath 解析检索工具入参（{"path":"..."} 或直接路径字符串）。
+func parseTreePath(input string) (string, error) {
+	var req struct {
+		Path string `json:"path"`
+	}
+	input = strings.TrimSpace(input)
+	if strings.HasPrefix(input, "{") {
+		if err := json.Unmarshal([]byte(input), &req); err != nil {
+			return "", fmt.Errorf("参数无效：应为 {\"path\":\"相对路径\"}，got %s", input)
+		}
+	} else {
+		req.Path = strings.Trim(input, `"`)
+	}
+	if req.Path == "" {
+		req.Path = "."
+	}
+	return req.Path, nil
 }
 
 // runDemoParallel 演示多 tool_call 并发执行：

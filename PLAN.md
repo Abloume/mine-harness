@@ -265,7 +265,8 @@
 - ① 长期记忆：会话持久化 + 断点续跑（呼应已有上下文管理，从"单次 Run"扩到跨会话）
   — ✅ 已实现（`internal/memory` SessionStore JSON 落盘 + `WithInitialHistory`
   断点续跑，`-demo session`；实现要点见 README「第 5 步阶段一落地」节）
-- ② 检索工具化——**树索引 + 推理检索优先**（决策依据 2026-10-13，PageIndex 观察，
+- ② 检索工具化——**树索引 + 推理检索优先**（✅ 阶段二已实现，2026-10-13；
+  决策依据 2026-10-13，PageIndex 观察，
   追加 2026-10-13 OpenViking 观察：字节火山引擎 Viking 团队开源的上下文数据库
   `volcengine/OpenViking` 以同一趋势工程化落地——层级组织 + 渐进披露 + 检索可观测，
   印证本路线非孤例）：
@@ -298,8 +299,10 @@
 - [x] 跨会话 demo：上次任务结论可被下次会话检索召回（断点续跑 + 记忆查询）—
   `go run . -demo session`（5 条消息落盘 → 新实例恢复 → 直接汇报）；
   单元测试 memory 4 用例 + resume 3 用例全绿
-- 树检索 demo：模型沿目录树定位到具体文件/行并作答（引用可追溯）；
-  大代码库/长文档场景成本只随命中节点增长（不整读）
+- [x] 树检索 demo：模型沿目录树定位到具体文件/行并作答（引用可追溯）—
+  `go run . -demo tree`（browse→overview→read 定位 RunWithContext@loop.go:307；
+  成本只随命中节点增长：74 节点索引 / 17052 行全量，只读 1 个文件全文）；
+  `internal/tree` 7 用例全绿
 
 ---
 

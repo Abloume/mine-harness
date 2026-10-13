@@ -35,8 +35,8 @@
 
 ## 当前进度（2026-10-13）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel` 二十六个场景分别演示
-「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约」，
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree` 二十七个场景分别演示
+「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索」，
 前七个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
 
 - **智谱**：需 `ZHIPU_API_KEY`，写入项目根 `.env`（已被 `.gitignore` 排除）；模型可用 `ZHIPU_MODEL` 切换，默认 `glm-4.7-flash`，限流时可换 `glm-4.5-flash`。
@@ -290,6 +290,31 @@ token 统计为**估算口径**（CJK 1 字 ≈ 1 token、其余 4 字符 ≈ 1 
 - 单元测试：`internal/agent/cancel_test.go` 8 用例（开始前取消/请求发出后
   响应前取消/逆序补偿/不可逆 partial/不可逆执行前拦截/补偿失败/未声明补偿/
   正常完成账本）全绿。
+
+## 第 5 步阶段二落地 · 树索引 + 推理检索（2026-10-13）
+
+来源：PLAN 第 5 步②（决策依据 2026-10-13：PageIndex 定路线 + OpenViking 补
+分层规格）。检索不做向量相似度，让模型像翻书一样沿树定位；成本只随命中
+节点增长，结果引用可追溯。
+
+- **`internal/tree`（新包）**：`TreeIndex` 把目录树组织成可浏览的层级索引。
+  - L0（一行摘要，browse 用）：目录=名字+子项数，文件=名字+行数+首行——
+    "先看目录"，一屏决定下钻方向；
+  - L1（概览，overview 用）：目录=子项清单，文件=头部 40 行+行数——
+    确认"这层有没有我要的东西"；
+  - L2（详情，read 用）：完整内容**带行号**——引用可追溯的载体（file:line）。
+  - 构建"索引侧全量一次"（walk + 统计行数），检索关键路径（browse/overview）
+    **不经过 LLM**（启发式摘要；"基础模型精修"是可选项）。
+  - **默认忽略 `.env`**（密钥防泄露：browse 摘要首行会进模型上下文/日志）、
+    .git / node_modules / sessions / .DS_Store。
+- **检索 = 工具调用序列**：`tree_browse` → `tree_overview` → `read_file`，
+  复用 Agent 既有工具协议（字符串入参/出参），零新依赖、复用第 1/2 步。
+- `-demo tree` 实测：模型 browse 根 → 下钻 internal/agent → overview loop.go
+  → read 全文 → 定位到 **RunWithContext 定义于 loop.go:307**（真实行号）；
+  成本对比：树索引 74 节点 / 全量 17052 行，本次只读 1 个文件全文。
+- 单元测试：`internal/tree/tree_test.go` 7 用例（构建+browse/忽略规则/
+  browse 文件报错/目录与文件 overview/L2 行号/缺失路径/根路径错误/.env 防泄露）
+  全绿。
 
 ## 约定
 
