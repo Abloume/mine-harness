@@ -3,12 +3,12 @@
 // 与 fsagent/cmdagent 同模式：独立包、只依赖 internal/agent 的 Tool 类型，
 // 机制归内核、工具归应用层。风险分级（读 vs 导出要区分开）：
 //   - figma_get_node:     读取指定节点子树 → 结构化摘要（名称/类型/尺寸/颜色/文本）
-//                         RiskNone（纯读，自动放行）
+//     RiskNone（纯读，自动放行）
 //   - figma_export_image: 导出节点为 PNG/SVG/PDF 图片 URL
-//                         RiskMedium（有副作用：消耗 API 配额、可能触发 rate limit、
-//                         生成可访问外部 URL；但可撤销——重导即可 → Medium 而非 High）
+//     RiskMedium（有副作用：消耗 API 配额、可能触发 rate limit、
+//     生成可访问外部 URL；但可撤销——重导即可 → Medium 而非 High）
 //   - figma_get_variables:读取设计变量（颜色/字号等 design tokens → 样式变量）
-//                         RiskNone（纯读，自动放行）
+//     RiskNone（纯读，自动放行）
 //
 // token 由宿主注入（main.go 从 .env 读 FIGMA_TOKEN），包内不隐式读环境变量——
 // 与 fsagent 的 root、cmdagent 的 root 一样是"构造时显式传入"。
@@ -99,10 +99,45 @@ func (t *Tools) All() []agent.Tool {
 			BaseRisk: agent.RiskNone,
 			Execute:  t.getVariables,
 		},
+		{
+			Name: "figma_classify_node",
+			Description: "对指定节点做资产决策分类（自动决策管线第 1 步）：按决策树判断每个节点" +
+				"\"该导出图片还是写 CSS\"——含 IMAGE 位图填充 → 导出 PNG；TEXT/简单矢量 → CSS 还原；" +
+				"复杂嵌套 → 逐层递归。返回每节点的 kind/recommendation/reason，以及 review_required" +
+				"（数据不足或需要人工评审的点）。参数 JSON：{\"ids\":\"0:1\"}。纯读无副作用。",
+			BaseRisk: agent.RiskNone,
+			Execute:  t.classifyNode,
+		},
+		{
+			Name: "figma_plan_page",
+			Description: "自动决策管线编排（第 2 步）：输入页面节点 id，输出完整还原计划——" +
+				"① 位图资产清单（需导出 PNG 的节点：id/名称/尺寸/理由）；② CSS 样式 token 清单" +
+				"（颜色/尺寸/圆角，从节点数据提取）；③ 评审点清单（reviewPoints：需人工评审或" +
+				"行不通的点，如导出需审批、REST 429 需浏览器接管、数据不足）。" +
+				"参数 JSON：{\"node_id\":\"0:1\",\"max_depth\":可选层数}。纯读无副作用。" +
+				"原则：能自动决策的全自动，不懂的/行不通的显式列出交给用户评审。",
+			BaseRisk: agent.RiskNone,
+			Execute:  t.planPage,
+		},
 	}
 }
 
 // ---- figma_get_node ----
+
+// fetchNodes 是 nodes 端点的公共取数入口：getNode（文本摘要）、classifyNode（资产决策）、
+// planPage（编排）都复用同一份解析——JS/TS 对比：避免每个工具各写一遍 HTTP+解析，
+// Go 用显式 helper 复用，接口收敛在包内，外部只暴露工具。
+func (t *Tools) fetchNodes(ids string) (nodesResp, error) {
+	q := t.baseURL + "/files/" + t.fileKey + "/nodes?ids=" + normalizeIDs(ids)
+	var resp nodesResp
+	if err := t.doJSON(http.MethodGet, q, &resp); err != nil {
+		return nodesResp{}, err
+	}
+	if len(resp.Nodes) == 0 {
+		return nodesResp{}, fmt.Errorf("未找到节点 %q（检查 id 是否正确、文件是否对 token 可见）", ids)
+	}
+	return resp, nil
+}
 
 type getNodeReq struct {
 	IDs         string `json:"ids"`                    // 逗号分隔，如 "0:1,52:3253"
@@ -124,13 +159,20 @@ type nodeInfo struct {
 }
 
 type figmaNode struct {
-	ID         string       `json:"id"`
-	Name       string       `json:"name"`
-	Type       string       `json:"type"`
-	BBox       *boundingBox `json:"absoluteBoundingBox"`
-	Fills      []fill       `json:"fills"`
-	Characters string       `json:"characters"`
-	Children   []figmaNode  `json:"children"`
+	ID           string       `json:"id"`
+	Name         string       `json:"name"`
+	Type         string       `json:"type"`
+	BBox         *boundingBox `json:"absoluteBoundingBox"`
+	Fills        []fill       `json:"fills"`
+	Characters   string       `json:"characters"`
+	CornerRadius *float64     `json:"cornerRadius"` // RECTANGLE/FRAME 圆角（plan_page 提 token 用）
+	Effects      []effect     `json:"effects"`      // 阴影/模糊等（token 提取用，只取类型枚举）
+	Children     []figmaNode  `json:"children"`
+}
+
+type effect struct {
+	Type    string `json:"type"` // DROPSHADOW / INNER_SHADOW / BACKGROUND_BLUR ...
+	Visible bool   `json:"visible"`
 }
 
 type boundingBox struct {
@@ -170,14 +212,9 @@ func (t *Tools) getNode(input string) (string, error) {
 		maxChildren = req.MaxChildren
 	}
 
-	q := t.baseURL + "/files/" + t.fileKey + "/nodes?ids=" + normalizeIDs(req.IDs)
-	var resp nodesResp
-	if err := t.doJSON(http.MethodGet, q, &resp); err != nil {
+	resp, err := t.fetchNodes(req.IDs)
+	if err != nil {
 		return "", err
-	}
-
-	if len(resp.Nodes) == 0 {
-		return "", fmt.Errorf("未找到节点 %q（检查 id 是否正确、文件是否对 token 可见）", req.IDs)
 	}
 
 	var b strings.Builder
@@ -386,6 +423,339 @@ func toFloat(v any) float64 {
 		return f
 	}
 	return 0
+}
+
+// ---- 自动决策管线：figma_classify_node / figma_plan_page ----
+//
+// 目标（产品层）："调用 mine-harness 做前端页面开发时，能自动决策，不懂的/行不通的
+// 再让用户评审"。这里把协作中沉淀的决策树固化为代码：
+//   1. 含 IMAGE 位图填充（照片/AI 纹理/插画）→ 导出 PNG（CSS 复刻不了）
+//   2. 文本 / 纯色 / 渐变矢量 → CSS 手动还原（取样式 token）
+//   3. 容器节点 → 递归逐子决策
+//   4. 数据不足（fills 缺失/API 异常）→ 升级人工评审（review_required）
+// 每个决策都带可解释的 Reason——评审时用户一眼能看懂"为什么这么定"。
+// JS/TS ↔ Go 对比：JS 常把这类规则写在 LLM prompt 里（自然语言决策，不可测试）；
+// Go 固化成本地类型 + 纯函数，可用单测逐分支验证，错误路径显式枚举。
+
+// AssetKind 是资产类型（决策树第一层判断结果）。
+type AssetKind string
+
+const (
+	AssetImage     AssetKind = "image"     // 位图填充 → 导出 PNG
+	AssetVector    AssetKind = "vector"    // 矢量/纯色/渐变 → CSS 还原
+	AssetText      AssetKind = "text"      // 文本 → CSS 还原
+	AssetComposite AssetKind = "composite" // 容器 → 递归逐子
+	AssetUnknown   AssetKind = "unknown"   // 数据不足 → 人工评审
+)
+
+// AssetDecision 是单节点的资产决策。ReviewRequired 命中时 ReviewNote 说明
+// 需要用户评审的具体点（导出审批 / 429 浏览器接管 / 数据缺失）。
+type AssetDecision struct {
+	NodeID         string
+	Name           string
+	Kind           AssetKind
+	Recommendation string // export_png / svg_inline / css_manual / recurse / review
+	Size           string // 宽x高（BBox 存在时）
+	Reason         string
+	ReviewRequired bool
+	ReviewNote     string
+}
+
+// ---- figma_classify_node ----
+
+type classifyReq struct {
+	IDs string `json:"ids"`
+}
+
+func (t *Tools) classifyNode(input string) (string, error) {
+	var req classifyReq
+	if err := json.Unmarshal([]byte(input), &req); err != nil {
+		return "", fmt.Errorf("参数解析失败: %v（需要 JSON {\"ids\":\"0:1\"}）", err)
+	}
+	if strings.TrimSpace(req.IDs) == "" {
+		return "", fmt.Errorf("ids 不能为空（逗号分隔，如 \"0:1\"）")
+	}
+	resp, err := t.fetchNodes(req.IDs)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	for id, info := range resp.Nodes {
+		fmt.Fprintf(&b, "=== 节点 %s 资产决策 ===\n", id)
+		writeDecisions(&b, info.Document, 0, defaultMaxDepth)
+	}
+	return b.String(), nil
+}
+
+// writeDecisions 深度优先输出每层节点的资产决策。depth 超限时显式标注省略——
+// 与 getNode 同动机：防超大文件撑爆输出，且模型/用户知道自己没看到全貌。
+func writeDecisions(b *strings.Builder, n figmaNode, depth, maxDepth int) {
+	if depth > maxDepth {
+		fmt.Fprintf(b, "%s…（超出深度 %d，已省略）\n", indent(depth), maxDepth)
+		return
+	}
+	d := decideAsset(n)
+	flag := ""
+	if d.ReviewRequired {
+		flag = " ⚠️ 需评审"
+	}
+	fmt.Fprintf(b, "%s[%s] %s（%s）→ %s%s\n", indent(depth), d.NodeID, d.Name, d.Kind, d.Recommendation, flag)
+	fmt.Fprintf(b, "%s  原因: %s\n", indent(depth), d.Reason)
+	if d.Size != "" {
+		fmt.Fprintf(b, "%s  尺寸: %s\n", indent(depth), d.Size)
+	}
+	if d.ReviewRequired {
+		fmt.Fprintf(b, "%s  评审点: %s\n", indent(depth), d.ReviewNote)
+	}
+	for _, c := range n.Children {
+		writeDecisions(b, c, depth+1, maxDepth)
+	}
+}
+
+// decideAsset 是决策树的核心纯函数：一个节点 → 资产分类 + 行动建议 + 可解释理由。
+// 顺序即优先级：位图 → 文本 → 容器 → 纯色/渐变矢量 → 数据缺失兜底。
+func decideAsset(n figmaNode) AssetDecision {
+	d := AssetDecision{NodeID: n.ID, Name: n.Name}
+	if n.BBox != nil {
+		d.Size = fmt.Sprintf("%dx%d", int(n.BBox.Width), int(n.BBox.Height))
+	}
+	switch {
+	case hasFillType(n.Fills, "IMAGE"):
+		d.Kind = AssetImage
+		d.Recommendation = "export_png"
+		d.Reason = "含 IMAGE 位图填充（照片/AI 纹理/插画），CSS 无法复刻，导出 PNG 挂载为背景或图标"
+		d.ReviewRequired = true
+		d.ReviewNote = "导出需过人工审批（RiskMedium）；若 REST /v1/images 触发 429 限流，改用接管系统浏览器以登录态导出"
+	case n.Type == "TEXT":
+		d.Kind = AssetText
+		d.Recommendation = "css_manual"
+		d.Reason = "文本节点：HTML/CSS 还原（characters 文案 + 颜色/字号 token），不导出图片"
+	case len(n.Children) > 0:
+		d.Kind = AssetComposite
+		d.Recommendation = "recurse"
+		d.Reason = fmt.Sprintf("容器节点（%d 个子节点）：递归逐子决策，位图/文本/矢量分别归类", len(n.Children))
+	case hasFillType(n.Fills, "SOLID") || hasFillPrefix(n.Fills, "GRADIENT"):
+		d.Kind = AssetVector
+		d.Recommendation = "css_manual"
+		d.Reason = "矢量形状节点：纯色/渐变填充，CSS 可还原（颜色/圆角/尺寸 token）"
+	case n.Fills == nil:
+		d.Kind = AssetUnknown
+		d.Recommendation = "review"
+		d.Reason = "fills 数据缺失（API 未返回填充信息），无法判断内容"
+		d.ReviewRequired = true
+		d.ReviewNote = "数据不足：打开设计稿查看该节点实际内容后补决策"
+	default:
+		d.Kind = AssetVector
+		d.Recommendation = "css_manual"
+		d.Reason = "无子节点、无位图填充：按矢量还原"
+	}
+	return d
+}
+
+// ---- figma_plan_page ----
+
+type planReq struct {
+	NodeID   string `json:"node_id"`
+	MaxDepth int    `json:"max_depth,omitempty"`
+	// TechStack 是目标技术栈（html / react / vue / svelte / angular）。
+	// 空 = 未指定：技术栈属于工程上下文，Figma 里读不出来——缺省时输出评审点，
+	// 编排层可先用 detect_tech_stack 感知工程后自动填入（"能自动的全自动"），
+	// 感知不到 / 信号冲突时留给用户确认（"行不通的让你评审"）。
+	TechStack string `json:"tech_stack,omitempty"`
+}
+
+// PlanResult 是页面级还原计划的汇总：要导出的位图、可复用的 CSS token、评审点。
+type PlanResult struct {
+	Assets       []AssetDecision
+	Tokens       []string
+	ReviewPoints []string
+}
+
+func (t *Tools) planPage(input string) (string, error) {
+	var req planReq
+	if err := json.Unmarshal([]byte(input), &req); err != nil {
+		return "", fmt.Errorf("参数解析失败: %v（需要 JSON {\"node_id\":\"104:17791\"}）", err)
+	}
+	if strings.TrimSpace(req.NodeID) == "" {
+		return "", fmt.Errorf("node_id 不能为空（页面级节点，如 \"104:17791\"）")
+	}
+	maxDepth := defaultMaxDepth
+	if req.MaxDepth > 0 {
+		maxDepth = req.MaxDepth
+	}
+	resp, err := t.fetchNodes(req.NodeID)
+	if err != nil {
+		return "", err
+	}
+
+	// 单节点请求只取第一条（plan 面向单个页面/Frame 节点）
+	var doc *figmaNode
+	for _, info := range resp.Nodes {
+		d := info.Document
+		doc = &d
+		break
+	}
+	if doc == nil {
+		return "", fmt.Errorf("未找到节点 %q", req.NodeID)
+	}
+
+	var pl PlanResult
+	collectPlan(*doc, maxDepth, &pl)
+
+	// 技术栈未指定 → 评审点（不静默猜 html：猜错整段代码作废）
+	if strings.TrimSpace(req.TechStack) == "" {
+		pl.ReviewPoints = appendUnique(pl.ReviewPoints,
+			"未指定目标技术栈，请确认（html / react / vue / 其他）；或先用 detect_tech_stack 感知工程上下文自动填写")
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "还原计划: %s（%s）\n", doc.Name, req.NodeID)
+	if req.TechStack != "" {
+		fmt.Fprintf(&b, "目标技术栈: %s\n", req.TechStack)
+	}
+	b.WriteString("\n── 位图资产（export_png，需导出挂载）──\n")
+	if len(pl.Assets) == 0 {
+		b.WriteString("  （无）\n")
+	}
+	for _, a := range pl.Assets {
+		fmt.Fprintf(&b, "  [%s] %s", a.NodeID, a.Name)
+		if a.Size != "" {
+			fmt.Fprintf(&b, " %s", a.Size)
+		}
+		fmt.Fprintf(&b, "\n    理由: %s\n", a.Reason)
+	}
+
+	// token 段标题随技术栈调整（同一批颜色/尺寸 token 的落点不同）
+	tokenTitle := "── CSS 样式 token（还原用）──"
+	switch req.TechStack {
+	case "react":
+		tokenTitle = "── 样式常量（React：token.ts / CSS Modules / 内联样式）──"
+	case "vue":
+		tokenTitle = "── 样式常量（Vue：<style scoped> CSS 变量）──"
+	case "svelte":
+		tokenTitle = "── 样式常量（Svelte：<style> 变量）──"
+	}
+	b.WriteString("\n" + tokenTitle + "\n")
+	if len(pl.Tokens) == 0 {
+		b.WriteString("  （无）\n")
+	}
+	for _, tk := range pl.Tokens {
+		fmt.Fprintf(&b, "  %s\n", tk)
+	}
+
+	// React 组件化分支：位图资产 → import 挂载、页面层级 → 组件拆分建议
+	if req.TechStack == "react" {
+		b.WriteString("\n── 组件拆分建议（React + TSX）──\n")
+		if len(pl.Assets) == 0 {
+			b.WriteString("  （无位图资产，纯 token 还原即可）\n")
+		}
+		for _, a := range pl.Assets {
+			fmt.Fprintf(&b, "  [%s] %s：import 为图片资源挂载（如 <img src={assets/%s}> 背景层/图标）\n",
+				a.NodeID, a.Name, safeAssetName(a.Name))
+		}
+		b.WriteString("  页面结构按 Figma 层级拆：Header / TabNav / CardList / ProductCard…\n")
+	}
+
+	b.WriteString("\n── 评审点（需你决策 / 行不通的地方）──\n")
+	if len(pl.ReviewPoints) == 0 {
+		b.WriteString("  （无，全部可自动决策）\n")
+	}
+	for i, rp := range pl.ReviewPoints {
+		fmt.Fprintf(&b, "  %d. %s\n", i+1, rp)
+	}
+	return b.String(), nil
+}
+
+// safeAssetName 把节点名转成安全的资源文件名，防路径注入。
+// 资产名来自设计稿（不可信输入），进 import 路径前必须净化：
+//   - 非 ASCII 字符（中文等）保留——macOS/Linux 文件系统与 Vite/Webpack
+//     构建链均支持，无需转码；
+//   - ASCII 中仅保留字母/数字/-/_；空白与 / \ . 等路径或文件系统非法字符
+//     一律转 _（"../../etc/passwd" → "_______etc_passwd"，穿越结构被抹平）。
+func safeAssetName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "asset"
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r > 127:
+			b.WriteRune(r)
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+// collectPlan 递归汇总：位图进 Assets、评审点进 ReviewPoints、矢量/文本提取 token。
+// maxDepth 递减防爆；children 为空即叶子，不再下探。
+func collectPlan(n figmaNode, maxDepth int, pl *PlanResult) {
+	d := decideAsset(n)
+	switch {
+	case d.Kind == AssetImage:
+		pl.Assets = append(pl.Assets, d)
+		if d.ReviewNote != "" {
+			pl.ReviewPoints = append(pl.ReviewPoints,
+				fmt.Sprintf("[%s] %s：%s", d.NodeID, d.Name, d.ReviewNote))
+		}
+	case d.Kind == AssetUnknown:
+		pl.ReviewPoints = append(pl.ReviewPoints,
+			fmt.Sprintf("[%s] %s：%s", d.NodeID, d.Name, d.ReviewNote))
+	case d.Kind == AssetVector || d.Kind == AssetText:
+		if c := fillColorHex(n.Fills); c != "" {
+			pl.Tokens = appendUnique(pl.Tokens, "颜色: "+c+"（"+n.Name+"）")
+		}
+		if n.BBox != nil {
+			pl.Tokens = appendUnique(pl.Tokens,
+				fmt.Sprintf("尺寸: %dx%d（%s）", int(n.BBox.Width), int(n.BBox.Height), n.Name))
+		}
+		if n.CornerRadius != nil {
+			pl.Tokens = appendUnique(pl.Tokens,
+				fmt.Sprintf("圆角: %g（%s）", *n.CornerRadius, n.Name))
+		}
+	}
+	if len(n.Children) == 0 || maxDepth <= 0 {
+		return
+	}
+	for _, c := range n.Children {
+		collectPlan(c, maxDepth-1, pl)
+	}
+}
+
+// appendUnique 线性去重追加（token 集合小，O(n) 足够；JS 的 Set 在 Go 里
+// 用 map 或线性扫描皆可——此处可读性优先）。
+func appendUnique(list []string, s string) []string {
+	for _, have := range list {
+		if have == s {
+			return list
+		}
+	}
+	return append(list, s)
+}
+
+// hasFillType / hasFillPrefix 判断节点填充里是否存在某类填充（visible 才计）。
+// Figma fill.type 取值：SOLID / GRADIENT_LINEAR|RADIAL|ANGULAR|DIAMOND / IMAGE / VIDEO。
+func hasFillType(fills []fill, typ string) bool {
+	for _, f := range fills {
+		if f.Visible && f.Type == typ {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFillPrefix(fills []fill, prefix string) bool {
+	for _, f := range fills {
+		if f.Visible && strings.HasPrefix(f.Type, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- 公共：HTTP + 工具函数 ----

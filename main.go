@@ -20,7 +20,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -59,6 +59,10 @@ func main() {
 		runDemoFigma(*verbose)
 	case "web":
 		runDemoWeb(*verbose)
+	case "plan":
+		runDemoPlan(*verbose)
+	case "stack":
+		runDemoStack(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -939,6 +943,54 @@ func runDemoFigma(verbose bool) {
 	showResult(a.Run("读取设计稿：先看画布结构，再深入产品目录页，最后导出页面 PNG"))
 }
 
+// runDemoPlan 演示"自动决策管线"（Figma 协作的第 3.5 步：自动决策 + 评审升级）。
+//
+// 用户目标："后续调用 mine-harness 做前端页面开发时，能自动决策，不懂的/行不通的
+// 再让我评审"。本 demo 把这条原则落成两步工具链：
+//
+//	figma_get_node（结构总览）→ figma_plan_page（自动决策：位图资产 / CSS token / 评审点）。
+//
+// 自动决策的部分：分类（IMAGE→导出、文本/矢量→CSS）、token 提取、计划编排——
+// 全部纯读 RiskNone，审批闸自动放行，不需要打扰用户。
+// 升级评审的部分：导出审批（RiskMedium）、REST 429 限流→浏览器接管、数据不足——
+// 显式列入 plan_page 输出的"评审点"，由 CLIApprover 问询用户决策。
+//
+// JS/TS ↔ Go 对比：TS 里这种"先自动、兜底人工"的管线常用状态机/编排框架；
+// Go 用工具 + 内核审批点表达同样的语义——自动路径靠 RiskNone 静默通过，
+// 评审路径靠 BaseRisk 声明触发闸门，两条路径在同一内核里显式分叉。
+func runDemoPlan(verbose bool) {
+	loadEnv(".env")
+	token := os.Getenv("FIGMA_TOKEN")
+	if token == "" {
+		fmt.Println("缺少 FIGMA_TOKEN：export FIGMA_TOKEN=xxx 或写入项目根 .env（已被 git 忽略）")
+		return
+	}
+	fileKey := os.Getenv("FIGMA_FILE_KEY")
+	if fileKey == "" {
+		fmt.Println("缺少 FIGMA_FILE_KEY：写入项目根 .env（已被 git 忽略）")
+		return
+	}
+	reg := agent.NewRegistry()
+	for _, t := range figmaagent.NewTools(fileKey, token).All() {
+		reg.Register(t)
+	}
+
+	// 脚本：结构总览 → 对"活动主页面"（104:17791，本文件真实页面节点）生成还原计划。
+	// plan_page 纯读自动放行；输出里的评审点（位图导出）留给 CLIApprover 决策。
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "figma_get_node", ToolInput: `{"ids":"0:1"}`},
+		{ToolName: "figma_plan_page", ToolInput: `{"node_id":"104:17791","max_depth":4}`},
+		{Content: "已完成：自动决策计划已生成——位图资产清单（导出 PNG）+ CSS token（还原用）+ 评审点（导出方式需你确认）。"},
+	})
+
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(4),
+		agent.WithVerbose(verbose),
+		agent.WithApprover(agent.NewCLIApprover()),
+	)
+	showResult(a.Run("读取设计稿结构，并自动生成还原计划：能自动决策的全自动，行不通的列入评审点交给用户"))
+}
+
 // demoWebTemplate 是"生成代码"产物的模板版页面（可安全提交 GitHub：
 // 品牌宣传月 / 示例品牌 · 能力支持 / 示例产品 A-E / 分类一·二，无公司信息）。
 // 本地真实版设计稿还原存于 webdemo/design.html（git 忽略，runDemoWeb 优先读取）；
@@ -949,6 +1001,7 @@ func runDemoFigma(verbose bool) {
 // JS/TS ↔ Go 差异：TS 里模板资源通常靠 bundler（webpack raw-loader / Vite ?raw）
 // 内联成字符串，或运行时 fs.readFile；Go 用 //go:embed 编译期打包进二进制——
 // 运行时不依赖文件系统，二进制自包含。代价是改动模板文件必须重新编译。
+//
 //go:embed assets/demo_template.html
 var demoWebTemplate string
 
@@ -1022,4 +1075,22 @@ func showResult(r agent.RunResult) {
 		// 软停止的语义：任务中断，但系统没有崩——这就是生产 Agent 的
 		// "交还给用户继续指挥"，而不是把 error 抛给上层。
 	}
+}
+
+// runDemoStack 演示 detect_tech_stack：对工程上下文感知技术栈。
+// 边界提示写在输出里：mine-harness 自身是 Go 项目（无前端信号），
+// 演示的是"无前端信号 → 需评审"路径；对任何前端工程 root 运行时，
+// react/vue/纯静态会被自动识别，冲突时才升级评审。
+func runDemoStack(verbose bool) {
+	fs := fsagent.NewTools(".")
+	reg := agent.NewRegistry()
+	for _, t := range fs.All() {
+		reg.Register(t)
+	}
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "detect_tech_stack", ToolInput: `{}`},
+		{Content: "已完成：已感知当前工程上下文的技术栈信号（或列出冲突交由你评审）。"},
+	})
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(2), agent.WithVerbose(verbose))
+	showResult(a.Run("感知当前工程的技术栈，判断前端代码生成目标（html / react / 其他）"))
 }

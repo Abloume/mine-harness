@@ -295,6 +295,167 @@ func TestNormalizeIDs(t *testing.T) {
 	}
 }
 
+// ---- 自动决策管线测试：figma_classify_node / figma_plan_page ----
+
+// samplePlanNodes 是"活动主页面"的迷你 mock：375×812 Frame，
+// 内含 IMAGE 位图背景（→导出）、TEXT 标题（→CSS）、SOLID 圆角卡片（→CSS+token）、
+// 嵌套容器（→递归）。覆盖决策树全部主干分支。
+func samplePlanNodes(t *testing.T) string {
+	t.Helper()
+	doc := map[string]any{
+		"name": "集团宣传月",
+		"nodes": map[string]any{
+			"104:17791": map[string]any{
+				"document": map[string]any{
+					"id": "104:17791", "name": "活动主页面", "type": "FRAME",
+					"absoluteBoundingBox": map[string]any{"x": 0.0, "y": 0.0, "width": 375.0, "height": 812.0},
+					"cornerRadius":        nil,
+					"fills": []any{
+						map[string]any{"type": "SOLID", "visible": true,
+							"color": map[string]any{"r": 0.89, "g": 0.91, "b": 0.99, "a": 1.0}},
+					},
+					"children": []any{
+						// 背景位图：IMAGE 填充 → export_png + 需评审
+						map[string]any{
+							"id": "104:17792", "name": "背景图", "type": "RECTANGLE",
+							"absoluteBoundingBox": map[string]any{"x": 0.0, "y": 0.0, "width": 375.0, "height": 812.0},
+							"fills": []any{
+								map[string]any{"type": "IMAGE", "visible": true},
+							},
+						},
+						// 文本：TEXT → css_manual
+						map[string]any{
+							"id": "104:17793", "name": "标题", "type": "TEXT",
+							"characters": "品牌宣传月",
+							"fills": []any{
+								map[string]any{"type": "SOLID", "visible": true,
+									"color": map[string]any{"r": 0.09, "g": 0.09, "b": 0.1, "a": 1.0}},
+							},
+						},
+						// 卡片：SOLID + 圆角 → css_manual + token
+						map[string]any{
+							"id": "104:17794", "name": "产品卡片", "type": "RECTANGLE",
+							"absoluteBoundingBox": map[string]any{"x": 20.0, "y": 300.0, "width": 335.0, "height": 72.0},
+							"cornerRadius":        22.0,
+							"fills": []any{
+								map[string]any{"type": "SOLID", "visible": true,
+									"color": map[string]any{"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0}},
+							},
+						},
+						// 嵌套容器：FRAME 有子 → recurse
+						map[string]any{
+							"id": "104:17795", "name": "板块容器", "type": "FRAME",
+							"children": []any{
+								map[string]any{
+									"id": "104:17796", "name": "板块标题", "type": "TEXT",
+									"characters": "交易与电商",
+									"fills":      []any{},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestClassifyNodeDecisionTree 验证决策树各分支：
+// IMAGE→export_png+评审 / TEXT→css_manual / 纯色圆角→css_manual / 容器→recurse。
+func TestClassifyNodeDecisionTree(t *testing.T) {
+	tools := newMockTools(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/files/test-file-key/nodes" || !strings.Contains(r.URL.RawQuery, "ids=104:17791") {
+			t.Errorf("应请求 /files/:key/nodes?ids=104:17791，实际 %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		fmt.Fprint(w, samplePlanNodes(t))
+	})
+	out, err := tools.classifyNode(`{"ids":"104:17791"}`)
+	if err != nil {
+		t.Fatalf("分类失败: %v", err)
+	}
+	for _, want := range []string{
+		"=== 节点 104:17791 资产决策 ===",
+		`[104:17791] 活动主页面（composite）→ recurse`,
+		`[104:17792] 背景图（image）→ export_png ⚠️ 需评审`,
+		"含 IMAGE 位图填充（照片/AI 纹理/插画）",
+		`[104:17793] 标题（text）→ css_manual`,
+		"文本节点：HTML/CSS 还原",
+		`[104:17794] 产品卡片（vector）→ css_manual`,
+		`[104:17795] 板块容器（composite）→ recurse`,
+		`[104:17796] 板块标题（text）→ css_manual`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("分类输出应包含 %q，实际:\n%s", want, out)
+		}
+	}
+	// 评审点必须出现在 IMAGE 节点下（导出审批 / 429 浏览器接管提示）
+	if !strings.Contains(out, "需过人工审批") {
+		t.Errorf("IMAGE 节点应带导出评审提示，实际:\n%s", out)
+	}
+}
+
+// TestPlanPageSummarizes 验证编排输出：位图资产清单 / CSS token / 评审点汇总。
+func TestPlanPageSummarizes(t *testing.T) {
+	tools := newMockTools(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, samplePlanNodes(t))
+	})
+	out, err := tools.planPage(`{"node_id":"104:17791","max_depth":4}`)
+	if err != nil {
+		t.Fatalf("计划失败: %v", err)
+	}
+	for _, want := range []string{
+		"还原计划: 活动主页面（104:17791）",
+		"── 位图资产（export_png，需导出挂载）──",
+		"[104:17792] 背景图 375x812",
+		"── CSS 样式 token（还原用）──",
+		"颜色: #17171A（标题）", // TEXT 节点 SOLID 填充（0.09→0x17）
+		"颜色: #FFFFFF（产品卡片）",
+		"尺寸: 335x72（产品卡片）",
+		"圆角: 22（产品卡片）",
+		"── 评审点（需你决策 / 行不通的地方）──",
+		"[104:17792] 背景图：导出需过人工审批",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("计划输出应包含 %q，实际:\n%s", want, out)
+		}
+	}
+	// 位图在"资产清单"与"评审点"各出现一次（共 2 处）；token 不重复
+	if strings.Count(out, "[104:17792] 背景图") != 2 {
+		t.Errorf("位图应出现在资产清单与评审点各一次（共 2 处），实际:\n%s", out)
+	}
+}
+
+// TestPlanPageBadInput 验证 node_id 校验。
+func TestPlanPageBadInput(t *testing.T) {
+	tools := newMockTools(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("node_id 非法时不应发 HTTP 请求")
+	})
+	if _, err := tools.planPage(`{"node_id":""}`); err == nil {
+		t.Fatal("空 node_id 应报错")
+	}
+	if _, err := tools.planPage(`not-json`); err == nil {
+		t.Fatal("非法 JSON 应报错")
+	}
+}
+
+// TestPlanPageHTTPError 验证 429 限流时 plan 报错（评审升级的第一道触发点：
+// 读节点失败 → 模型知道走浏览器接管/稍后重试，而不是假装读到）。
+func TestPlanPageHTTPError(t *testing.T) {
+	tools := newMockTools(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"status":429,"err":"Rate limit exceeded"}`)
+	})
+	_, err := tools.planPage(`{"node_id":"104:17791"}`)
+	if err == nil || !strings.Contains(err.Error(), "rate limit") {
+		t.Fatalf("429 应报错提示限流，实际: %v", err)
+	}
+}
+
 // TestToolRiskDeclaration 验证工具风险分级声明（不依赖网络，纯本地断言）：
 //   - get_node / get_variables 纯读 → RiskNone，审批闸自动放行；
 //   - export_image 有副作用（消耗配额/可能触发限流/产出外部 URL）→ RiskMedium，
@@ -309,6 +470,8 @@ func TestToolRiskDeclaration(t *testing.T) {
 		"figma_get_node":      agent.RiskNone,
 		"figma_export_image":  agent.RiskMedium,
 		"figma_get_variables": agent.RiskNone,
+		"figma_classify_node": agent.RiskNone,
+		"figma_plan_page":     agent.RiskNone,
 	}
 	got := map[string]agent.RiskLevel{}
 	for _, tl := range tools.All() {
@@ -388,4 +551,84 @@ func TestExportImageApprovalGate(t *testing.T) {
 			t.Errorf("应正常完成，实际 %s / %s", r.Status, r.Reason)
 		}
 	})
+}
+
+// ---- plan_page × tech_stack：技术栈是工程上下文，缺省必须升级评审 ----
+
+// TestPlanPageTechStackUnspecified 缺省路径：不传 tech_stack → 评审点提示确认
+// （并引导 detect_tech_stack 感知工程上下文自动填写——评审升级闭环）。
+func TestPlanPageTechStackUnspecified(t *testing.T) {
+	tools := newMockTools(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, samplePlanNodes(t))
+	})
+	out, err := tools.planPage(`{"node_id":"104:17791"}`)
+	if err != nil {
+		t.Fatalf("计划失败: %v", err)
+	}
+	for _, want := range []string{
+		"未指定目标技术栈，请确认（html / react / vue / 其他）",
+		"detect_tech_stack 感知工程上下文自动填写",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("缺省 tech_stack 应含评审点 %q，实际:\n%s", want, out)
+		}
+	}
+}
+
+// TestPlanPageTechStackReact 指定 react：输出目标技术栈 + 组件拆分建议 +
+// 样式常量标题（React 落点），且不再出现"未指定"评审点。
+func TestPlanPageTechStackReact(t *testing.T) {
+	tools := newMockTools(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, samplePlanNodes(t))
+	})
+	out, err := tools.planPage(`{"node_id":"104:17791","tech_stack":"react"}`)
+	if err != nil {
+		t.Fatalf("计划失败: %v", err)
+	}
+	for _, want := range []string{
+		"目标技术栈: react",
+		"── 组件拆分建议（React + TSX）──",
+		"import 为图片资源挂载",
+		"── 样式常量（React",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("react 模式应含 %q，实际:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "未指定目标技术栈") {
+		t.Errorf("指定 tech_stack 后不应再出现未指定评审点，实际:\n%s", out)
+	}
+}
+
+// TestPlanPageTechStackHTML 指定 html：token 段保持 CSS 标题，无"未指定"评审点。
+func TestPlanPageTechStackHTML(t *testing.T) {
+	tools := newMockTools(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, samplePlanNodes(t))
+	})
+	out, err := tools.planPage(`{"node_id":"104:17791","tech_stack":"html"}`)
+	if err != nil {
+		t.Fatalf("计划失败: %v", err)
+	}
+	if !strings.Contains(out, "目标技术栈: html") || !strings.Contains(out, "── CSS 样式 token（还原用）──") {
+		t.Errorf("html 模式应保持 CSS token 标题，实际:\n%s", out)
+	}
+	if strings.Contains(out, "未指定目标技术栈") {
+		t.Errorf("指定 tech_stack 后不应再出现未指定评审点，实际:\n%s", out)
+	}
+}
+
+// TestSafeAssetName 验证资产名净化：设计稿名字进 import 路径前必须去非法字符
+// （防路径注入——资产名来自设计稿，属于不可信输入）。
+func TestSafeAssetName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"背景图", "背景图"},                           // 中文保留（资源文件名可含中文）
+		{"背景 图", "背景_图"},                         // 空白 → _
+		{"../../etc/passwd", "______etc_passwd"}, // .. 与 / 全转 _（6 前缀下划线），etc_passwd 保留
+		{"", "asset"},
+	}
+	for _, c := range cases {
+		if got := safeAssetName(c.in); got != c.want {
+			t.Errorf("safeAssetName(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
 }

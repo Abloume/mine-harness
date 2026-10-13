@@ -265,9 +265,130 @@ func TestUnknownToolNotInAll(t *testing.T) {
 	fs, _ := setup(t)
 	for _, tool := range fs.All() {
 		switch tool.Name {
-		case "read_file", "write_file", "edit_file", "glob", "grep":
+		case "read_file", "write_file", "edit_file", "glob", "grep", "detect_tech_stack":
 		default:
 			t.Errorf("意外的工具名: %s", tool.Name)
 		}
+	}
+}
+
+// ---- detect_tech_stack 测试：工程上下文 → 技术栈感知 ----
+//
+// 覆盖：React 高置信 / 纯静态 HTML / Vue / 信号冲突（需评审）/ 空目录 /
+// node_modules 忽略。用临时目录造真实工程文件，走工具入口断言输出。
+
+func TestDetectTechStackReact(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "package.json", `{"dependencies":{"react":"^18.2.0","react-dom":"^18.2.0"}}`)
+	writeTestFile(t, root, "tsconfig.json", `{"compilerOptions":{"jsx":"react-jsx"}}`)
+	writeTestFile(t, root, "src/App.tsx", "export const App = () => <div/>")
+	writeTestFile(t, root, "src/main.tsx", "import React from 'react'")
+
+	out, err := NewTools(root).detectTechStack(`{}`)
+	if err != nil {
+		t.Fatalf("感知失败: %v", err)
+	}
+	for _, want := range []string{
+		"技术栈推断: react",
+		"置信度: high",
+		"package.json 依赖含 react",
+		`jsx="react-jsx"`,
+		"2 个 .tsx 源文件",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("应包含 %q，实际:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "需评审") {
+		t.Errorf("高置信 react 不应触发评审，实际:\n%s", out)
+	}
+}
+
+func TestDetectTechStackStaticHTML(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "index.html", "<html><body>hello</body></html>")
+	writeTestFile(t, root, "style.css", "body { color: #333; }")
+
+	out, err := NewTools(root).detectTechStack(`{}`)
+	if err != nil {
+		t.Fatalf("感知失败: %v", err)
+	}
+	if !strings.Contains(out, "技术栈推断: html") {
+		t.Errorf("纯静态应推断 html，实际:\n%s", out)
+	}
+	if !strings.Contains(out, "存在 index.html") {
+		t.Errorf("应列出 index.html 信号，实际:\n%s", out)
+	}
+}
+
+func TestDetectTechStackVue(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "package.json", `{"dependencies":{"vue":"^3.4.0","vue-router":"^4.3.0"}}`)
+	writeTestFile(t, root, "src/App.vue", "<template><div/></template>")
+
+	out, err := NewTools(root).detectTechStack(`{}`)
+	if err != nil {
+		t.Fatalf("感知失败: %v", err)
+	}
+	if !strings.Contains(out, "技术栈推断: vue") {
+		t.Errorf("应推断 vue，实际:\n%s", out)
+	}
+	if !strings.Contains(out, ".vue 源文件") {
+		t.Errorf("应列出 .vue 信号，实际:\n%s", out)
+	}
+}
+
+// TestDetectTechStackConflict 是评审升级的关键用例：vue 依赖 + .tsx 源文件并存，
+// 双框架信号冲突，不能假装自动决策，必须列证据请用户确认。
+func TestDetectTechStackConflict(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "package.json", `{"dependencies":{"vue":"^3.4.0"}}`)
+	writeTestFile(t, root, "src/App.tsx", "export const App = () => <div/>")
+
+	out, err := NewTools(root).detectTechStack(`{}`)
+	if err != nil {
+		t.Fatalf("感知失败: %v", err)
+	}
+	for _, want := range []string{
+		"技术栈推断: unknown",
+		"需评审",
+		"冲突信号",
+		"请确认目标技术栈",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("冲突场景应包含 %q，实际:\n%s", want, out)
+		}
+	}
+}
+
+// TestDetectTechStackEmpty 空目录（无任何工程信号）→ unknown + 评审点。
+func TestDetectTechStackEmpty(t *testing.T) {
+	root := t.TempDir()
+	out, err := NewTools(root).detectTechStack(`{}`)
+	if err != nil {
+		t.Fatalf("感知失败: %v", err)
+	}
+	if !strings.Contains(out, "技术栈推断: unknown") || !strings.Contains(out, "请确认生成目标") {
+		t.Errorf("空目录应 unknown + 评审点，实际:\n%s", out)
+	}
+}
+
+// TestDetectTechStackIgnoresNodeModules 验证 node_modules 里的 .tsx 不计入信号
+// （否则任何装了 TS 依赖的项目都会被误判为 react 工程）。
+func TestDetectTechStackIgnoresNodeModules(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "src/App.tsx", "export const App = () => <div/>")
+	writeTestFile(t, root, "node_modules/react/index.tsx", "// 依赖源码，不应计入")
+	writeTestFile(t, root, "node_modules/vue/dist/index.vue", "<template/>")
+
+	out, err := NewTools(root).detectTechStack(`{}`)
+	if err != nil {
+		t.Fatalf("感知失败: %v", err)
+	}
+	if !strings.Contains(out, "1 个 .tsx 源文件") {
+		t.Errorf("应只计 src 下的 1 个 .tsx（node_modules 被忽略），实际:\n%s", out)
+	}
+	if strings.Contains(out, ".vue 源文件") {
+		t.Errorf("node_modules 里的 .vue 不应计入，实际:\n%s", out)
 	}
 }

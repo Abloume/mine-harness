@@ -77,6 +77,16 @@ func (t *Tools) All() []agent.Tool {
 			ConcurrentSafe: true,
 			Execute:        t.grep,
 		},
+		{
+			Name: "detect_tech_stack",
+			Description: "感知项目工程的技术栈（纯读，自动放行）：扫描 package.json / tsconfig / 框架配置 / 源文件后缀，" +
+				"推断前端代码生成目标（react / vue / svelte / html / unknown），输出 stack + confidence + evidence 信号依据。" +
+				"置信度低或信号冲突（如 package.json 无 react 但目录全是 .tsx）时输出需评审提示——" +
+				"技术栈是工程上下文，Figma 里读不出来，必须从项目文件感知。参数 JSON：{}。",
+			BaseRisk:       agent.RiskNone,
+			ConcurrentSafe: true,
+			Execute:        t.detectTechStack,
+		},
 	}
 }
 
@@ -403,4 +413,245 @@ func grepFile(full, pattern string, max int, displayPath string) (string, error)
 		return "", err
 	}
 	return strings.Join(out, "\n"), nil
+}
+
+// ---- detect_tech_stack（工程技术栈感知） ----
+//
+// 目标：Figma 决定"还原什么"，工程上下文决定"用什么还原"——技术栈在
+// package.json / tsconfig / 框架配置 / 源文件后缀里，不在设计稿里。
+// 本工具把「读文件 + 规则匹配」的感知固化为可测试的纯函数：
+//   - 高置信（react 依赖 + jsx 配置 + .tsx 文件齐了）→ 直接自动决策；
+//   - 低置信 / 信号冲突（package.json 无 react 但全是 .tsx）→ 显式列证据，
+//     升级用户评审——"能自动的全自动，行不通的让你评审"在这一层的落地。
+//
+// JS/TS ↔ Go 对比：JS 常靠 npm 包（which-pm-runs / get-framework）做检测，
+// Go 这里手写规则枚举——依赖少、行为可测试；代价是框架清单要自己维护，
+// 新增框架 = 加一个 map 条目 + 一个测试用例。
+
+// techStack 是推断结果：stack + 置信度 + 证据/冲突清单。
+type techStack struct {
+	Stack      string   // react / vue / svelte / angular / html / unknown
+	Confidence string   // high / medium / low
+	Evidence   []string // 支持推断的信号（给模型/用户看依据）
+	Conflicts  []string // 冲突信号（存在则需评审）
+}
+
+// detectTechStack 工具实现：输入 JSON {}，对绑定 root 扫描推断。
+func (t *Tools) detectTechStack(input string) (string, error) {
+	// 无参数工具：输入预期 "{}"，忽略内容（与 figma_get_variables 同模式）
+	st := detectStack(t.root)
+	return formatStack(st), nil
+}
+
+// formatStack 把推断结果格式化为人类可读输出（评审时用户一眼看懂依据）。
+func formatStack(st techStack) string {
+	var b strings.Builder
+	flag := ""
+	if st.Stack == "unknown" || len(st.Conflicts) > 0 {
+		flag = "（⚠️ 需评审）"
+	}
+	fmt.Fprintf(&b, "技术栈推断: %s（置信度: %s）%s\n", st.Stack, st.Confidence, flag)
+	if len(st.Evidence) > 0 {
+		b.WriteString("信号:\n")
+		for _, e := range st.Evidence {
+			fmt.Fprintf(&b, "  - %s\n", e)
+		}
+	}
+	if len(st.Conflicts) > 0 {
+		b.WriteString("冲突信号（需你确认）:\n")
+		for _, c := range st.Conflicts {
+			fmt.Fprintf(&b, "  - %s\n", c)
+		}
+	}
+	if len(st.Conflicts) > 0 {
+		b.WriteString("评审点: 信号冲突，请确认目标技术栈后再生成（避免自动猜错整段代码作废）")
+	} else if st.Stack == "unknown" {
+		b.WriteString("评审点: 未检测到可靠的前端技术栈信号，请确认生成目标（html / react / vue / 其他）")
+	}
+	return b.String()
+}
+
+// detectStack 核心感知逻辑：扫描 root 的工程文件，输出推断。
+func detectStack(root string) techStack {
+	var st techStack
+	// scores 按"信号条数"独立累加：react 依赖 + jsx 配置 + .tsx 文件 = 3 条信号，
+	// 而不是 map 覆盖成 1 条——置信度由信号数量决定（JS/TS 对比：map 值去重
+	// 会把同框架多信号合并，这里用计数表，每个信号事件都算数）。
+	scores := map[string]int{}
+
+	// ① 依赖信号：package.json 的 dependencies + devDependencies
+	deps := readPackageDeps(root)
+	for name := range deps {
+		fw := ""
+		switch {
+		case name == "react" || name == "react-dom" || name == "next" || strings.HasPrefix(name, "@react"):
+			fw = "react"
+		case name == "vue" || name == "nuxt":
+			fw = "vue"
+		case name == "svelte" || name == "@sveltejs/kit":
+			fw = "svelte"
+		case name == "@angular/core":
+			fw = "angular"
+		}
+		if fw != "" {
+			scores[fw]++
+			st.Evidence = append(st.Evidence, "package.json 依赖含 "+name)
+		}
+	}
+
+	// ② tsconfig：jsx 编译选项 → React+TS 的强信号
+	if jsx := readTSConfigJSX(root); jsx != "" {
+		st.Evidence = append(st.Evidence, fmt.Sprintf("tsconfig.json 设置 jsx=%q", jsx))
+		if jsx == "react-jsx" || jsx == "react" || jsx == "preserve" {
+			scores["react"]++
+		}
+	}
+
+	// ③ 源文件后缀计数 + 框架配置文件存在性（跳过 node_modules/.git/backup）
+	extCount := map[string]int{}
+	hasConfig := map[string]bool{}
+	walkIgnore(root, func(rel string) {
+		ext := strings.ToLower(filepath.Ext(rel))
+		extCount[ext]++
+		base := filepath.Base(rel)
+		cfg := map[string]string{
+			"vite.config": "vite", "next.config": "next", "nuxt.config": "nuxt",
+			"svelte.config": "svelte", "astro.config": "astro", "angular.json": "angular",
+		}
+		for prefix, framework := range cfg {
+			if strings.HasPrefix(base, prefix) {
+				hasConfig[framework] = true
+				st.Evidence = append(st.Evidence, fmt.Sprintf("存在 %s（%s）", base, framework))
+			}
+		}
+	})
+	for ext, n := range extCount {
+		switch ext {
+		case ".tsx":
+			st.Evidence = append(st.Evidence, fmt.Sprintf("存在 %d 个 .tsx 源文件", n))
+			scores["react"]++
+		case ".vue":
+			st.Evidence = append(st.Evidence, fmt.Sprintf("存在 %d 个 .vue 源文件", n))
+			scores["vue"]++
+		case ".svelte":
+			st.Evidence = append(st.Evidence, fmt.Sprintf("存在 %d 个 .svelte 源文件", n))
+			scores["svelte"]++
+		}
+	}
+	// 框架配置文件也计入对应框架信号
+	for fw, has := range hasConfig {
+		if has {
+			scores[fw]++
+		}
+	}
+
+	// ④ 纯静态信号：有 index.html 但无任何框架信号
+	_, htmlErr := os.Stat(filepath.Join(root, "index.html"))
+	hasHTML := htmlErr == nil
+	if hasHTML && len(scores) == 0 {
+		st.Evidence = append(st.Evidence, "存在 index.html，且无框架依赖/框架源文件")
+		scores["html"]++
+	}
+
+	// ⑤ 汇总结论：多框架并存 → 冲突；单一 → 按信号条数定置信度；全无 → unknown
+	best, bestScore := "", 0
+	for fw, n := range scores {
+		if n > bestScore {
+			best, bestScore = fw, n
+		}
+	}
+	if bestScore == 0 {
+		st.Stack, st.Confidence = "unknown", "low"
+		return st
+	}
+	// 冲突检测：第二名也有信号（且非 html——html 是"无框架"的兜底，不算冲突）
+	second := 0
+	for fw, n := range scores {
+		if fw != best && n > second {
+			second = n
+		}
+	}
+	if second > 0 && best != "html" {
+		st.Stack, st.Confidence = "unknown", "low"
+		for fw := range scores {
+			if fw != best {
+				st.Conflicts = append(st.Conflicts, fmt.Sprintf("检测到 %s 与 %s 双框架信号", best, fw))
+			}
+		}
+		return st
+	}
+	st.Stack = best
+	switch {
+	case bestScore >= 3 || (best == "react" && hasConfig["vite"]):
+		st.Confidence = "high"
+	case bestScore == 2:
+		st.Confidence = "medium"
+	default:
+		st.Confidence = "medium"
+	}
+	return st
+}
+
+// readPackageDeps 读取 package.json 的 dependencies + devDependencies 键集合。
+// 解析失败/文件缺失 → 空集合（不 panic；JSON 语法错误也算"无依赖信号"）。
+func readPackageDeps(root string) map[string]string {
+	data, err := os.ReadFile(filepath.Join(root, "package.json"))
+	if err != nil {
+		return nil
+	}
+	var pkg struct {
+		Dependencies    map[string]string `json:"dependencies"`
+		DevDependencies map[string]string `json:"devDependencies"`
+	}
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return nil
+	}
+	out := make(map[string]string)
+	for k, v := range pkg.Dependencies {
+		out[k] = v
+	}
+	for k, v := range pkg.DevDependencies {
+		out[k] = v
+	}
+	return out
+}
+
+// readTSConfigJSX 读取 tsconfig.json 的 compilerOptions.jsx 值。
+func readTSConfigJSX(root string) string {
+	data, err := os.ReadFile(filepath.Join(root, "tsconfig.json"))
+	if err != nil {
+		return ""
+	}
+	var ts struct {
+		CompilerOptions struct {
+			JSX string `json:"jsx"`
+		} `json:"compilerOptions"`
+	}
+	if err := json.Unmarshal(data, &ts); err != nil {
+		return ""
+	}
+	return ts.CompilerOptions.JSX
+}
+
+// walkIgnore 遍历 root，跳过 node_modules/.git/backup/dist，对每个文件
+// 调 fn(rel)。错误静默跳过（探测场景容错优先：读不了的目录不致命）。
+func walkIgnore(root string, fn func(rel string)) {
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			switch filepath.Base(p) {
+			case "node_modules", ".git", "backup", "dist", ".next", "build", "vendor":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return nil
+		}
+		fn(filepath.ToSlash(rel))
+		return nil
+	})
 }
