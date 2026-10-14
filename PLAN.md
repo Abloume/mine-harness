@@ -164,7 +164,7 @@
 > 单 Agent 优先、主项目串路线**均已对齐**——外部实践印证，方向不动，继续走；
 > 真正增量集中在四项：可观测性前置 / 仓库 dogfood / 检索数据系统化 /
 > 意图路由先于多 Agent（另有 Prompt 回归门禁并入第 8 步）。
-> 落地形态：增量 C/D/E 直接并入对应步骤（见下方指引），增量 A/B 本节落地。
+> 落地形态：增量 C/D/E 直接并入对应步骤（见下方指引），增量 A/B/F/G/H/I 本节落地。
 
 ### 增量 A · 结构化轨迹导出前置（可观测性，原第 8 步①提前）
 
@@ -270,6 +270,43 @@
 - [x] 单测：硬约束在任意位置 → 压缩后仍完整保留；摘要 / FIFO 兜底路径都不触碰 Protected 消息
       （已落地：TestCompactPreservesProtected / TestTrimSkipsProtected / TestWithHardConstraints，全绿）
 - [x] 既有 context_test 全绿（无行为回退）
+
+### 增量 H · 任务系统 + 依赖图（Task Graph）
+
+> 单次 Run 只覆盖"一次任务"，任务系统让目标持久化到单次对话之外：
+> 任务可分解（父任务拆子任务）、有依赖图（先 A 后 B）、可并行追踪。
+> 现状：Agent 只有单次 Run + StepRecord 账本，任务边界=一次对话。
+
+**做什么**
+- [ ] 任务模型（内核）：Task 结构（ID / 目标 / 状态 / 父任务 / 依赖集），持久化复用 internal/memory
+- [ ] 依赖图：任务注册 DAG，完成态传播（子任务全 done → 父任务可 done；依赖未就绪 → blocked）
+- [ ] 宿主入口：TaskStore 接入 Run（随 step 更新任务状态），机制归内核、宿主决定任务来源
+- [ ] 与增量 A 打通：轨迹 TraceTask 事件（任务创建 / 完成 / 依赖阻塞）
+- [ ] 配套 `-demo task-graph`：父任务拆 3 个子任务（2 个无依赖可并行、1 个依赖前置）→ 依赖门控 + 汇总
+
+**Go 练习点**
+- 图结构（邻接表 / 入度）+ 拓扑排序；状态机（pending → running → done / blocked）
+
+**验证**
+- [ ] 单测：DAG 注册、依赖未就绪阻塞、子任务完成传播父任务、环路检测
+
+### 增量 I · hooks 扩展系统（Lifecycle Hooks）
+
+> 宿主常需要在不改内核的前提下挂自定义逻辑（拦截、注入、审计、限流）。
+> 现有 trace / 审批是专用插槽，hooks 是通用扩展点：工具调用前/后、step 前/后、
+> 压缩前后——文章把它列为 harness 的标准组件。
+
+**做什么**
+- [ ] 钩子注册表（内核）：OnBeforeTool / OnAfterTool / OnBeforeStep / OnAfterStep / OnBeforeCompact / OnAfterCompact
+- [ ] 宿主入口：WithHooks(...Hook) 注册；钩子可改入参、阻断（返回 err → 终止该步）、注入
+- [ ] 与既有机制分工：审批闸门管"能不能做"（权限），hooks 管"做了什么 / 怎么处理"（扩展）；trace 记录结果、hooks 干预过程
+- [ ] 配套 `-demo hooks`：钩子拦截特定工具名 + 审计日志 + 压缩前后记录 token
+
+**Go 练习点**
+- 函数类型一等公民（TS 闭包 ↔ Go func 类型）；切片注册表遍历执行
+
+**验证**
+- [ ] 单测：钩子调用顺序、阻断生效、错误传播；无钩子时行为不变（既有测试无回归）
 
 ---
 
