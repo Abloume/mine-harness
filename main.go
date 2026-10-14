@@ -1,5 +1,5 @@
-// mine-harness 入口：三十三个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索 / 长期记忆关键召回 / 结构化轨迹导出 / 开发工作流 Skill / 前端视觉验证 / 压缩保真度抽查 + 硬约束保护层 / 任务系统 + 依赖图"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity | task-graph
+// mine-harness 入口：三十四个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索 / 长期记忆关键召回 / 结构化轨迹导出 / 开发工作流 Skill / 前端视觉验证 / 压缩保真度抽查 + 硬约束保护层 / 任务系统 + 依赖图 / 意图路由（多意图并行分流）"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity | task-graph | intent-route
 package main
 
 import (
@@ -13,8 +13,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"mine-harness/internal/agent"
@@ -29,7 +31,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity | task-graph")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity | task-graph | intent-route")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -102,6 +104,8 @@ func main() {
 		runDemoCompactFidelity(*verbose)
 	case "task-graph":
 		runDemoTaskGraph(*verbose)
+	case "intent-route":
+		runDemoIntentRoute(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -2349,4 +2353,123 @@ func runDemoTaskGraph(verbose bool) {
 func mustStatus(g *agent.TaskGraph, id string) string {
 	st, _ := g.Status(id)
 	return st
+}
+
+// runDemoIntentRoute 演示增量 D（意图路由 · 第 7 步前置）：
+//
+//	A 段 · 多意图并行查询：一句话拆 3 条意图 → 都路由到检索链 → 三路并行
+//	   （README 读取 + git 提交计数 + git 作者列表）→ 合并汇报；
+//	B 段 · 混合意图分流：改数据走审批链（未过审批不执行）、查知识走检索链；
+//	C 段 · 闲聊直答：chit-chat 不调工具直接回答。
+//
+// 并行用标准库 goroutine + WaitGroup（AGENTS.md：Go 标准库优先，
+// errgroup 属第三方 x/sync，不引入）。
+func runDemoIntentRoute(verbose bool) {
+	fmt.Println("== 增量 D 演示：意图路由（第 7 步前置）==")
+
+	cls := &agent.HeuristicIntentClassifier{}
+
+	// ---- A 段：多意图并行查询 ----
+	task := "这个项目有什么内容、要多少次更新、都是谁提交的"
+	fmt.Printf("\n[A] 输入：%q\n", task)
+	results := agent.SplitAndClassify(task, cls)
+	for i, r := range results {
+		fmt.Printf("    子句 %d：%q → %s（conf=%.2f）→ 路由 %s\n",
+			i+1, agent.HeuristicIntentSplitter(task)[i], r.Intent, r.Confidence, r.Route)
+	}
+
+	// 三路并行执行（每路一个 goroutine），WaitGroup 汇总
+	type laneResult struct {
+		label  string
+		result string
+		err    error
+	}
+	lanes := []laneResult{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	run := func(label string, fn func() (string, error)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := fn()
+			mu.Lock()
+			lanes = append(lanes, laneResult{label: label, result: res, err: err})
+			mu.Unlock()
+		}()
+	}
+	run("README 读取", func() (string, error) {
+		b, err := os.ReadFile("README.md")
+		if err != nil {
+			return "", err
+		}
+		// rune 安全截断：UTF-8 多字节字符不能按字节切（会出乱码）
+		s := string(b)
+		r := []rune(s)
+		if len(r) > 40 {
+			s = string(r[:40]) + "…"
+		}
+		return strings.ReplaceAll(s, "\n", " "), nil
+	})
+	run("提交计数", func() (string, error) {
+		out, err := exec.Command("git", "log", "--oneline").Output()
+		if err != nil {
+			return "", err
+		}
+		n := len(strings.Split(strings.TrimSpace(string(out)), "\n"))
+		return fmt.Sprintf("%d 次提交", n), nil
+	})
+	run("作者列表", func() (string, error) {
+		out, err := exec.Command("git", "log", "--format=%an").Output()
+		if err != nil {
+			return "", err
+		}
+		authors := map[string]bool{}
+		for _, a := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if a != "" {
+				authors[a] = true
+			}
+		}
+		var names []string
+		for a := range authors {
+			names = append(names, a)
+		}
+		return "作者: " + strings.Join(names, ", "), nil
+	})
+	wg.Wait()
+	fmt.Println("[A] 三路并行结果合并：")
+	for _, l := range lanes {
+		if l.err != nil {
+			fmt.Printf("    · %s → 失败: %v\n", l.label, l.err)
+		} else {
+			fmt.Printf("    · %s → %s\n", l.label, l.result)
+		}
+	}
+
+	// ---- B 段：混合意图分流 ----
+	taskB := "帮我修改一下 README，另外这个项目是做什么的"
+	fmt.Printf("\n[B] 混合意图输入：%q\n", taskB)
+	resB := agent.SplitAndClassify(taskB, cls)
+	for i, r := range resB {
+		switch r.Route {
+		case "approval":
+			fmt.Printf("    子句 %d：%s → 审批链：写类动作，未过审批闸门不执行（演示拒绝）\n", i+1, r.Intent)
+		case "retrieve":
+			fmt.Printf("    子句 %d：%s → 检索链：读取 README 开头…\n", i+1, r.Intent)
+			b, _ := os.ReadFile("README.md")
+			s := string(b)
+			rs := []rune(s)
+			if len(rs) > 30 {
+				s = string(rs[:30]) + "…"
+			}
+			fmt.Printf("       → %s\n", strings.ReplaceAll(s, "\n", " "))
+		default:
+			fmt.Printf("    子句 %d：%s → 链路 %s\n", i+1, r.Intent, r.Route)
+		}
+	}
+
+	// ---- C 段：闲聊直答 ----
+	fmt.Printf("\n[C] 闲聊输入：%q\n", "你好")
+	c := cls.Classify("你好")
+	fmt.Printf("    → %s（conf=%.2f）→ 路由 %s：不调工具，直接回答\n", c.Intent, c.Confidence, c.Route)
+	fmt.Println("    回答：你好！有什么可以帮你？（如需查项目内容/改代码，请直接说）")
 }

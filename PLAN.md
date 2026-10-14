@@ -218,6 +218,35 @@
 
 ### 增量 D · 意图路由先于多 Agent → 并入第 7 步「前置步骤」
 
+> 拆多 Agent 之前先回答"用户到底要什么"：单 Agent 频繁在多种职责间打架时，
+> 先做意图分类/路由，让不同意图走不同链路；一句话含多个意图时拆成多条并行查询。
+> （2026-10-14 已落地 ✅，实现见下）
+
+**做什么**
+- [x] 意图分类（内核 intent.go）：Intent 枚举（query-knowledge / mutate-data / service / chit-chat / unknown）
+      + IntentClassifier 窄接口 + HeuristicIntentClassifier 默认实现
+      （强词 ×2 / 普通词 ×1 加权计分；平局按 mutate > service > query > chit；
+      写类触发审批链误判成本高 → 优先级与"双义词"分级为此设计）
+- [x] 多意图拆分：HeuristicIntentSplitter（标点 + 连接词切分）+ SplitAndClassify 组合
+- [x] 路由决策：RouteIntent → retrieve / approval / service-flow / direct-reply / fallback
+- [x] 配套 `-demo intent-route`：A 段"有什么内容、多少次更新、谁提交的"三路并行
+      （README 读取 + git 提交计数 + git 作者列表，标准库 goroutine + WaitGroup 合并）；
+      B 段混合意图（改 README→审批链拒绝演示 + 查项目→检索链）；
+      C 段闲聊直答（不调工具）
+      （已落地：README demo 场景数 33→34，main.go 头部注释同步）
+
+**Go 练习点**
+- map + 包级编译 regexp（编译一次复用）；加权计分与平局确定性（map 遍历无序 →
+  用显式 priority 切片取最高分，不依赖 map 顺序）
+- 多路并行：goroutine + sync.WaitGroup + mutex 汇总（标准库优先，不引第三方 errgroup；
+  JS/TS ↔ Go：JS 是事件循环单线程，Go 是 goroutine 显式并发）
+
+**验证**
+- [x] 单测 6 个全绿：分类命中（改/删/更新/查/售后/闲聊/unknown）、置信度（单意图=1、
+      无命中=0、混合∈(0,1)）、拆分（顿号/连接词/空输入）、路由映射、
+      SplitAndClassify（三路查询 + 混合分流）、空输入回退
+- [x] 既有测试全绿（无行为回退）；`go run . -demo intent-route` 端到端符合预期
+
 ### 增量 E · Prompt 回归门禁 → 并入第 8 步③
 
 ### 增量 F · 压缩保真度抽查（Compact Fidelity）
@@ -557,6 +586,8 @@
   一句话含多个意图时拆成多条意图并行查询（例："这个项目有什么内容、
   要多少次更新、都是谁提交的" → README 读取 + 提交计数 + 作者列表三路并行，
   比硬贴单个"查项目"标签可靠）
+  （✅ 2026-10-14 已落地：internal/agent/intent.go + 6 单测 + `-demo intent-route`，
+  详见外部启发回写章节增量 D）
 - **触发条件写具体**：单 Agent 频繁在多种职责间打架、任务能明确
   拆分、交接与合并规则清楚时才拆多 Agent；不满足则维持单 Agent + 意图路由
 - 主管-子代理模式：Planner 拆解任务 → 多个 Agent 实例各自跑独立主循环 → 汇总合并结果
