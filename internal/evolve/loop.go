@@ -8,6 +8,8 @@ import "mine-harness/internal/eval"
 type RoundResult struct {
 	Round        int               // 第几轮（从 1 开始）
 	Score        float64           // 这轮评测的通过率（0-100）
+	Delta        float64           // 相对上一轮的分数变化（第 1 轮为 0）
+	Regressed    bool              // 是否引入了回归（Delta < 0）
 	Failures     []FailureRecord   // 这轮收集到的失败
 	Suggestions  []SuggestedChange // 这轮诊断出的改写建议
 	NewSkillBody string            // 进化后的 Skill 全文
@@ -20,6 +22,10 @@ type RoundResult struct {
 //  2. Evolve() 产出新 Skill
 //  3. 调用 onEvolved 回调（调用方在这里切换自己的 Skill 版本状态）
 //  4. 如果还有失败且没到 maxRounds，回到第 1 步
+//
+// 回归检测：每轮自动跟上前一轮的分数对比。
+// 如果下一轮分数比上一轮低（Delta < 0），标记 Regressed=true。
+// 这是 SkillForge 论文里提到的护栏：大改会引入回归，要能检测到。
 //
 // onEvolved 参数：每轮进化后的回调，传 (轮次, 新 Skill 全文)。
 // 调用方在这里做"切换 Skill 版本"的动作——比如 demo 里改 skillVersion 变量。
@@ -35,14 +41,27 @@ func EvolveLoop(
 ) []RoundResult {
 	results := []RoundResult{}
 	currentSkill := initialSkill
+	prevScore := -1.0 // -1 表示"还没有上一轮"
 
 	for i := 0; i < maxRounds; i++ {
 		report := runSuite()
 		evo := Evolve(report, currentSkill)
+		score := report.PassRate()
+
+		// 回归检测：跟上前一轮分数对比
+		delta := 0.0
+		regressed := false
+		if prevScore >= 0 {
+			delta = score - prevScore
+			regressed = delta < 0
+		}
+		prevScore = score
 
 		results = append(results, RoundResult{
 			Round:        i + 1,
-			Score:        report.PassRate(),
+			Score:        score,
+			Delta:        delta,
+			Regressed:    regressed,
 			Failures:     evo.Failures,
 			Suggestions:  evo.Suggestions,
 			NewSkillBody: evo.NewSkillBody,
