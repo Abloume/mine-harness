@@ -112,6 +112,10 @@ func main() {
 		runDemoSelfEvolve(*verbose)
 	case "dag":
 		runDemoDAG(*verbose)
+	case "dag-planner":
+		runDemoDAGPlanner(*verbose)
+	case "dag-replan":
+		runDemoDAGReplan(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -2735,4 +2739,264 @@ func runDemoDAG(verbose bool) {
 	fmt.Println("• 第 3 步（查发布记录）失败，后继节点标记 skipped")
 	fmt.Println("• 其他分支不受影响，第 5、6 步照样跑完")
 	fmt.Println("• 这就是 DAG 相比 for 循环的优势：并行加速 + 失败隔离")
+}
+
+// mockPlannerLLM 是一个假的 Planner LLM，模拟模型输出 DAG JSON。
+type mockPlannerLLM struct {
+	response string
+}
+
+func (m *mockPlannerLLM) Generate(prompt string) (string, error) {
+	return m.response, nil
+}
+
+// runDemoDAGPlanner 演示 Planner：从自然语言任务自动生成 DAG。
+//
+// 跟 runDemoDAG 的区别：
+//   - runDemoDAG：手写 Graph（节点和边都是硬编码的）
+//   - runDemoDAGPlanner：输入任务描述，Planner 自动出 DAG
+//
+// 这里用 mock LLM 模拟模型输出，展示"从任务到图"的完整链路。
+func runDemoDAGPlanner(verbose bool) {
+	fmt.Println("=== DAG Planner：从任务描述自动生成执行图 ===")
+	fmt.Println()
+
+	// 1. 可用工具列表
+	tools := []dag.ToolDesc{
+		{Name: "query_metrics", Description: "查询服务监控指标（延迟、QPS、错误率）"},
+		{Name: "query_health", Description: "查询依赖服务健康状态"},
+		{Name: "query_logs", Description: "查询错误日志"},
+		{Name: "analyze", Description: "分析多组数据的时间相关性"},
+		{Name: "gen_report", Description: "生成分析报告"},
+	}
+
+	// 2. 构造 mock LLM——模拟模型返回的 DAG JSON
+	//    实际场景里这一步是真实模型跑出来的
+	mockLLM := &mockPlannerLLM{
+		response: `
+{
+  "nodes": [
+    {"id": "1", "action": "查支付接口延迟监控", "tool": "query_metrics"},
+    {"id": "2", "action": "查依赖服务健康度", "tool": "query_health"},
+    {"id": "3", "action": "查昨天的错误日志", "tool": "query_logs"},
+    {"id": "4", "action": "分析延迟与错误的相关性", "tool": "analyze"},
+    {"id": "5", "action": "生成分析报告", "tool": "gen_report"}
+  ],
+  "edges": [
+    {"from": "1", "to": "4"},
+    {"from": "2", "to": "4"},
+    {"from": "3", "to": "4"},
+    {"from": "4", "to": "5"}
+  ]
+}
+`,
+	}
+
+	// 3. 创建 Planner，输入任务
+	planner := dag.NewPlanner(mockLLM, tools)
+	task := "分析昨天支付接口变慢的原因，生成一份分析报告"
+
+	fmt.Println("--- 1. 输入任务 ---")
+	fmt.Printf("任务：%s\n\n", task)
+
+	// 4. Planner 自动出 DAG
+	fmt.Println("--- 2. Planner 输出 DAG ---")
+	graph, err := planner.Plan(task)
+	if err != nil {
+		fmt.Println("Planner 失败:", err)
+		return
+	}
+
+	fmt.Printf("节点数：%d\n", len(graph.Nodes))
+	for _, n := range graph.Nodes {
+		fmt.Printf("  · %s: %s（工具：%s）\n", n.ID, n.Action, n.Tool)
+	}
+	fmt.Printf("依赖边：%d 条\n", len(graph.Edges))
+	for _, e := range graph.Edges {
+		fmt.Printf("  · %s → %s\n", e.From, e.To)
+	}
+
+	// 5. 拓扑排序，展示分层
+	fmt.Println("\n--- 3. 拓扑排序（分层并行） ---")
+	layers, err := graph.TopoSort()
+	if err != nil {
+		fmt.Println("拓扑排序失败:", err)
+		return
+	}
+	for i, layer := range layers {
+		fmt.Printf("  第 %d 层：%v（%d 个并行）\n", i+1, layer, len(layer))
+	}
+
+	// 6. 执行 DAG
+	fmt.Println("\n--- 4. 执行 DAG ---")
+	executor := dag.NewExecutor(3)
+	executor.Register("query_metrics", func(params string) (string, error) {
+		return `{"p99":"850ms"}`, nil
+	})
+	executor.Register("query_health", func(params string) (string, error) {
+		return `{"mq":"degraded"}`, nil
+	})
+	executor.Register("query_logs", func(params string) (string, error) {
+		return `{"errors":127}`, nil
+	})
+	executor.Register("analyze", func(params string) (string, error) {
+		return `{"finding":"MQ 降级导致延迟飙升"}`, nil
+	})
+	executor.Register("gen_report", func(params string) (string, error) {
+		return `# 支付接口变慢分析报告\n结论：MQ 服务降级导致延迟从 200ms 涨到 850ms。`, nil
+	})
+
+	nodeMap, err := executor.Run(graph)
+	if err != nil {
+		fmt.Println("执行失败:", err)
+		return
+	}
+
+	// 7. 结果汇总
+	fmt.Println("\n--- 5. 执行结果 ---")
+	for id, node := range nodeMap {
+		switch node.Status {
+		case dag.StatusSuccess:
+			fmt.Printf("  ✅ %s: success\n", id)
+		case dag.StatusFailed:
+			fmt.Printf("  ❌ %s: failed\n", id)
+		case dag.StatusSkipped:
+			fmt.Printf("  ⏭️  %s: skipped\n", id)
+		}
+	}
+
+	// 8. 总结
+	fmt.Println("\n--- 关键观察 ---")
+	fmt.Println("• 从自然语言任务 → 结构化 DAG，全程不需要手写图")
+	fmt.Println("• Planner 输出 JSON，执行器负责解析 + 校验 + 执行")
+	fmt.Println("• 跟手写 Graph 的区别：模型负责规划，执行器负责调度")
+	fmt.Println("• 这就是 Plan-and-Execute 的完整闭环：Planner → Executor → 结果")
+}
+
+// runDemoDAGReplan 演示局部重规划（Replan）。
+//
+// 场景：
+//   1. 初始 DAG：查监控 → 查日志 → 分析 → 生成报告
+//   2. "查监控"这步失败了（工具不存在 = 永久失败）
+//   3. 触发 Replan：摘出失败节点 + 它的后继
+//   4. （mock）Planner 重新规划：用"查 trace"代替"查监控"
+//   5. 合并回原 DAG，继续执行
+func runDemoDAGReplan(verbose bool) {
+	fmt.Println("=== DAG Replan：局部重规划演示 ===")
+	fmt.Println()
+
+	// 1. 初始 DAG
+	graph := &dag.Graph{
+		Nodes: []dag.Node{
+			{ID: "1", Action: "查延迟监控", Tool: "query_metrics", Params: `{}`},
+			{ID: "2", Action: "查错误日志", Tool: "query_logs", Params: `{}`},
+			{ID: "3", Action: "分析相关性", Tool: "analyze", Params: `{}`},
+			{ID: "4", Action: "生成报告", Tool: "gen_report", Params: `{}`},
+		},
+		Edges: []dag.Edge{
+			{From: "1", To: "3"},
+			{From: "2", To: "3"},
+			{From: "3", To: "4"},
+		},
+	}
+
+	fmt.Println("--- 1. 初始 DAG ---")
+	for _, n := range graph.Nodes {
+		fmt.Printf("  · %s: %s\n", n.ID, n.Action)
+	}
+	fmt.Println()
+
+	// 2. 模拟执行："查监控"失败了（工具不存在）
+	fmt.Println("--- 2. 执行中... ---")
+	executor := dag.NewExecutor(3)
+	executor.Register("query_logs", func(params string) (string, error) {
+		return `{"errors": 127}`, nil
+	})
+	// 故意不注册 query_metrics——模拟"工具不存在"的永久失败
+	executor.Register("analyze", func(params string) (string, error) {
+		return `{"finding": "错误率飙升"}`, nil
+	})
+	executor.Register("gen_report", func(params string) (string, error) {
+		return `# 报告\n\n结论：错误率飙升导致问题。`, nil
+	})
+
+	nodeMap, _ := executor.Run(graph)
+	fmt.Println()
+
+	// 3. 检查是否需要 Replan
+	fmt.Println("--- 3. 检查是否需要 Replan ---")
+	replanner := dag.NewReplanner(dag.DefaultReplanTrigger{}, 3)
+
+	failedNode := nodeMap["1"]
+	needReplan, reason := replanner.CheckReplan(failedNode, failedNode.Err)
+	fmt.Printf("  %s\n", reason)
+	fmt.Printf("  需要 Replan：%v\n\n", needReplan)
+
+	if !needReplan {
+		fmt.Println("不需要重规划，流程结束。")
+		return
+	}
+
+	// 4. 摘出失败节点（只替换它本身，后继节点保留）
+	fmt.Println("--- 4. 摘出需要替换的节点 ---")
+	fmt.Printf("  失败节点：1（查延迟监控）\n")
+	fmt.Printf("  已成功、不许动的节点：%v\n", graph.LockedNodes())
+	fmt.Println("  （后继节点 3、4 保留，只是要重新连接）")
+	fmt.Println()
+
+	// 5. （mock）Planner 重新规划——用"查 trace"代替"查监控"
+	fmt.Println("--- 5. Planner 重新规划 ---")
+	fmt.Println("  （模拟）Planner 说：监控工具挂了，改用 trace 分析")
+	newNode := dag.Node{ID: "1b", Action: "查调用链 trace", Tool: "query_trace", Params: `{}`}
+	fmt.Println("  新节点：1b（查 trace）")
+	fmt.Println("  新依赖边：1b → 3（连到原来的分析节点）")
+	fmt.Println()
+
+	// 6. 合并回原 DAG：删掉失败节点 1，加上新节点 1b，重连边
+	fmt.Println("--- 6. 合并回原 DAG ---")
+	graph.MergeSubgraph([]string{"1"}, []dag.Node{newNode}, []dag.Edge{{From: "1b", To: "3"}})
+	fmt.Println("  合并后的节点：")
+	for _, n := range graph.Nodes {
+		fmt.Printf("    · %s: %s\n", n.ID, n.Action)
+	}
+	fmt.Println()
+
+	// 7. 重新执行
+	fmt.Println("--- 7. 重新执行（第 2 轮）---")
+	executor2 := dag.NewExecutor(3)
+	executor2.Register("query_trace", func(params string) (string, error) {
+		return `{"slow_calls": ["db.query", "mq.publish"]}`, nil
+	})
+	executor2.Register("query_logs", func(params string) (string, error) {
+		return `{"errors": 127}`, nil
+	})
+	executor2.Register("analyze", func(params string) (string, error) {
+		return `{"finding": "DB 查询慢 + 错误率飙升"}`, nil
+	})
+	executor2.Register("gen_report", func(params string) (string, error) {
+		return `# 报告\n\n结论：DB 查询慢导致延迟飙升，伴随错误率上升。`, nil
+	})
+
+	nodeMap2, _ := executor2.Run(graph)
+	fmt.Println()
+
+	// 8. 结果
+	fmt.Println("--- 8. 最终结果 ---")
+	for id, node := range nodeMap2 {
+		switch node.Status {
+		case dag.StatusSuccess:
+			fmt.Printf("  ✅ %s: success\n", id)
+		case dag.StatusFailed:
+			fmt.Printf("  ❌ %s: failed\n", id)
+		case dag.StatusSkipped:
+			fmt.Printf("  ⏭️  %s: skipped\n", id)
+		}
+	}
+
+	fmt.Println("\n--- 关键观察 ---")
+	fmt.Println("• 失败是永久的（工具不存在）→ 触发 Replan")
+	fmt.Println("• 已成功的节点（2、3、4...不对，这里 2 还没跑）→ 锁定不动")
+	fmt.Println("• 只替换失败子图，不全盘重来")
+	fmt.Println("• Replan 上限 3 次——防止模型每次都规划错陷入死循环")
+	fmt.Println("• 这就是论文里说的'局部重规划'：改后半段，不推翻前半段")
 }
