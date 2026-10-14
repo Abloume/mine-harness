@@ -220,6 +220,57 @@
 
 ### 增量 E · Prompt 回归门禁 → 并入第 8 步③
 
+### 增量 F · 压缩保真度抽查（Compact Fidelity）
+
+> 摘要压缩不是无损操作：压太狠丢关键信息（记忆断片），压太轻成本和延迟又降不下来。
+> 现有收敛护栏只保证「压缩必然收敛」（防死循环），不保证「关键信息没被误删」——
+> 抽查是关键信息防丢失的兜底环。
+> （2026-10-14 已落地 ✅）
+
+**做什么**
+- [x] 关键实体抽取（规则式、零新依赖）：从被压批次抽取数字 / URL / 引用包裹的专有名词
+      （已落地：`extractKeyEntities` 正则抽取，≥2 位数字/URL/引号专名；regexp 包级编译复用）
+- [x] 摘要生成后做保真度抽查：关键实体全部丢失 → 回退 FIFO（保底不丢事实）或注入「缺失提示」
+      （已落地：`CompactContextReport` 保真度抽查——**全丢 → 判定摘要不可信、保留原文放弃压缩**；
+      **部分丢 → 「【补注】缺失实体」追回**；补注后不收敛 → FIFO 兜底，实体数进报告可追溯）
+- [x] 抽查结果写进轨迹：TraceCompact Detail 记录「保真度抽查介入 N 批（丢失 M 个关键实体，
+      已补注追回或保留原文）」（与增量 A 打通）
+- [x] 配套 `-demo compact-fidelity`：同一批次带关键数字，演示「摘要保留 → 通过」与
+      「摘要漏关键实体 → 回退」两条路径（已注册 flag/switch，含硬约束保留段）
+
+**Go 练习点**
+- 正则抽取（regexp 编译一次复用）+ 集合运算（map 去重/差集）
+
+**验证**
+- [x] 单测：含关键数字的批次，摘要保留 → 抽查通过；摘要漏关键实体 → 回退 FIFO 且轨迹有记录
+      （已落地：TestCompactFidelityPass / FullLossKeepsOriginal / PartialAnnotates，全绿）
+- [x] demo 手动确认两条路径输出（`go run . -demo compact-fidelity` 实测）
+
+### 增量 G · 硬约束保护层（Protected Constraints）
+
+> 用户第一轮的硬约束（过敏禁忌、禁用动作、红线参数）要常驻 system 提示层、
+> 不参与压缩——长会话后期「第 15 轮还记得吗」的标准答案。
+> 现状：CompactContext 只隐式保护 msgs[0]（首条），中途提出的硬约束无保护通道。
+> （2026-10-14 已落地 ✅）
+
+**做什么**
+- [x] Message 增加 Protected 标志（roleSystem 恒受保护；显式标记的硬约束消息也受保护）
+      （已落地：`Message.Protected bool`；首条 msgs[0] 无条件保留 + Protected 消息跳过选批；
+      摘要消息不设 Protected，允许再压缩）
+- [x] CompactContext / TrimContext 选批时跳过 Protected 消息（压缩只发生在非保护消息上）
+      （已落地：选批从索引 1 起且跳过 Protected；TrimContext 兜底同样跳过）
+- [x] 宿主入口：WithHardConstraints 把硬约束注入为 system 消息并标记 Protected
+      （机制归内核、注入归宿主）
+- [x] 压缩事件 Detail 体现「跳过 N 条受保护消息」（与增量 A 打通）
+
+**Go 练习点**
+- 切片过滤与原地压缩的不可变边界（不破坏原切片语义）；结构体字段扩展对既有调用方零破坏
+
+**验证**
+- [x] 单测：硬约束在任意位置 → 压缩后仍完整保留；摘要 / FIFO 兜底路径都不触碰 Protected 消息
+      （已落地：TestCompactPreservesProtected / TestTrimSkipsProtected / TestWithHardConstraints，全绿）
+- [x] 既有 context_test 全绿（无行为回退）
+
 ---
 
 ## 反思回写 · 短期缺口（2026-10-13）

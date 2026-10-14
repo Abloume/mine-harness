@@ -196,7 +196,7 @@ func TestCompactUsesLLMSummarizer(t *testing.T) {
 		{ToolName: "get_weather", ToolInput: `{"city":"广州"}`},
 		{Content: "四城天气已汇总。"},
 	})
-	summ := &recordingLLM{out: "摘要模型说：已查北京/上海/杭州/广州四城天气，均为晴。"}
+	summ := &recordingLLM{out: "摘要模型说：已查北京/上海/杭州/广州四城天气，均为晴，气温 22 度。"}
 
 	a := NewAgent(llm, reg,
 		WithMaxSteps(8),
@@ -222,10 +222,11 @@ func TestCompactUsesLLMSummarizer(t *testing.T) {
 	}
 }
 
-// TestCompactUnconvergedSummaryFallsBackFIFO 验证收敛保证：生成式摘要器
-// 返回超长摘要（比它替换的旧批次还大）时，插入摘要会让 while 循环永不
-// 收敛（每次压缩 token 不降）——内核必须回退 FIFO 丢弃，保证必然收敛。
-func TestCompactUnconvergedSummaryFallsBackFIFO(t *testing.T) {
+// TestUnconvergedSummaryFallsBackFIFO 验证收敛保证（增量 F 下语义）：
+// 生成式摘要器返回超长摘要（比被压批次还大）时，插入会让循环永不收敛——
+// 内核回退 FIFO 直丢保证必然收敛（全丢场景已由保真度抽查提前 break 保留，
+// 这里只剩"摘要可接受但不收敛"的压缩率兜底）。
+func TestUnconvergedSummaryFallsBackFIFO(t *testing.T) {
 	reg := NewRegistry()
 	reg.Register(Tool{
 		Name:     "get_weather",
@@ -235,8 +236,8 @@ func TestCompactUnconvergedSummaryFallsBackFIFO(t *testing.T) {
 		},
 	})
 
-	// 摘要模型固定返回超长文本：token 大于被压缩的旧批次
-	huge := strings.Repeat("摘要内容非常非常长", 100) // 约 1000 字
+	// 摘要模型固定返回超长文本（含关键实体 22，可接受但不收敛）：token 大于旧批次
+	huge := "气温 22 度，" + strings.Repeat("摘要内容非常非常长", 100) // 约 1000 字
 	llm := NewMockLLM([]MockDecision{
 		{ToolName: "get_weather", ToolInput: `{"city":"北京"}`},
 		{ToolName: "get_weather", ToolInput: `{"city":"上海"}`},
@@ -248,7 +249,7 @@ func TestCompactUnconvergedSummaryFallsBackFIFO(t *testing.T) {
 	})
 	summ := &recordingLLM{out: huge}
 
-	// 预算 120：历史快速超预算；摘要比旧批次大 → 全部走 FIFO
+	// 预算 120：历史快速超预算；摘要超长不收敛 → 回退 FIFO 直丢，保证收敛
 	a := NewAgent(llm, reg,
 		WithMaxSteps(8),
 		WithTokenBudget(120),
@@ -256,15 +257,236 @@ func TestCompactUnconvergedSummaryFallsBackFIFO(t *testing.T) {
 	)
 	res := a.Run("查天气")
 	if res.Status != StatusCompleted {
-		t.Fatalf("应 completed（循环必须收敛），实际 %s（%s）", res.Status, res.Reason)
+		t.Fatalf("应 completed，实际 %s（%s）", res.Status, res.Reason)
 	}
 	if MessagesTokens(a.History()) > 120 {
-		t.Errorf("压缩后历史应 ≤ 预算 120，实际 %d", MessagesTokens(a.History()))
+		t.Errorf("FIFO 兜底后历史应 ≤ 预算 120，实际 %d", MessagesTokens(a.History()))
 	}
-	// 摘要未被插入（回退了 FIFO）
+	// 超长摘要未被插入
 	for _, m := range a.History() {
 		if strings.Contains(m.Content, "摘要内容非常非常长") {
 			t.Fatal("超长摘要不应被插入历史（应回退 FIFO）")
 		}
+	}
+}
+
+// ---- 增量 F：压缩保真度抽查 ----
+
+// keyFailingSummarizer 是"会丢全部关键实体"的摘要器：截断到不含数字/URL/专名，
+// 模拟生成式摘要改写/归纳导致的记忆断片（对比 HeuristicSummarizer 的抽取式）。
+type keyFailingSummarizer struct{}
+
+func (keyFailingSummarizer) Summarize(msgs []Message) (string, error) {
+	var b strings.Builder
+	for _, m := range msgs {
+		b.WriteString(m.Role)
+		b.WriteString(": 内容已处理\n")
+	}
+	return b.String(), nil // 无任何原文细节
+}
+
+// keyPartialSummarizer 模拟"截断式"摘要器：user 完整保留、tool 只留前 4
+// 字符——tool 里的关键数字（订单号/金额）会被丢掉，走"部分丢失 → 补注"路径。
+type keyPartialSummarizer struct{}
+
+func (keyPartialSummarizer) Summarize(msgs []Message) (string, error) {
+	var b strings.Builder
+	for _, m := range msgs {
+		b.WriteString(m.Role)
+		b.WriteString(": ")
+		if m.Role == roleTool {
+			r := []rune(m.Content)
+			if len(r) > 4 {
+				r = r[:4]
+			}
+			b.WriteString(string(r))
+		} else {
+			b.WriteString(m.Content)
+		}
+		b.WriteString("\n")
+	}
+	return b.String(), nil
+}
+
+// TestCompactFidelityFullLossKeepsOriginal 验证增量 F：关键实体**全部**丢失
+// → 判定摘要不可信，放弃本次压缩、保留原文（不产生误导性摘要、不 FIFO 直丢）。
+func TestCompactFidelityFullLossKeepsOriginal(t *testing.T) {
+	msgs := []Message{
+		{Role: roleSystem, Content: "system 指令"},
+		{Role: roleUser, Content: "订单号 50231 金额 4500 元，发票抬头为\"美团科技有限公司\"，详情见 https://example.com/order/50231"},
+		{Role: roleTool, Content: "已处理：确认收货地址。同时抄送 88 号仓库。"},
+	}
+	rep := CompactContextReport(msgs, 20, keyFailingSummarizer{})
+	if rep.KeysFound == 0 {
+		t.Errorf("应抽到关键实体（订单号/金额/URL/引号专名），KeysFound=0")
+	}
+	if rep.KeysLost != rep.KeysFound {
+		t.Errorf("全丢摘要应抽查出全部丢失，KeysLost=%d KeysFound=%d", rep.KeysLost, rep.KeysFound)
+	}
+	if rep.FidelityDropped != 1 {
+		t.Errorf("应介入 1 批，实际 FidelityDropped=%d", rep.FidelityDropped)
+	}
+	// 放弃压缩：原文完整保留（user 消息还在），且未插入误导性摘要
+	joined := ""
+	for _, m := range rep.Messages {
+		joined += m.Content
+	}
+	for _, k := range []string{"50231", "4500", "https://example.com/order/50231"} {
+		if !strings.Contains(joined, k) {
+			t.Errorf("全丢场景应保留原文（关键实体 %q 不应消失）", k)
+		}
+	}
+	if strings.Contains(joined, "【历史摘要】") {
+		t.Errorf("摘要不可信时不应插入摘要消息，got %q", joined)
+	}
+}
+
+// TestCompactFidelityPartialAnnotates 验证增量 F：部分丢失 → 补注进摘要
+// （不丢事实），摘要仍比原文小、正常插入。
+func TestCompactFidelityPartialAnnotates(t *testing.T) {
+	msgs := []Message{
+		{Role: roleSystem, Content: "system 指令"},
+		{Role: roleUser, Content: "请处理订单 50231"},
+		{Role: roleTool, Content: `{"order":50231,"amount":4500,"note":"已处理完成等待确认，收货地址无误，后续流程见 https://example.com/order/50231，金额已核对，发票已开具并归档"}`},
+		{Role: roleUser, Content: "继续处理订单 50241"},
+		{Role: roleTool, Content: `{"order":50241,"amount":4600,"note":"已处理完成等待确认"}`},
+	}
+	before := MessagesTokens(msgs)
+	// 单批压缩：预算 80 处于"触发（before>80）与一轮后退出（压缩后≤80）"之间，
+	// 只压最早一批 user1+tool1，不进入第二轮（避免摘要再被压缩的干扰）
+	rep := CompactContextReport(msgs, 80, keyPartialSummarizer{})
+	if !rep.Compacted {
+		t.Fatalf("预算 80 应触发压缩，before=%d", before)
+	}
+	if rep.KeysLost == 0 {
+		t.Errorf("应抽查出部分丢失，KeysLost=0")
+	}
+	if rep.FidelityDropped != 1 {
+		t.Errorf("应介入 1 批（补注），实际 FidelityDropped=%d", rep.FidelityDropped)
+	}
+	if MessagesTokens(rep.Messages) >= before {
+		t.Errorf("补注后仍应收敛（token 下降）：before=%d after=%d", before, MessagesTokens(rep.Messages))
+	}
+	// 补注追回：摘要消息含全部关键实体（50231 由 user 保留，4500/URL 补注）
+	joined := ""
+	for _, m := range rep.Messages {
+		joined += m.Content
+	}
+	for _, k := range []string{"50231", "50241", "4500", "https://example.com/order/50231"} {
+		if !strings.Contains(joined, k) {
+			t.Errorf("关键实体 %q 在压缩后丢失（应被补注追回）", k)
+		}
+	}
+}
+
+// TestCompactFidelityPass 验证增量 F：抽取式摘要保留关键实体 → 抽查通过、
+// 无补注（零开销路径）。
+func TestCompactFidelityPass(t *testing.T) {
+	msgs := []Message{
+		{Role: roleSystem, Content: "system 指令"},
+		{Role: roleUser, Content: "请查一下城市 10086 的天气"},
+		{Role: roleTool, Content: `{"city":"北京","temp":22,"summary":"夜间最低温18度，注意添衣。"}`},
+	}
+	rep := CompactContextReport(msgs, 20, NewHeuristicSummarizer())
+	if !rep.Compacted {
+		t.Fatalf("预算 20 应触发压缩")
+	}
+	if rep.FidelityDropped != 0 {
+		t.Errorf("抽取式摘要保留实体，不应触发补注，实际 FidelityDropped=%d", rep.FidelityDropped)
+	}
+	if rep.KeysFound == 0 {
+		t.Errorf("应抽到关键实体（22/18/10086），KeysFound=0")
+	}
+	joined := ""
+	for _, m := range rep.Messages {
+		joined += m.Content
+	}
+	for _, k := range []string{"22", "18"} {
+		if !strings.Contains(joined, k) {
+			t.Errorf("关键实体 %q 应保留在摘要中", k)
+		}
+	}
+}
+
+// ---- 增量 G：硬约束保护层 ----
+
+// TestCompactPreservesProtected 验证增量 G：Protected 消息在任意位置
+// （含最旧、中间）→ 压缩后仍完整保留；摘要/FIFO 兜底都不触碰它。
+func TestCompactPreservesProtected(t *testing.T) {
+	hard := Message{Role: roleSystem, Content: "【用户硬约束】禁止删除文件，金额超过 5000 需确认", Protected: true}
+	msgs := []Message{
+		{Role: roleSystem, Content: "system 指令"},
+		hard, // 硬约束插在最早一批（最容易被压缩选中）
+		{Role: roleUser, Content: "处理订单 50231"},
+		{Role: roleTool, Content: "订单 50231 已处理，金额 4500 元"},
+		{Role: roleUser, Content: "继续处理订单 50232"},
+		{Role: roleTool, Content: "订单 50232 已处理，金额 4600 元"},
+	}
+	rep := CompactContextReport(msgs, 30, NewHeuristicSummarizer())
+	if !rep.Compacted {
+		t.Fatalf("预算 30 应触发压缩")
+	}
+	if rep.SkippedProtected != 1 {
+		t.Errorf("应跳过 1 条受保护消息，实际 SkippedProtected=%d", rep.SkippedProtected)
+	}
+	found := false
+	for _, m := range rep.Messages {
+		if m.Protected && strings.Contains(m.Content, "禁止删除文件") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("Protected 硬约束消息在压缩后必须完整保留")
+	}
+}
+
+// TestTrimSkipsProtected 验证增量 G：FIFO 兜底（TrimContext）同样不丢 Protected。
+func TestTrimSkipsProtected(t *testing.T) {
+	hard := Message{Role: roleSystem, Content: "硬约束：金额超过 5000 需确认", Protected: true}
+	msgs := []Message{
+		{Role: roleSystem, Content: "system 指令"},
+		hard,
+		{Role: roleUser, Content: "订单 50231"},
+		{Role: roleTool, Content: "已处理"},
+	}
+	out := TrimContext(msgs, 8) // 预算极小：非保护消息全丢后停止
+	for _, m := range out {
+		if m.Protected && strings.Contains(m.Content, "硬约束") {
+			return // 硬约束保留，符合预期
+		}
+	}
+	t.Errorf("TrimContext 不应丢弃 Protected 消息：%+v", out)
+}
+
+// TestWithHardConstraints 验证增量 G：宿主 Option 注入 system Protected 消息，
+// 且参与压缩后仍保留（长会话后期仍记得第一轮的禁忌）。
+func TestWithHardConstraints(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(Tool{Name: "get_weather", BaseRisk: RiskNone,
+		Execute: func(input string) (string, error) { return strings.Repeat("天气很好", 10), nil }})
+	llm := &usageLLM{toolRounds: 2, usage: &Usage{TotalTokens: 9999}}
+	a := NewAgent(llm, reg,
+		WithMaxSteps(6),
+		WithTokenBudget(180),
+		WithSummarizer(&HeuristicSummarizer{MaxLenPerMsg: 10}),
+		WithHardConstraints([]string{"我对海鲜过敏，菜单里不要出现海鲜", "金额超过 5000 需人工确认"}),
+	)
+	res := a.Run("查天气")
+	if res.Status != StatusCompleted {
+		t.Fatalf("应 completed，实际 %s（%s）", res.Status, res.Reason)
+	}
+	// 注入：首条应为受保护的硬约束 system 消息
+	if len(a.history) == 0 || a.history[0].Role != roleSystem || !a.history[0].Protected {
+		t.Fatalf("硬约束应注入为受保护的 system 首条, got %+v", a.history[0])
+	}
+	// 压缩后仍在（全程触发过 usage 9999 > 180 的压缩）
+	found := false
+	for _, m := range a.history {
+		if m.Protected && strings.Contains(m.Content, "海鲜") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("硬约束消息压缩后必须完整保留（不参与压缩）")
 	}
 }

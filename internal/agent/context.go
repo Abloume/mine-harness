@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -187,50 +188,235 @@ func (s *LLMSummarizer) Summarize(msgs []Message) (string, error) {
 // JS/TS ↔ Go 差异：切片 msgs[1:1+k] 是取子切片（引用原数组），
 // 对应 JS 的 slice(1, 1+k)。Go 切片是视图，拼接新数组时用 append 组合。
 func CompactContext(msgs []Message, budget int, s Summarizer) ([]Message, bool) {
+	r := CompactContextReport(msgs, budget, s)
+	return r.Messages, r.Compacted
+}
+
+// CompactReport 是压缩过程的可观测信息（增量 F/G：保真度与保护层状态）。
+// 供宿主写轨迹（TraceCompact Detail）与评测——压缩不是黑盒，"压了什么、
+// 丢了什么、保护了什么"都要可回答。
+type CompactReport struct {
+	Messages         []Message // 压缩后的消息
+	Compacted        bool      // 本次是否发生了压缩
+	SkippedProtected int       // 增量 G：受保护消息数（不参与压缩）
+	FidelityDropped  int       // 增量 F：保真度抽查介入的批次次数（全丢→放弃压缩保留原文；部分丢→补注追回）
+	FIFODropped      int       // 摘要失败/不收敛兜底 FIFO 丢弃的批次次数
+	KeysFound        int       // 增量 F：被压批次抽到的关键实体数
+	KeysLost         int       // 增量 F：抽查发现摘要丢失的关键实体数（全丢放弃 / 部分丢补注追回）
+}
+
+// CompactContextReport 是 CompactContext 的可观测版本（调用方要写轨迹时用它，
+// 不要 JSON 序列化整个历史）。
+//
+// 增量 G：选批只发生在非 Protected 消息上（硬约束/系统提示不参与压缩，
+// 首条 msgs[0] 无条件保留）；增量 F：摘要后做保真度抽查——被压批次的关键
+// 实体（数字/URL/引用专名）全部丢失则判定摘要不可信、保留原文放弃压缩；
+// 部分丢失则补注进摘要（不丢事实），宁可少压也不压错。
+func CompactContextReport(msgs []Message, budget int, s Summarizer) CompactReport {
+	var rep CompactReport
 	if budget <= 0 {
-		return msgs, false
+		rep.Messages = msgs
+		return rep
 	}
 	compacted := false
 	for MessagesTokens(msgs) > budget && len(msgs) > 2 {
-		// 除 system 外的消息数；压缩其中最早一半（至少 1 条）
-		n := len(msgs) - 1
-		k := max(1, n/2) // Go 1.21+ 内置 max
+		// 可压缩消息：跳过 Protected（硬约束/受保护系统提示），
+		// 且从索引 1 起（首条 msgs[0] 恒保留——系统提示不参与压缩）
+		var cand []int
+		for i := 1; i < len(msgs); i++ {
+			if !msgs[i].Protected {
+				cand = append(cand, i)
+			}
+		}
+		// 受保护消息数（含首条若标记）：本次压缩不参与选批的硬约束/系统提示
+		prot := 0
+		for _, m := range msgs {
+			if m.Protected {
+				prot++
+			}
+		}
+		rep.SkippedProtected = prot
+		// 只剩 ≤1 条非保护消息：再压会丢掉最后一条上下文，停止
+		if len(cand) < 2 {
+			break
+		}
+		// 压缩其中最早的一半（至少 1 条）；索引保持升序
+		k := max(1, len(cand)/2) // Go 1.21+ 内置 max
+		oldIdx := cand[:k]
 
-		old := msgs[1 : 1+k]
+		var old []Message
+		for _, i := range oldIdx {
+			old = append(old, msgs[i])
+		}
 		before := MessagesTokens(old)
 		summary, err := s.Summarize(old)
 		if err != nil {
 			// 摘要失败：兜底 FIFO，直接丢这一批
-			msgs = append(msgs[:1], msgs[1+k:]...)
+			msgs = dropIndices(msgs, oldIdx)
+			rep.FIFODropped++
 			compacted = true
 			continue
 		}
 
-		// 用一条"摘要消息"替换这批旧消息（角色标记为 system，前缀注明是摘要）
+		// 增量 F · 保真度抽查：关键实体必须保留在摘要里，否则判定记忆断片。
+		// 全部丢失 → 摘要不可信，放弃压缩保留原文；部分丢失 → 补注进摘要
+		// （不丢事实）。压缩的可靠性优先于压缩率。
+		// Heuristic（抽取式）截断可能丢尾部数字 → 补注兜住；生成式摘要若改写
+		// 关键数字/专名 → 同样处理。
+		keys, lostKeys := keyEntitiesLost(old, summary)
+		rep.KeysFound += len(keys)
+		rep.KeysLost += len(lostKeys)
+		if len(lostKeys) > 0 {
+			if len(lostKeys) == len(keys) {
+				// 关键实体**全部**丢失：摘要不可信（生成式摘要改写/归纳过头），
+				// 放弃本次压缩、保留原文——宁可略超预算也不留"看似完整实则
+				// 丢光硬信息"的误导性摘要
+				rep.FidelityDropped++
+				break
+			}
+			// 部分丢失：把缺失实体补注进摘要（不丢事实，摘要仍比原文小）。
+			// 前缀刻意精简（【补注】4 字）——补注是兜底手段，开销必须远小于
+			// 被追回实体的价值，否则补注膨胀会让摘要不收敛
+			summary += "\n【补注】" + strings.Join(lostKeys, "、")
+			rep.FidelityDropped++
+		}
+
+		// 用一条"摘要消息"替换这批旧消息（角色标记为 system，前缀注明是摘要）。
+		// 摘要消息不设 Protected：历史摘要允许被再压缩/合并（旧摘要并入新摘要）。
 		sumMsg := Message{Role: roleSystem, Content: "【历史摘要】\n" + summary}
 		if MessagesTokens([]Message{sumMsg}) >= before {
-			// 摘要不比原文小：插入不收敛（如生成式摘要器输出超长），
-			// 回退 FIFO 丢弃，保证循环必然收敛
-			msgs = append(msgs[:1], msgs[1+k:]...)
+			// 摘要（含补注）不比原文小：插入不收敛，回退 FIFO 直丢
+			// （压缩率兜底，保证循环必然收敛；被丢批次的关键实体已在
+			// rep.KeysLost/KeysFound 中记录，宿主可写进轨迹可追溯）。
+			// 注：增量 F 之后"全丢"已在上方 break 保留原文，这里只剩
+			// "摘要可接受但不收敛"的场景，直丢不违反保真意图。
+			msgs = dropIndices(msgs, oldIdx)
+			rep.FIFODropped++
 			compacted = true
 			continue
 		}
-		merged := append([]Message{msgs[0]}, sumMsg)
-		merged = append(merged, msgs[1+k:]...)
-		msgs = merged
+		msgs = replaceIndices(msgs, oldIdx, sumMsg)
 		compacted = true
 	}
-	return msgs, compacted
+	rep.Messages = msgs
+	rep.Compacted = compacted
+	return rep
 }
 
-// TrimContext FIFO 兜底：直接丢弃最旧的非首条消息，直到满足预算。
+// keyEntitiesLost 抽取被压批次的关键实体并核对摘要保真度（增量 F）。
+// 返回：抽取到的实体列表、丢失的实体列表。规则式、零新依赖——只兜"硬信息"
+// （数字/URL/引用专名），不追求全量实体识别；摘要保留全部实体才算通过。
+func keyEntitiesLost(old []Message, summary string) ([]string, []string) {
+	var sb strings.Builder
+	for _, m := range old {
+		sb.WriteString(m.Content)
+		sb.WriteString("\n")
+	}
+	keys := extractKeyEntities(sb.String())
+	if len(keys) == 0 {
+		return nil, nil // 无可抽查实体：不干预
+	}
+	var lost []string
+	for _, k := range keys {
+		if !strings.Contains(summary, k) {
+			lost = append(lost, k)
+		}
+	}
+	return keys, lost
+}
+
+// extractKeyEntities 关键实体抽取（增量 F）：≥2 位数字（含小数/百分比）、URL、
+// 双引号/中文引号包裹的专有名词。regexp 包级编译一次、复用（并发安全）。
+// 只抽 ≥2 位数字：1 位数字几乎都是序号/计数（"第 1 步"、"调用 1 次"）——
+// 抽进来会让抽查把结构噪声当硬信息，造成补注膨胀。
+var (
+	reNumber = regexp.MustCompile(`\d{2,}(?:[.,]\d+)?%?`)
+	reURL    = regexp.MustCompile(`https?://[^\s"'《》]+`)
+	reQuoted = regexp.MustCompile(`["“]([^"”]{1,24})["”]`)
+)
+
+func extractKeyEntities(text string) []string {
+	seen := map[string]bool{}
+	var out []string
+	// 数字：独立成串（避免把时间戳/ID 的每一位拆开——先整串匹配再整体入列）
+	for _, m := range reNumber.FindAllString(text, -1) {
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	for _, m := range reURL.FindAllString(text, -1) {
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	// 引号包裹的专名（如 "订单号 50231" 里的整体）
+	for _, m := range reQuoted.FindAllString(text, -1) {
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// dropIndices 删除指定索引（升序）的消息，返回新切片（不修改原切片）。
+func dropIndices(msgs []Message, idx []int) []Message {
+	drop := make(map[int]bool, len(idx))
+	for _, i := range idx {
+		drop[i] = true
+	}
+	out := make([]Message, 0, len(msgs)-len(idx))
+	for i, m := range msgs {
+		if !drop[i] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// replaceIndices 把指定索引（升序）的消息整体替换为一条消息：
+// 摘要插在第一批被压消息的位置，其余顺序保持。
+func replaceIndices(msgs []Message, idx []int, sub Message) []Message {
+	drop := make(map[int]bool, len(idx))
+	for _, i := range idx {
+		drop[i] = true
+	}
+	out := make([]Message, 0, len(msgs)-len(idx)+1)
+	inserted := false
+	for i, m := range msgs {
+		if i == idx[0] && !inserted {
+			out = append(out, sub)
+			inserted = true
+		}
+		if !drop[i] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// TrimContext FIFO 兜底：直接丢弃最旧的非保护消息，直到满足预算。
 // 仅在摘要压缩仍无法收敛时使用（保底，避免无限膨胀）。
+// 增量 G：跳过 Protected 消息（硬约束/系统提示不在兜底丢弃范围内）。
 func TrimContext(msgs []Message, budget int) []Message {
 	if budget <= 0 {
 		return msgs
 	}
 	for MessagesTokens(msgs) > budget && len(msgs) > 1 {
-		msgs = msgs[1:]
+		dropped := false
+		for i := range msgs {
+			if msgs[i].Protected {
+				continue
+			}
+			msgs = append(msgs[:i], msgs[i+1:]...)
+			dropped = true
+			break
+		}
+		if !dropped {
+			break // 全部受保护：不能再丢，停止
+		}
 	}
 	return msgs
 }

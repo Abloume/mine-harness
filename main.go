@@ -29,7 +29,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -98,6 +98,8 @@ func main() {
 		runDemoWorkflow(*verbose)
 	case "visual-verify":
 		runDemoVisualVerify(*verbose)
+	case "compact-fidelity":
+		runDemoCompactFidelity(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -2154,4 +2156,120 @@ func runDemoVisualVerify(verbose bool) {
 		agent.WithVerbose(verbose),
 	)
 	showResult(a.Run("按 visual-verify 流程验证临时页面的移动端渲染：起服务、截屏、核对、修复、再验证"))
+}
+
+// runDemoCompactFidelity 演示增量 F（压缩保真度抽查）+ 增量 G（硬约束保护层）：
+//
+//	A. 抽取式摘要（Heuristic）保留关键数字 → 保真度抽查通过，摘要正常插入；
+//	B. 自定义"丢实体"摘要器 → 订单号/金额等关键实体全丢 → 抽查判定摘要
+//	   不可信、保留原文（宁超预算不压错），TraceCompact Detail 记录介入；
+//	C. WithHardConstraints 注入受保护消息 → 压缩跳过（Detail 记"跳过受保护
+//	   N 条"），压缩后硬约束仍完整保留（长会话后期仍记得第一轮的禁忌）。
+//
+// JS/TS ↔ Go 差异：自定义摘要器实现 Summarizer 接口（方法集隐式实现，
+// 对应 TS 的 implements）；RunResult.Trace 是增量 A 的产物，demo 里过滤
+// TraceCompact 事件读取压缩详情，相当于 TS 里 filter(type === 'compact')。
+func runDemoCompactFidelity(verbose bool) {
+	fmt.Println("== 增量 F/G 演示：压缩保真度抽查 + 硬约束保护层 ==")
+
+	newLLM := func() *agent.MockLLM {
+		return agent.NewMockLLM([]agent.MockDecision{
+			{ToolName: "get_order", ToolInput: `{"id":"A"}`},
+			{ToolName: "get_order", ToolInput: `{"id":"B"}`},
+			{ToolName: "get_order", ToolInput: `{"id":"C"}`},
+			{ToolName: "get_order", ToolInput: `{"id":"D"}`},
+			{Content: "四个订单已全部处理完成。"},
+		})
+	}
+	showCompactDetail := func(r agent.RunResult, label string) {
+		for _, e := range r.Trace {
+			if e.Type == agent.TraceCompact {
+				fmt.Printf("  [%s] TraceCompact: %s\n", label, e.Detail)
+			}
+		}
+	}
+
+	fmt.Println("\n--- A. 抽取式摘要（Heuristic）：关键数字保留 → 抽查通过 ---")
+	{
+		reg := agent.NewRegistry()
+		reg.Register(agent.Tool{
+			Name:        "get_order",
+			Description: "查询订单详情（返回含订单号/金额/URL 等关键数字）",
+			Execute: func(input string) (string, error) {
+				// 关键数字（订单号/金额）靠前，尾部是长中文描述：
+				// Heuristic 截断只丢尾部描述、关键实体全保留 → 抽查通过
+				return `{"order":50231,"amount":4500,"note":"已处理完成等待确认，收货地址无误，发票已开具并归档，后续流程专人跟进"}`, nil
+			},
+		})
+		a := agent.NewAgent(newLLM(), reg, agent.WithMaxSteps(8), agent.WithTokenBudget(60), agent.WithVerbose(verbose))
+		r := a.Run("依次查询 4 个订单并汇总")
+		showResult(r)
+		showCompactDetail(r, "A")
+	}
+
+	fmt.Println("\n--- B. 丢实体摘要器：关键实体全丢 → 保留原文（宁超预算不压错）---")
+	{
+		reg := agent.NewRegistry()
+		reg.Register(agent.Tool{
+			Name:        "get_order",
+			Description: "查询订单详情",
+			Execute: func(input string) (string, error) {
+				return `{"order":50231,"amount":4500,"note":"已处理完成等待确认，收货地址无误，金额已核对并归档"}`, nil
+			},
+		})
+		// 模拟生成式摘要归纳过头：把订单号/金额全部丢掉
+		a := agent.NewAgent(newLLM(), reg,
+			agent.WithMaxSteps(8), agent.WithTokenBudget(60),
+			agent.WithSummarizer(demoKeyDropSummarizer{}),
+			agent.WithVerbose(verbose),
+		)
+		r := a.Run("依次查询 4 个订单并汇总")
+		showResult(r)
+		showCompactDetail(r, "B")
+	}
+
+	fmt.Println("\n--- C. WithHardConstraints：硬约束不参与压缩，压缩后仍完整保留 ---")
+	{
+		reg := agent.NewRegistry()
+		reg.Register(agent.Tool{
+			Name:        "get_order",
+			Description: "查询订单详情",
+			Execute: func(input string) (string, error) {
+				return `{"order":50231,"amount":4500,"note":"已处理完成等待确认，收货地址无误，金额已核对并归档"}`, nil
+			},
+		})
+		a := agent.NewAgent(newLLM(), reg,
+			agent.WithMaxSteps(8), agent.WithTokenBudget(60),
+			agent.WithHardConstraints([]string{"金额超过 5000 需人工确认后再执行", "禁止删除任何文件"}),
+			agent.WithVerbose(verbose),
+		)
+		r := a.Run("依次查询 4 个订单并汇总")
+		showResult(r)
+		showCompactDetail(r, "C")
+		// 硬约束压缩后仍在历史里（受保护消息不被压缩/FIFO 触碰）
+		kept := false
+		for _, m := range a.History() {
+			if m.Protected && strings.Contains(m.Content, "金额超过 5000") {
+				kept = true
+			}
+		}
+		if kept {
+			fmt.Println("  [C] 硬约束消息压缩后仍完整保留 ✓（长会话后期仍记得第一轮的禁忌）")
+		} else {
+			fmt.Println("  [C] 硬约束消息丢失 ✗")
+		}
+	}
+}
+
+// demoKeyDropSummarizer 演示用"丢实体"摘要器：模拟生成式摘要改写/归纳过头、
+// 把订单号/金额等关键数字全部丢掉（对比 HeuristicSummarizer 抽取式必保留原文）。
+type demoKeyDropSummarizer struct{}
+
+func (demoKeyDropSummarizer) Summarize(msgs []agent.Message) (string, error) {
+	var b strings.Builder
+	for _, m := range msgs {
+		b.WriteString(m.Role)
+		b.WriteString(": 内容已处理\n")
+	}
+	return b.String(), nil
 }

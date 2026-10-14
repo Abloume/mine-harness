@@ -228,6 +228,23 @@ func WithLoopGuard(g *LoopGuard) Option { return func(a *Agent) { a.guard = g } 
 // WithSummarizer 替换默认摘要压缩器（如换成调 LLM 的生成式摘要）。
 func WithSummarizer(s Summarizer) Option { return func(a *Agent) { a.summarizer = s } }
 
+// WithHardConstraints 把用户硬约束注入为受保护的 system 消息（增量 G）：
+// 硬约束常驻提示层、不参与压缩与 FIFO 兜底——长会话后期仍记得第一轮的
+// 禁忌（过敏/禁用动作/红线参数）。注入的消息 Protected=true。
+// 机制归内核（消息标记 + 压缩跳过），注入归宿主（哪条算硬约束由宿主决定）。
+func WithHardConstraints(constraints []string) Option {
+	return func(a *Agent) {
+		if len(constraints) == 0 {
+			return
+		}
+		msg := Message{Role: roleSystem,
+			Content:   "【用户硬约束（长期有效，不参与压缩）】\n" + strings.Join(constraints, "\n"),
+			Protected: true,
+		}
+		a.history = append([]Message{msg}, a.history...)
+	}
+}
+
 // WithApprover 设置审批决策器（human-in-the-loop）。
 // 达到审批阈值的调用若无 approver 会被默认拒绝（fail-closed）。
 func WithApprover(ap Approver) Option { return func(a *Agent) { a.approver = ap } }
@@ -405,11 +422,24 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 				target = a.tokenBudget / 2
 			}
 			before := MessagesTokens(a.history)
-			a.history, _ = CompactContext(a.history, target, a.summarizer)
+			// 增量 F/G：用可观测版本压缩（保真度抽查 + 受保护消息跳过），
+			// 报告里的数字写进轨迹 Detail
+			rep := CompactContextReport(a.history, target, a.summarizer)
+			a.history = rep.Messages
 			after := MessagesTokens(a.history)
-			// 增量 A：上下文压缩进轨迹（Detail 含触发原因与压缩前后估算）
-			a.appendTrace(TraceEvent{Type: TraceCompact, Step: step, Outcome: "compacted",
-				Detail: fmt.Sprintf("token=%d > 预算 %d → 压缩后估算 %d", before, a.tokenBudget, after)})
+			// 增量 A：上下文压缩进轨迹（Detail 含触发原因、压缩前后估算、
+			// 受保护消息数、保真度抽查结果）
+			detail := fmt.Sprintf("token=%d > 预算 %d → 压缩后估算 %d（跳过受保护 %d 条",
+				before, a.tokenBudget, after, rep.SkippedProtected)
+			if rep.FidelityDropped > 0 {
+				detail += fmt.Sprintf("，保真度抽查介入 %d 批（丢失 %d 个关键实体，已补注追回或保留原文）",
+					rep.FidelityDropped, rep.KeysLost)
+			}
+			if rep.FIFODropped > 0 {
+				detail += fmt.Sprintf("，兜底 FIFO %d 批", rep.FIFODropped)
+			}
+			detail += "）"
+			a.appendTrace(TraceEvent{Type: TraceCompact, Step: step, Outcome: "compacted", Detail: detail})
 			if a.verbose {
 				if a.lastUsageTokens > 0 {
 					log.Printf("[step %d] 上下文压缩：服务端 usage=%d > 预算 %d，压缩后估算 token=%d",

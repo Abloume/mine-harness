@@ -27,6 +27,12 @@ type Message struct {
 	Content    string
 	ToolCallID string     // tool 角色：关联的工具调用 id（真实 API 必需）
 	ToolCalls  []ToolCall // assistant 角色：本次请求的工具调用（可为多个，并行调用）
+	// 增量 G · 硬约束保护层：Protected 消息不参与上下文压缩与 FIFO 兜底。
+	// 用户硬约束（过敏禁忌/禁用动作/红线参数）常驻提示层、长期有效——
+	// 压缩只发生在非保护消息上，防止"第 15 轮忘了第 1 轮的禁忌"。
+	// 注意：摘要消息不设 Protected（历史摘要允许被再压缩/合并）；
+	// 首条 system 提示由压缩逻辑无条件保留（msgs[0]）。
+	Protected bool
 }
 
 // ToolCall 表示模型请求调用某个工具。
