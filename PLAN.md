@@ -278,17 +278,30 @@
 > 现状：Agent 只有单次 Run + StepRecord 账本，任务边界=一次对话。
 
 **做什么**
-- [ ] 任务模型（内核）：Task 结构（ID / 目标 / 状态 / 父任务 / 依赖集），持久化复用 internal/memory
-- [ ] 依赖图：任务注册 DAG，完成态传播（子任务全 done → 父任务可 done；依赖未就绪 → blocked）
-- [ ] 宿主入口：TaskStore 接入 Run（随 step 更新任务状态），机制归内核、宿主决定任务来源
-- [ ] 与增量 A 打通：轨迹 TraceTask 事件（任务创建 / 完成 / 依赖阻塞）
-- [ ] 配套 `-demo task-graph`：父任务拆 3 个子任务（2 个无依赖可并行、1 个依赖前置）→ 依赖门控 + 汇总
+- [x] 任务模型（内核 task.go）：Task 结构（ID / 目标 / 状态 / 父任务 / 依赖集 / Children 反向索引）
+- [x] 依赖图：Register 原子注册（ID 唯一 / 前置已注册 / 环路检测）+ UpdateDeps 动态改依赖；
+      完成态传播（子任务全 done → 父任务自动 done，递归向上）；依赖未就绪 → IsBlocked / Schedulable 派生门控
+- [x] 宿主入口：WithTaskGraph Option——Run 开始 MarkRunning(task)、completed 时 MarkDone(task)，
+      中止/取消不标 done（任务保持原状态可重试）；sink 未接入前事件缓冲回放（注册事件不丢）
+- [x] 与增量 A 打通：轨迹 TraceTask 事件（registered / running / done / blocked / deps-updated）
+- [x] 配套 `-demo task-graph`：A 段纯 TaskGraph 编排（release 拆 t1/t2 可并行 + t3 依赖前置 →
+      门控 → 解除 → 传播 release done）；B 段 mock agent 带 WithTaskGraph 跑 Run（t1 自动 done + 轨迹事件）
+      （已落地：README demo 场景数 32→33，main.go 头部注释同步）
 
 **Go 练习点**
-- 图结构（邻接表 / 入度）+ 拓扑排序；状态机（pending → running → done / blocked）
+- 图结构：map 邻接表（Depends 正向 / Children 反向索引）+ 递归 DFS 环路检测
+  （JS/TS ↔ Go：递归闭包需先声明 var 再赋值；map 遍历无序 → order 切片保证稳定输出）
+- 状态机（pending → running → done / blocked；blocked 为依赖派生而非独立字段）；
+  sync.Mutex 防并行领取数据竞争（JS 单线程无此顾虑）
 
 **验证**
-- [ ] 单测：DAG 注册、依赖未就绪阻塞、子任务完成传播父任务、环路检测
+- [x] 单测 6 个全绿：RegisterAndCycle（重复/前置缺失/UpdateDeps 环/拒绝后状态不被写入）、
+      BlockedAndSchedulable（初始 t1,t2 可调度、t3 门控）、Propagation（t1→t3 仍阻塞 →
+      t2→t3 解除 → t3 done → release 自动 done）、MarkRunningIdempotent、
+      AgentHooks（Run completed → 任务 done + 3 条 TraceTask 事件）、
+      AgentAbortKeepsPending（脚本耗尽中止 → 任务保持 running、无 done 事件）
+- [x] 既有测试全绿（无行为回退）；`go run . -demo task-graph` 端到端输出符合预期
+- [ ] 持久化复用 internal/memory（任务图落盘/恢复——当前内存态，宿主可自行持久化）
 
 ### 增量 I · hooks 扩展系统（Lifecycle Hooks）
 

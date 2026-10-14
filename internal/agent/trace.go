@@ -35,6 +35,7 @@ const (
 	TraceSkill    = "skill"    // load_skill / read_skill_ref 决策：outcome = loaded/rejected/...
 	TraceCompact  = "compact"  // 上下文压缩：Detail 含触发原因与压缩前后估算
 	TraceCancel   = "cancel"   // 取消/补偿收尾：Detail 含终态
+	TraceTask     = "task"     // 任务系统（增量 H）：outcome = registered/running/done/blocked
 )
 
 // 工具调用结果分类（TraceTool.Outcome 取值）。

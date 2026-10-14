@@ -1,5 +1,5 @@
-// mine-harness 入口：二十八个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索 / 长期记忆关键召回"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall
+// mine-harness 入口：三十三个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索 / 长期记忆关键召回 / 结构化轨迹导出 / 开发工作流 Skill / 前端视觉验证 / 压缩保真度抽查 + 硬约束保护层 / 任务系统 + 依赖图"。
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity | task-graph
 package main
 
 import (
@@ -29,7 +29,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity | task-graph")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -100,6 +100,8 @@ func main() {
 		runDemoVisualVerify(*verbose)
 	case "compact-fidelity":
 		runDemoCompactFidelity(*verbose)
+	case "task-graph":
+		runDemoTaskGraph(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -2272,4 +2274,79 @@ func (demoKeyDropSummarizer) Summarize(msgs []agent.Message) (string, error) {
 		b.WriteString(": 内容已处理\n")
 	}
 	return b.String(), nil
+}
+
+// runDemoTaskGraph 演示增量 H（任务系统 + 依赖图）：
+//
+//	A 段 · 纯 TaskGraph 编排：父任务 release 拆 3 个子任务——
+//	   t1 改代码 / t2 写文档（无依赖，可并行），t3 跑测试（依赖 t1+t2）。
+//	   演示依赖门控（t3 初始 blocked）、可调度查询、完成态传播（子任务
+//	   全 done → release 自动 done）。
+//	B 段 · 与 Agent.Run 打通：带 WithTaskGraph 的 mock agent 跑一次 Run，
+//	   开始标 running、completed 自动 done，TraceTask 事件进入轨迹。
+func runDemoTaskGraph(verbose bool) {
+	fmt.Println("== 增量 H 演示：任务系统 + 依赖图（Task Graph）==")
+
+	// ---- A 段：纯 TaskGraph 编排 ----
+	g := agent.NewTaskGraph()
+	must := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	must(g.Register("release", "发布 v2.0", ""))
+	must(g.Register("t1", "改代码", "release"))
+	must(g.Register("t2", "写文档", "release"))
+	must(g.Register("t3", "跑测试", "release", "t1", "t2"))
+
+	fmt.Println("\n[A] 注册 4 个任务：release 父任务 + t1/t2 可并行 + t3 依赖 t1+t2")
+	fmt.Print(g.Dump())
+
+	fmt.Println("\n[A] 初始可调度（依赖全就绪）:", g.Schedulable())
+	fmt.Println("[A] t3 依赖未就绪 → IsBlocked =", g.IsBlocked("t3"))
+
+	// 模拟并行执行：先并行领取 t1、t2（Schedulable 只有它俩）
+	fmt.Println("\n[A] 领取并执行 t1、t2（并行）→ 均 done")
+	g.MarkRunning("t1")
+	g.MarkRunning("t2")
+	g.MarkDone("t1")
+	fmt.Println("[A] t1 done 后：t3 仍 blocked =", g.IsBlocked("t3"), "；可调度 =", g.Schedulable())
+	g.MarkDone("t2")
+	fmt.Println("[A] t2 done 后：t3 解除门控 =", !g.IsBlocked("t3"), "；可调度 =", g.Schedulable())
+
+	fmt.Println("\n[A] 领取并执行 t3 → done")
+	g.MarkRunning("t3")
+	g.MarkDone("t3")
+	st, _ := g.Status("release")
+	fmt.Printf("[A] 所有子任务完成 → 完成态传播：release 状态 = %s\n", st)
+
+	// ---- B 段：与 Agent.Run 打通 ----
+	fmt.Println("\n[B] Agent 接入：mock agent 跑 Run(\"t1\")，Run 开始标 running、completed 自动 done")
+	g2 := agent.NewTaskGraph()
+	must(g2.Register("t1", "查询天气", ""))
+	reg := agent.NewRegistry()
+	reg.Register(agent.Tool{
+		Name:     "get_weather",
+		BaseRisk: agent.RiskNone,
+		Execute:  func(input string) (string, error) { return "晴 24 度", nil },
+	})
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolCalls: []agent.ToolCall{{ID: "c1", Name: "get_weather", Input: `{"city":"北京"}`}}},
+		{Content: "北京晴 24 度"},
+	})
+	a := agent.NewAgent(llm, reg, agent.WithMaxSteps(3), agent.WithTaskGraph(g2))
+	res := a.Run("t1")
+	fmt.Printf("[B] Run 结果：status=%s，任务 t1 状态=%s\n", res.Status, mustStatus(g2, "t1"))
+	fmt.Println("[B] 轨迹中的 TraceTask 事件：")
+	for _, ev := range res.Trace {
+		if ev.Type == agent.TraceTask {
+			fmt.Printf("    · %s: %s（%s）\n", ev.Type, ev.Outcome, ev.Name)
+		}
+	}
+}
+
+// mustStatus 查询任务状态（demo 用，注册必成功）。
+func mustStatus(g *agent.TaskGraph, id string) string {
+	st, _ := g.Status(id)
+	return st
 }

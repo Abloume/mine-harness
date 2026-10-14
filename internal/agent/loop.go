@@ -204,6 +204,11 @@ type Agent struct {
 	trace []TraceEvent
 	model string
 
+	// 增量 H · 任务系统：taskGraph 是宿主注入的任务图（nil = 未启用）。
+	// Run 开始把 task 标记 running，completed 时标记 done——一次 Run 即一个
+	// 任务的执行生命周期；父子分解 / 依赖门控 / 完成传播由 TaskGraph 负责。
+	taskGraph *TaskGraph
+
 	history []Message
 }
 
@@ -313,6 +318,18 @@ func WithSessionID(id string) Option {
 	return func(a *Agent) { a.sessionID = id }
 }
 
+// WithTaskGraph 接入任务系统（增量 H）：Run 开始把 task 标 running、
+// completed 时标 done，并把 TaskGraph 的状态变更写入轨迹（TraceTask）。
+// 机制归内核：TaskGraph 不依赖 Agent，Agent 通过 Option 单向接入。
+func WithTaskGraph(g *TaskGraph) Option {
+	return func(a *Agent) {
+		a.taskGraph = g
+		if g != nil {
+			g.SetTraceSink(func(ev TraceEvent) { a.appendTrace(ev) })
+		}
+	}
+}
+
 // NewAgent 构造一个 Agent，默认 maxSteps=10、budget=4096、verbose=false。
 func NewAgent(llm LLM, registry *Registry, opts ...Option) *Agent {
 	a := &Agent{
@@ -368,6 +385,12 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 	defer func() {
 		res.Ledger = a.ledger
 		res.Compensations = a.compensations
+		// 增量 H：completed 时把本次 Run 对应的任务标 done（触发父任务传播）；
+		// 中止/取消不标 done——任务保持原状态，宿主可重试或转人工。
+		// 注意顺序：MarkDone 产生 TraceTask 事件，须先于 Trace 快照。
+		if a.taskGraph != nil && res.Status == StatusCompleted {
+			a.taskGraph.MarkDone(task)
+		}
 		res.Trace = a.trace // 增量 A：轨迹随结果暴露（默认产物，宿主可落盘为 JSON）
 		a.settleMemory(res.Status)
 	}()
@@ -396,6 +419,12 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 	// 与 WithInitialHistory 对照：阶段一恢复"整历史"，本步只召回"关键记忆"——
 	// 跨会话的轻量延续，token 成本与历史长度无关。
 	a.recallMemory(task)
+
+	// 增量 H：Run 开始即领取任务（pending → running）；未注册的 task 字符串
+	// 被 TaskGraph 幂等忽略，不影响无任务图/未注册的既有行为。
+	if a.taskGraph != nil {
+		a.taskGraph.MarkRunning(task)
+	}
 
 	for step := 1; step <= a.maxSteps; step++ {
 		// 安全检查点①：外部取消后不开始新步骤（LLM 调用期间到达的
