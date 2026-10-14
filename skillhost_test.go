@@ -158,4 +158,22 @@ func TestRepoSkillsDiscoverable(t *testing.T) {
 			}
 		}
 	}
+
+	// 规范型 Skill（fe-practices）：只要求被发现 + 按「场景/规则/理由/反例」组织
+	m, ok := got["fe-practices"]
+	if !ok {
+		t.Fatalf("skills/ 应发现 fe-practices（实际清单: %v）", got)
+	}
+	if m.Description == "" {
+		t.Error("fe-practices 的 description 不能为空")
+	}
+	body, ok := p.LoadSkill("fe-practices")
+	if !ok || body == "" {
+		t.Fatal("LoadSkill(fe-practices) 应命中正文")
+	}
+	for _, kw := range []string{"场景", "规则", "理由", "反例"} {
+		if !strings.Contains(body, kw) {
+			t.Errorf("fe-practices 正文缺少「%s」小节（规范型 Skill 硬要求）", kw)
+		}
+	}
 }
