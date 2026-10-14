@@ -2584,7 +2584,7 @@ func runDemoSelfEvolve(verbose bool) {
 	results := evolve.EvolveLoop(runSuite, v0Skill, 5, func(round int, newSkill string) {
 		// 每轮进化后切换 mock 行为版本（模拟 Skill 内容变化导致 Agent 行为变化）
 		skillVersion = round
-	})
+	}, evolve.RuleDiagnostician{})
 
 	// ---- 打印每轮结果 ----
 	fmt.Println("\n--- 进化过程 ---")

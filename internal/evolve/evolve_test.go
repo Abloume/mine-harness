@@ -190,7 +190,7 @@ func TestE2EEvolve(t *testing.T) {
 
 	currentSkill := "# 修复 bug\n\n## 流程\n1. 复现"
 
-	result := Evolve(report, currentSkill)
+	result := Evolve(report, currentSkill, RuleDiagnostician{})
 
 	// 应识别出 2 条失败（knowledge + tool）
 	if len(result.Failures) != 2 {
@@ -231,7 +231,7 @@ func TestEvolveLoopStopsWhenNoFailures(t *testing.T) {
 		}
 	}
 
-	results := EvolveLoop(runSuite, "# v0 skill", 5, nil)
+	results := EvolveLoop(runSuite, "# v0 skill", 5, nil, RuleDiagnostician{})
 
 	if len(results) != 2 {
 		t.Errorf("应跑 2 轮后提前结束，实际 %d 轮", len(results))
@@ -259,7 +259,7 @@ func TestEvolveLoopCallsOnEvolved(t *testing.T) {
 		if !strings.Contains(newSkill, "自进化 v1") {
 			t.Errorf("回调的 newSkill 应包含自进化标记")
 		}
-	})
+	}, RuleDiagnostician{})
 
 	if len(calledRounds) != 3 {
 		t.Errorf("onEvolved 应被调用 3 次（每轮都有失败，跑满 maxRounds），实际 %d 次", len(calledRounds))
@@ -438,7 +438,7 @@ func TestEvolveLoopDetectsRegression(t *testing.T) {
 		}
 	}
 
-	results := EvolveLoop(runSuite, "# v0", 4, nil)
+	results := EvolveLoop(runSuite, "# v0", 4, nil, RuleDiagnostician{})
 
 	if len(results) < 2 {
 		t.Fatalf("应至少跑 2 轮，实际 %d 轮", len(results))
@@ -478,7 +478,7 @@ func TestEvolveLoopDetectsImprovement(t *testing.T) {
 		}
 	}
 
-	results := EvolveLoop(runSuite, "# v0", 3, nil)
+	results := EvolveLoop(runSuite, "# v0", 3, nil, RuleDiagnostician{})
 
 	if len(results) < 2 {
 		t.Fatalf("应至少跑 2 轮，实际 %d 轮", len(results))

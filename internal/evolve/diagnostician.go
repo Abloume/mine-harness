@@ -80,3 +80,19 @@ func countByCategory(failures []FailureRecord) map[Category]int {
 	}
 	return counts
 }
+
+// RuleDiagnostician 是规则版诊断器——按类别计数追加通用模板。
+//
+// 它实现 Diagnostician 接口，跟 LLMDiagnostician 可互换。
+// 零成本、确定性、不依赖外部服务——适合单元测试和兜底。
+//
+// JS/TS ↔ Go 差异：TS 里常用 class 实现策略接口；
+// Go 用空结构体 + 方法集，零值就能用，不需要构造函数。
+type RuleDiagnostician struct{}
+
+// Diagnose 实现 Diagnostician 接口：调用原有的规则版 Diagnose 函数。
+func (RuleDiagnostician) Diagnose(failures []FailureRecord, currentSkill string) ([]SuggestedChange, error) {
+	// currentSkill 在规则版里用不上（它只按类别计数），
+	// 但接口签名要求传，这里忽略——跟 LLM 版的区别就是 LLM 会读 Skill 内容。
+	return Diagnose(failures), nil
+}

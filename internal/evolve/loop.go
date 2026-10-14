@@ -38,6 +38,7 @@ func EvolveLoop(
 	initialSkill string,
 	maxRounds int,
 	onEvolved func(round int, newSkill string),
+	diag Diagnostician,
 ) []RoundResult {
 	results := []RoundResult{}
 	currentSkill := initialSkill
@@ -45,7 +46,7 @@ func EvolveLoop(
 
 	for i := 0; i < maxRounds; i++ {
 		report := runSuite()
-		evo := Evolve(report, currentSkill)
+		evo := Evolve(report, currentSkill, diag)
 		score := report.PassRate()
 
 		// 回归检测：跟上前一轮分数对比

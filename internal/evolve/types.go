@@ -62,3 +62,17 @@ type EvolutionReport struct {
 	Suggestions  []SuggestedChange // 诊断出的改写建议
 	NewSkillBody string            // 改写后的 SKILL.md 全文（v_n+1）
 }
+
+// Diagnostician 是诊断器接口——把失败记录转成改写建议。
+//
+// 有两个实现：
+//   - RuleDiagnostician：规则版，按类别计数追加通用模板（零成本、兜底）
+//   - LLMDiagnostician：LLM 版，读 Skill 内容后给出针对性建议（主路径）
+//
+// 调用方想选哪个就注入哪个，Evolve 不关心具体实现。
+//
+// JS/TS ↔ Go 差异：TS 里常用策略模式（strategy pattern）+ 函数注入；
+// Go 用接口实现同一目的，编译期类型安全，运行时可替换。
+type Diagnostician interface {
+	Diagnose(failures []FailureRecord, currentSkill string) ([]SuggestedChange, error)
+}
