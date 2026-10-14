@@ -21,6 +21,7 @@ import (
 
 	"mine-harness/internal/agent"
 	"mine-harness/internal/cmdagent"
+	"mine-harness/internal/dag"
 	"mine-harness/internal/eval"
 	"mine-harness/internal/evolve"
 	"mine-harness/internal/figmaagent"
@@ -109,6 +110,8 @@ func main() {
 		runDemoIntentRoute(*verbose)
 	case "self-evolve":
 		runDemoSelfEvolve(*verbose)
+	case "dag":
+		runDemoDAG(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -2617,4 +2620,119 @@ func runDemoSelfEvolve(verbose bool) {
 	fmt.Println(strings.Repeat("─", 50))
 	fmt.Println(final.NewSkillBody)
 	fmt.Println(strings.Repeat("─", 50))
+}
+
+// runDemoDAG 演示 Plan-and-Execute DAG 执行器：
+// 模拟"分析支付接口变慢原因"的 6 步任务，展示三层 DAG 并行执行。
+//
+// 场景设计（对应文章里的例子）：
+//   第一层（4 个并行）：查延迟监控 / 查依赖健康度 / 查发布记录 / 查错误日志
+//   第二层（等齐）：分析延迟与错误的时间相关性
+//   第三层（汇总）：生成报告
+//
+// 故意让"查发布记录"这步失败，展示失败隔离——
+// 其他分支照跑，后继节点标记 skipped。
+func runDemoDAG(verbose bool) {
+	fmt.Println("=== Plan-and-Execute DAG 执行器演示 ===")
+	fmt.Println("场景：分析昨天支付接口变慢的原因，生成报告")
+	fmt.Println()
+
+	// 1. 构造 DAG：6 个节点，三层
+	graph := dag.Graph{
+		Nodes: []dag.Node{
+			{ID: "1", Action: "查支付接口延迟监控", Tool: "query_metrics", Params: `{"service":"payment","metric":"latency"}`},
+			{ID: "2", Action: "查依赖服务健康度", Tool: "query_health", Params: `{"deps":["db","redis","mq"]}`},
+			{ID: "3", Action: "查昨天的发布记录", Tool: "query_deploys", Params: `{"date":"yesterday"}`},
+			{ID: "4", Action: "查错误日志", Tool: "query_logs", Params: `{"level":"error","date":"yesterday"}`},
+			{ID: "5", Action: "分析延迟与错误的时间相关性", Tool: "analyze_correlation", Params: `{"window":"24h"}`},
+			{ID: "6", Action: "汇总生成报告", Tool: "gen_report", Params: `{"title":"支付接口变慢分析"}`},
+		},
+		Edges: []dag.Edge{
+			// 前 4 步都要等齐，第 5 步才能跑
+			{From: "1", To: "5"},
+			{From: "2", To: "5"},
+			{From: "3", To: "5"},
+			{From: "4", To: "5"},
+			// 第 5 步完成后才能出报告
+			{From: "5", To: "6"},
+		},
+	}
+
+	// 2. 校验 + 拓扑排序
+	fmt.Println("--- 1. 校验 DAG + 拓扑排序 ---")
+	layers, err := graph.TopoSort()
+	if err != nil {
+		fmt.Println("DAG 校验失败:", err)
+		return
+	}
+	fmt.Printf("共 %d 层：\n", len(layers))
+	for i, layer := range layers {
+		fmt.Printf("  第 %d 层：%v（%d 个并行节点）\n", i+1, layer, len(layer))
+	}
+	fmt.Println()
+
+	// 3. 注册工具（模拟执行函数）
+	executor := dag.NewExecutor(3) // 最多 3 个并发
+	executor.Register("query_metrics", func(params string) (string, error) {
+		fmt.Println("    [模拟] 查询延迟监控数据...")
+		return `{"p99":"850ms","p95":"420ms","baseline":"200ms"}`, nil
+	})
+	executor.Register("query_health", func(params string) (string, error) {
+		fmt.Println("    [模拟] 查询依赖服务健康度...")
+		return `{"db":"healthy","redis":"healthy","mq":"degraded"}`, nil
+	})
+	executor.Register("query_deploys", func(params string) (string, error) {
+		// 故意让这步失败——模拟"发布记录 API 超时"
+		return "", fmt.Errorf("api timeout: deploy service unavailable")
+	})
+	executor.Register("query_logs", func(params string) (string, error) {
+		fmt.Println("    [模拟] 查询错误日志...")
+		return `{"error_count":127,"top_error":"timeout"}`, nil
+	})
+	executor.Register("analyze_correlation", func(params string) (string, error) {
+		fmt.Println("    [模拟] 分析时间相关性...")
+		return `{"finding":"mq 降级时段与延迟飙升时段高度重合"}`, nil
+	})
+	executor.Register("gen_report", func(params string) (string, error) {
+		fmt.Println("    [模拟] 生成报告...")
+		return `# 支付接口变慢分析报告\n\n结论：MQ 服务降级导致支付接口延迟从 200ms 飙升到 850ms。`, nil
+	})
+
+	// 4. 执行 DAG
+	fmt.Println("--- 2. 执行 DAG ---")
+	nodeMap, err := executor.Run(&graph)
+	if err != nil {
+		fmt.Println("执行失败:", err)
+		return
+	}
+	fmt.Println()
+
+	// 5. 打印最终结果
+	fmt.Println("--- 3. 执行结果汇总 ---")
+	for id := range nodeMap {
+		node := nodeMap[id]
+		switch node.Status {
+		case dag.StatusSuccess:
+			fmt.Printf("  ✅ %s: success\n", id)
+		case dag.StatusFailed:
+			fmt.Printf("  ❌ %s: failed（%v）\n", id, node.Err)
+		case dag.StatusSkipped:
+			fmt.Printf("  ⏭️  %s: skipped\n", id)
+		}
+	}
+
+	// 6. 展示最终节点的输出
+	fmt.Println("\n--- 4. 最终报告内容 ---")
+	if nodeMap["6"].Status == dag.StatusSuccess {
+		fmt.Println(nodeMap["6"].Output)
+	} else {
+		fmt.Printf("报告节点状态：%s\n", nodeMap["6"].Status)
+	}
+
+	// 7. 总结
+	fmt.Println("\n--- 关键观察 ---")
+	fmt.Println("• 前 4 步并行执行（第 1 层），不是串行 6 步")
+	fmt.Println("• 第 3 步（查发布记录）失败，后继节点标记 skipped")
+	fmt.Println("• 其他分支不受影响，第 5、6 步照样跑完")
+	fmt.Println("• 这就是 DAG 相比 for 循环的优势：并行加速 + 失败隔离")
 }
