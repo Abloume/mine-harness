@@ -189,18 +189,30 @@ func (r *customReflector) Check(answer string, task string, history []Message) R
 	}
 }
 
-// cleanJSON 清理模型返回的 JSON——去掉 markdown 代码块标记。
+// cleanJSON 清理模型返回的 JSON——从混杂文本中提取 JSON 代码块。
+//
+// 模型经常会在 JSON 前面加一段说明文字，比如：
+// "我将按照要求整理...：```json {...} ```"
+// 我们需要找到 ```json 和 ``` 之间的内容。
 func cleanJSON(raw string) string {
 	s := strings.TrimSpace(raw)
 
-	if strings.HasPrefix(s, "```") {
-		if idx := strings.Index(s, "\n"); idx >= 0 {
-			s = s[idx+1:]
+	// 找 ```json 或 ``` 开头的代码块
+	start := strings.Index(s, "```json")
+	if start < 0 {
+		start = strings.Index(s, "```")
+	}
+	if start >= 0 {
+		// 跳过 ```json 或 ``` 这一行
+		if idx := strings.Index(s[start:], "\n"); idx >= 0 {
+			s = s[start+idx+1:]
 		}
 	}
 
-	if strings.HasSuffix(s, "```") {
-		s = strings.TrimSuffix(s, "```")
+	// 找结尾的 ```
+	end := strings.LastIndex(s, "```")
+	if end >= 0 {
+		s = s[:end]
 	}
 
 	return strings.TrimSpace(s)

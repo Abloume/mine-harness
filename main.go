@@ -3112,13 +3112,20 @@ ORDER BY dt DESC;
 	fmt.Println("• 这就是文章里说的\"Reflection 要有明确标准，不是让模型自嗨\"")
 }
 
-// mockStandardGenLLM 是标准生成器的 mock LLM。
-type mockStandardGenLLM struct {
-	response string
+// doubaoStandardGenLLM 是把豆包 API 适配成 reflection.StandardGenLLM 的适配器。
+type doubaoStandardGenLLM struct {
+	llm agent.LLM
 }
 
-func (m *mockStandardGenLLM) Generate(prompt string) (string, error) {
-	return m.response, nil
+func (m *doubaoStandardGenLLM) Generate(prompt string) (string, error) {
+	msgs := []agent.Message{
+		{Role: "user", Content: prompt},
+	}
+	resp, err := m.llm.Chat(msgs, nil)
+	if err != nil {
+		return "", err
+	}
+	return resp.Content, nil
 }
 
 // runDemoReflectionGenerator 演示标准生成器：让 LLM 根据任务自动生成检查标准。
@@ -3129,68 +3136,44 @@ func (m *mockStandardGenLLM) Generate(prompt string) (string, error) {
 //   3. 展示生成的标准
 //   4. 用这个标准检查回答
 func runDemoReflectionGenerator(verbose bool) {
-	fmt.Println("=== Reflection 标准生成器：LLM 自动生成验收标准 ===")
+	loadEnv(".env")
+	key := os.Getenv("ARK_API_KEY")
+	if key == "" {
+		fmt.Println("缺少 ARK_API_KEY：export ARK_API_KEY=xxx 或写入项目根 .env（已被 git 忽略）")
+		return
+	}
+	model := os.Getenv("DOUBAO_MODEL")
+	if model == "" {
+		model = "doubao-seed-2-1-lite-260915"
+	}
+
+	fmt.Println("=== Reflection 标准生成器：LLM 自动生成验收标准（真实豆包 API）===")
 	fmt.Println()
 
 	// 1. 用户任务
 	task := "写一个登录页面组件（React + TypeScript）"
-	userNotes := "要兼容 Chrome 最新版，性能要好"
+	userNotes := "要兼容 Chrome 最新版，性能要好，有表单校验"
 
 	fmt.Println("--- 1. 用户任务 ---")
 	fmt.Printf("任务：%s\n", task)
 	fmt.Printf("特殊要求：%s\n\n", userNotes)
 
-	// 2. mock LLM 生成标准
-	fmt.Println("--- 2. LLM 生成检查标准 ---")
+	// 2. 调用真实豆包 API 生成标准
+	fmt.Println("--- 2. 调用豆包生成检查标准（请稍等几秒）---")
 
-	mockLLM := &mockStandardGenLLM{
-		response: `{
-  "task_type": "React 前端组件开发",
-  "summary": "登录页必须能用、体验好、性能不卡顿",
-  "required": [
-    {
-      "id": "req-1",
-      "dimension": "正确性",
-      "description": "表单提交后有 loading 态，防止重复提交",
-      "pass_if": "代码中有 loading 状态，提交中按钮 disabled"
-    },
-    {
-      "id": "req-2",
-      "dimension": "正确性",
-      "description": "表单校验：空邮箱/错误格式要提示",
-      "pass_if": "代码中有邮箱格式校验，错误时显示提示信息"
-    },
-    {
-      "id": "req-3",
-      "dimension": "安全性",
-      "description": "密码不能明文传输",
-      "pass_if": "代码中有密码加密或 hash 处理"
-    }
-  ],
-  "quality": [
-    {
-      "id": "q-1",
-      "dimension": "性能",
-      "description": "首屏加载速度快",
-      "pass_if": "有代码分割或懒加载，首屏 JS < 100KB"
-    },
-    {
-      "id": "q-2",
-      "dimension": "体验",
-      "description": "错误提示友好",
-      "pass_if": "错误提示是人话，不是技术报错"
-    },
-    {
-      "id": "q-3",
-      "dimension": "可访问性",
-      "description": "label 关联 input",
-      "pass_if": "每个 input 都有对应的 label 或 aria-label"
-    }
-  ]
-}`,
-	}
+	provider := agent.NewOpenAICompatibleProvider(
+		"https://ark.cn-beijing.volces.com/api/v3",
+		model,
+		key,
+	)
+	// 标准生成需要更多 token + 更长超时，关闭 thinking 加速
+	provider.MaxTokens = 4096
+	provider.Client = &http.Client{Timeout: 120 * time.Second}
+	provider.DisableThinking = true
 
-	generator := reflection.NewStandardGenerator(mockLLM)
+	llm := &doubaoStandardGenLLM{llm: provider}
+	generator := reflection.NewStandardGenerator(llm)
+
 	standards, err := generator.Generate(task, userNotes)
 	if err != nil {
 		fmt.Println("生成失败:", err)
@@ -3242,7 +3225,7 @@ export default function LoginPage() {
 
 	// 4. 总结
 	fmt.Println("\n\n--- 关键观察 ---")
-	fmt.Println("• 标准不是硬编码的——是 LLM 根据任务自动生成的")
+	fmt.Println("• 标准不是硬编码的——是真实豆包 API 根据任务自动生成的")
 	fmt.Println("• 用户特殊要求会影响标准（比如\"要兼容 Chrome\"）")
 	fmt.Println("• 必过项是底线，质量项是加分")
 	fmt.Println("• 这就是\"标准驱动\"：先想清楚什么叫好，再动手做")
