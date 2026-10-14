@@ -2480,19 +2480,17 @@ func runDemoIntentRoute(verbose bool) {
 // runDemoSelfEvolve 演示"自进化 Skill"闭环：
 // 从评测失败（Bad Case）→ 四维归因 → 诊断 Skill 缺陷 → 自动改写 Skill 文本。
 //
-// 对应 SkillForge 论文（arXiv:2604.08618）的最小切片：
-//   - v0：一个"有缺陷"的 fix-bug Skill（缺工具调用指引），Agent 跑完不调测试工具
-//   - 跑评测 → 收集失败 → evolve.Evolve → 产出 v1 Skill 草稿
-//   - v1：Agent 补上了工具调用（模拟 Skill 进化后的行为）
-//   - 再跑评测 → 对比 v0 vs v1 通过率
+// 对应 SkillForge 论文（arXiv:2604.08618）的多轮进化实验：
+//   - v0：缺工具调用指引 → Agent 不跑测试（tool 类失败）
+//   - v1：补上了工具调用，但回答缺关键信息（knowledge 类失败）
+//   - v2：全好了 → 收敛
 //
-// JS/TS ↔ Go 差异：TS 里闭包捕获外部变量直接用 let；
-// Go 里闭包同样捕获，但要注意变量作用域——这里用 skillVersion 变量
-// 控制 mock 脚本行为，模拟"Skill 内容变化导致 Agent 行为变化"。
+// 用 EvolveLoop 自动跑多轮，每轮 onEvolved 回调里切换 mock 行为版本。
+// 展示论文里"分数单调递增、每轮都有收益"的效果。
 func runDemoSelfEvolve(verbose bool) {
-	fmt.Println("== 自进化 Skill 演示：从 Bad Case 到新 Skill ==")
+	fmt.Println("== 自进化 Skill 多轮演示：每轮解决一类问题 ==")
 
-	// v0：有缺陷的 Skill——缺"修完必须跑测试"的工具调用指引
+	// v0：有缺陷的 Skill——缺工具调用指引、缺回答要点
 	v0Skill := `# 修复 bug
 
 ## 何时加载
@@ -2505,8 +2503,9 @@ func runDemoSelfEvolve(verbose bool) {
 `
 
 	// skillVersion 控制 mock 脚本行为：
-	//   0 = v0（不调 run_tests，模拟 Skill 缺指引）
-	//   1 = v1（调 run_tests，模拟 Skill 进化后补上了指引）
+	//   0 = v0（不调 run_tests，回答缺"验证"关键词）→ tool 类失败
+	//   1 = v1（调了 run_tests，但回答还缺"验证"）→ knowledge 类失败
+	//   2 = v2（调了 run_tests，回答有"验证"）→ 全过
 	skillVersion := 0
 
 	mkFixBugAgent := func() *agent.Agent {
@@ -2528,20 +2527,29 @@ func runDemoSelfEvolve(verbose bool) {
 		})
 
 		var decisions []agent.MockDecision
-		if skillVersion == 0 {
-			// v0：修完就直接回答，不跑测试（Skill 里没指引要跑测试）
+		switch skillVersion {
+		case 0:
+			// v0：不跑测试（Skill 缺工具调用指引），回答缺"验证"
 			decisions = []agent.MockDecision{
 				{ToolName: "read_file", ToolInput: `{"path":"main.go"}`},
 				{ToolName: "edit_file", ToolInput: `{"path":"main.go","action":"replace"}`},
 				{Content: "已修复 add 函数的减法 bug，现在返回 a+b。"},
 			}
-		} else {
-			// v1：修完主动跑测试验证（Skill 进化后补上了工具调用指引）
+		case 1:
+			// v1：补了跑测试（tool 类解决了），但回答还缺"验证"关键词
 			decisions = []agent.MockDecision{
 				{ToolName: "read_file", ToolInput: `{"path":"main.go"}`},
 				{ToolName: "edit_file", ToolInput: `{"path":"main.go","action":"replace"}`},
 				{ToolName: "run_tests", ToolInput: `{"cmd":"go test ./..."}`},
-				{Content: "已修复 add 函数的减法 bug，测试全部通过（coverage 85%）。"},
+				{Content: "已修复 add 函数的减法 bug。"},
+			}
+		default:
+			// v2：全好了——跑了测试，回答也有"验证"
+			decisions = []agent.MockDecision{
+				{ToolName: "read_file", ToolInput: `{"path":"main.go"}`},
+				{ToolName: "edit_file", ToolInput: `{"path":"main.go","action":"replace"}`},
+				{ToolName: "run_tests", ToolInput: `{"cmd":"go test ./..."}`},
+				{Content: "已修复 add 函数的减法 bug，验证通过，测试覆盖率 85%。"},
 			}
 		}
 
@@ -2549,81 +2557,64 @@ func runDemoSelfEvolve(verbose bool) {
 		return agent.NewAgent(llm, reg, agent.WithMaxSteps(6))
 	}
 
-	// 评测套件：3 个用例，都要求 Agent 修完必须跑测试（RequireTools: run_tests）
+	// 评测套件：3 个用例，要求跑测试 + 回答含"修复"和"验证"
 	suite := []eval.BenchCase{
-		{
-			ID:    "fix-add",
-			Task:  "修复 main.go 里 add 函数的 bug（现在返回 a-b，应该返回 a+b）",
-			BuildAgent: mkFixBugAgent,
+		{ID: "fix-add", Task: "修复 add 函数的 bug", BuildAgent: mkFixBugAgent,
 			Judge: eval.RuleJudge{
 				RequireTools:  []string{"read_file", "edit_file", "run_tests"},
-				RequireAnswer: []string{"修复"},
-			},
-		},
-		{
-			ID:    "fix-multiply",
-			Task:  "修复 main.go 里 multiply 函数的 bug",
-			BuildAgent: mkFixBugAgent,
+				RequireAnswer: []string{"修复", "验证"},
+			}},
+		{ID: "fix-multiply", Task: "修复 multiply 函数的 bug", BuildAgent: mkFixBugAgent,
 			Judge: eval.RuleJudge{
 				RequireTools:  []string{"read_file", "edit_file", "run_tests"},
-				RequireAnswer: []string{"修复"},
-			},
-		},
-		{
-			ID:    "fix-divide",
-			Task:  "修复 main.go 里 divide 函数除零的 bug",
-			BuildAgent: mkFixBugAgent,
+				RequireAnswer: []string{"修复", "验证"},
+			}},
+		{ID: "fix-divide", Task: "修复 divide 函数除零的 bug", BuildAgent: mkFixBugAgent,
 			Judge: eval.RuleJudge{
 				RequireTools:  []string{"read_file", "edit_file", "run_tests"},
-				RequireAnswer: []string{"修复"},
-			},
-		},
+				RequireAnswer: []string{"修复", "验证"},
+			}},
 	}
 
-	// ---- 第一轮：v0 评测 ----
-	fmt.Println("\n--- 第 1 轮：v0（有缺陷的 Skill）---")
-	report0 := eval.RunSuite(suite)
-	fmt.Printf("通过率：%.0f%%（%d/%d）\n", report0.PassRate(), report0.PositivePassed, report0.PositiveTotal)
-	for _, r := range report0.Results {
-		if !r.Pass {
-			fmt.Printf("  ✗ %s: %s\n", r.ID, r.Reason)
+	// 跑多轮进化
+	runSuite := func() eval.Report {
+		return eval.RunSuite(suite)
+	}
+
+	results := evolve.EvolveLoop(runSuite, v0Skill, 5, func(round int, newSkill string) {
+		// 每轮进化后切换 mock 行为版本（模拟 Skill 内容变化导致 Agent 行为变化）
+		skillVersion = round
+	})
+
+	// ---- 打印每轮结果 ----
+	fmt.Println("\n--- 进化过程 ---")
+	for _, r := range results {
+		fmt.Printf("\n[第 %d 轮] 通过率：%.0f%%\n", r.Round, r.Score)
+		if len(r.Failures) == 0 {
+			fmt.Println("  ✓ 无失败，已收敛")
+			continue
+		}
+		fmt.Printf("  失败 %d 条：\n", len(r.Failures))
+		for _, f := range r.Failures {
+			fmt.Printf("    · [%s/%s] %s\n", f.Category, f.Severity, f.CaseID)
+		}
+		if len(r.Suggestions) > 0 {
+			fmt.Printf("  诊断建议 %d 条：\n", len(r.Suggestions))
+			for _, s := range r.Suggestions {
+				fmt.Printf("    · [%s]\n", s.Section)
+			}
 		}
 	}
 
-	// ---- 自进化：从失败到新 Skill ----
-	fmt.Println("\n--- 自进化分析 ---")
-	evo := evolve.Evolve(report0, v0Skill)
+	// ---- 最终总结 ----
+	fmt.Println("\n--- 进化总结 ---")
+	final := results[len(results)-1]
+	fmt.Printf("初始通过率：%.0f%% → 最终通过率：%.0f%%\n", results[0].Score, final.Score)
+	fmt.Printf("共跑 %d 轮，失败从 %d 条降到 %d 条\n",
+		len(results), len(results[0].Failures), len(final.Failures))
 
-	fmt.Printf("识别到 %d 条失败记录：\n", len(evo.Failures))
-	for _, f := range evo.Failures {
-		fmt.Printf("  · [%s/%s] %s: %s\n", f.Category, f.Severity, f.CaseID, f.Detail)
-	}
-
-	fmt.Printf("\n诊断出 %d 条改写建议：\n", len(evo.Suggestions))
-	for i, s := range evo.Suggestions {
-		fmt.Printf("  %d. [%s]\n", i+1, s.Section)
-	}
-
-	// ---- 第二轮：v1 评测（模拟 Skill 进化后的行为）----
-	fmt.Println("\n--- 第 2 轮：v1（进化后的 Skill）---")
-	skillVersion = 1 // 切换到 v1 行为
-	report1 := eval.RunSuite(suite)
-	fmt.Printf("通过率：%.0f%%（%d/%d）\n", report1.PassRate(), report1.PositivePassed, report1.PositiveTotal)
-	for _, r := range report1.Results {
-		status := "✓"
-		if !r.Pass {
-			status = "✗"
-		}
-		fmt.Printf("  %s %s\n", status, r.ID)
-	}
-
-	// ---- 对比总结 ----
-	fmt.Println("\n--- 进化对比 ---")
-	fmt.Printf("v0 通过率：%.0f%% → v1 通过率：%.0f%%（提升 %.0f pp）\n",
-		report0.PassRate(), report1.PassRate(), report1.PassRate()-report0.PassRate())
-
-	fmt.Println("\nv1 Skill 全文（自进化后追加的部分已标记）：")
+	fmt.Println("\n最终 Skill 全文（v0 + 各轮追加）：")
 	fmt.Println(strings.Repeat("─", 50))
-	fmt.Println(evo.NewSkillBody)
+	fmt.Println(final.NewSkillBody)
 	fmt.Println(strings.Repeat("─", 50))
 }

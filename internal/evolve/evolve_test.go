@@ -206,3 +206,62 @@ func TestE2EEvolve(t *testing.T) {
 		t.Error("新 Skill 应包含自进化标记")
 	}
 }
+
+// ---- EvolveLoop 多轮进化测试 ----
+
+func TestEvolveLoopStopsWhenNoFailures(t *testing.T) {
+	// 第一轮有失败，第二轮没失败 → 应提前结束（只跑 2 轮）
+	callCount := 0
+	runSuite := func() eval.Report {
+		callCount++
+		if callCount == 1 {
+			// 第一轮：有 tool 类失败
+			return eval.Report{
+				Results:       []eval.CaseResult{{ID: "t1", Pass: false, Reason: "要求实际执行 run_tests，但轨迹中未发现"}},
+				PositiveTotal: 1, PositivePassed: 0,
+			}
+		}
+		// 第二轮：全部通过
+		return eval.Report{
+			Results:       []eval.CaseResult{{ID: "ok", Pass: true, Reason: "全部判据通过"}},
+			PositiveTotal: 1, PositivePassed: 1,
+		}
+	}
+
+	results := EvolveLoop(runSuite, "# v0 skill", 5, nil)
+
+	if len(results) != 2 {
+		t.Errorf("应跑 2 轮后提前结束，实际 %d 轮", len(results))
+	}
+	if results[0].Score != 0 {
+		t.Errorf("第 1 轮通过率应为 0，实际 %.0f", results[0].Score)
+	}
+	if results[1].Score != 100 {
+		t.Errorf("第 2 轮通过率应为 100，实际 %.0f", results[1].Score)
+	}
+}
+
+func TestEvolveLoopCallsOnEvolved(t *testing.T) {
+	// 验证 onEvolved 回调被正确调用
+	var calledRounds []int
+	runSuite := func() eval.Report {
+		return eval.Report{
+			Results:       []eval.CaseResult{{ID: "t1", Pass: false, Reason: "要求实际执行 run_tests，但轨迹中未发现"}},
+			PositiveTotal: 1, PositivePassed: 0,
+		}
+	}
+
+	EvolveLoop(runSuite, "# v0", 3, func(round int, newSkill string) {
+		calledRounds = append(calledRounds, round)
+		if !strings.Contains(newSkill, "自进化 v1") {
+			t.Errorf("回调的 newSkill 应包含自进化标记")
+		}
+	})
+
+	if len(calledRounds) != 3 {
+		t.Errorf("onEvolved 应被调用 3 次（每轮都有失败，跑满 maxRounds），实际 %d 次", len(calledRounds))
+	}
+	if calledRounds[0] != 1 || calledRounds[1] != 2 || calledRounds[2] != 3 {
+		t.Errorf("回调轮次应为 [1, 2, 3]，实际 %v", calledRounds)
+	}
+}
