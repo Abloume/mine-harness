@@ -119,6 +119,8 @@ func main() {
 		runDemoDAGReplan(*verbose)
 	case "reflection":
 		runDemoReflection(*verbose)
+	case "reflection-generator":
+		runDemoReflectionGenerator(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -3108,4 +3110,140 @@ ORDER BY dt DESC;
 	fmt.Println("• SQL 类：SELECT/WHERE 是必过项，时间范围/防全表扫描是质量项")
 	fmt.Println("• 必过项全过 + 质量项 >= 50% 才算合格——不是凑总分")
 	fmt.Println("• 这就是文章里说的\"Reflection 要有明确标准，不是让模型自嗨\"")
+}
+
+// mockStandardGenLLM 是标准生成器的 mock LLM。
+type mockStandardGenLLM struct {
+	response string
+}
+
+func (m *mockStandardGenLLM) Generate(prompt string) (string, error) {
+	return m.response, nil
+}
+
+// runDemoReflectionGenerator 演示标准生成器：让 LLM 根据任务自动生成检查标准。
+//
+// 完整流程：
+//   1. 用户给任务 + 特殊要求
+//   2. LLM 生成检查标准（必过项 + 质量项）
+//   3. 展示生成的标准
+//   4. 用这个标准检查回答
+func runDemoReflectionGenerator(verbose bool) {
+	fmt.Println("=== Reflection 标准生成器：LLM 自动生成验收标准 ===")
+	fmt.Println()
+
+	// 1. 用户任务
+	task := "写一个登录页面组件（React + TypeScript）"
+	userNotes := "要兼容 Chrome 最新版，性能要好"
+
+	fmt.Println("--- 1. 用户任务 ---")
+	fmt.Printf("任务：%s\n", task)
+	fmt.Printf("特殊要求：%s\n\n", userNotes)
+
+	// 2. mock LLM 生成标准
+	fmt.Println("--- 2. LLM 生成检查标准 ---")
+
+	mockLLM := &mockStandardGenLLM{
+		response: `{
+  "task_type": "React 前端组件开发",
+  "summary": "登录页必须能用、体验好、性能不卡顿",
+  "required": [
+    {
+      "id": "req-1",
+      "dimension": "正确性",
+      "description": "表单提交后有 loading 态，防止重复提交",
+      "pass_if": "代码中有 loading 状态，提交中按钮 disabled"
+    },
+    {
+      "id": "req-2",
+      "dimension": "正确性",
+      "description": "表单校验：空邮箱/错误格式要提示",
+      "pass_if": "代码中有邮箱格式校验，错误时显示提示信息"
+    },
+    {
+      "id": "req-3",
+      "dimension": "安全性",
+      "description": "密码不能明文传输",
+      "pass_if": "代码中有密码加密或 hash 处理"
+    }
+  ],
+  "quality": [
+    {
+      "id": "q-1",
+      "dimension": "性能",
+      "description": "首屏加载速度快",
+      "pass_if": "有代码分割或懒加载，首屏 JS < 100KB"
+    },
+    {
+      "id": "q-2",
+      "dimension": "体验",
+      "description": "错误提示友好",
+      "pass_if": "错误提示是人话，不是技术报错"
+    },
+    {
+      "id": "q-3",
+      "dimension": "可访问性",
+      "description": "label 关联 input",
+      "pass_if": "每个 input 都有对应的 label 或 aria-label"
+    }
+  ]
+}`,
+	}
+
+	generator := reflection.NewStandardGenerator(mockLLM)
+	standards, err := generator.Generate(task, userNotes)
+	if err != nil {
+		fmt.Println("生成失败:", err)
+		return
+	}
+
+	fmt.Printf("任务类型：%s\n", standards.TaskType)
+	fmt.Printf("核心验收点：%s\n\n", standards.Summary)
+
+	fmt.Println("必过项（缺了就不合格）：")
+	for i, s := range standards.Required {
+		fmt.Printf("  %d. [%s] %s\n", i+1, s.Dimension, s.Description)
+		fmt.Printf("     怎么算过：%s\n", s.PassIf)
+	}
+
+	fmt.Println("\n质量项（有更好）：")
+	for i, s := range standards.Quality {
+		fmt.Printf("  %d. [%s] %s\n", i+1, s.Dimension, s.Description)
+		fmt.Printf("     怎么算过：%s\n", s.PassIf)
+	}
+
+	// 3. 用生成的标准检查回答
+	fmt.Println("\n\n--- 3. 用这个标准检查回答 ---")
+
+	// 有问题的回答——只写了个表单，没校验、没 loading、没加密
+	badAnswer := `
+export default function LoginPage() {
+  return (
+    <div>
+      <h1>登录</h1>
+      <input placeholder="邮箱" />
+      <input placeholder="密码" type="password" />
+      <button>登录</button>
+    </div>
+  )
+}
+`
+
+	fmt.Printf("回答（有问题版）：\n%s\n", badAnswer)
+
+	reflector := reflection.ReflectorFromStandards(standards)
+	result := reflector.Check(badAnswer, task, nil)
+
+	fmt.Printf("\n自检得分：%d/100（通过：%v）\n", result.Score, result.Passed)
+	fmt.Printf("检查项：%d 条，未达标：%d 条\n", result.TotalChecks, len(result.Issues))
+	for _, issue := range result.Issues {
+		fmt.Printf("  ❌ %s\n", issue.Standard)
+	}
+
+	// 4. 总结
+	fmt.Println("\n\n--- 关键观察 ---")
+	fmt.Println("• 标准不是硬编码的——是 LLM 根据任务自动生成的")
+	fmt.Println("• 用户特殊要求会影响标准（比如\"要兼容 Chrome\"）")
+	fmt.Println("• 必过项是底线，质量项是加分")
+	fmt.Println("• 这就是\"标准驱动\"：先想清楚什么叫好，再动手做")
 }
