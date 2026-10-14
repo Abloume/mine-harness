@@ -513,10 +513,11 @@
 - [x] 把日常开发流程封装为 Skill（复用第 1/2/3 步真实工具 + 既有 `load_skill` 渐进加载）：
   修复 bug / 改功能 / 跑测试修失败 / **前端视觉验证**（起服务 → 截屏 → 给视觉模型核对），
   流程 = 复现 → 定位 → 修改 → 验证
-  （已落地 5 个 Skill：`skills/fix-bug` / `skills/implement-feature` /
-  `skills/run-tests-fix` / `skills/visual-verify`（流程型）+ `skills/fe-practices`
-  （规范型，2026-10-14 增补：前端实践规范 13 条，按场景/规则/理由/反例组织，
-  编写前端代码时加载），均含触发条件、流程骨架、
+  （已落地 6 个 Skill：`skills/fix-bug` / `skills/implement-feature` /
+  `skills/run-tests-fix` / `skills/visual-verify` / `skills/practices-ingest`（流程型）
+  + `skills/fe-practices`（规范型，2026-10-14 增补：前端实践规范 13 条，按场景/规则/理由/反例组织，
+  编写前端代码时加载）；practices-ingest 为知识维护型（外部经验 → fe-practices 入库流程，
+  自举准备：mine-harness 连真实模型后可自己维护知识库），均含触发条件、流程骨架、
   验证清单、失败回滚路径）
 - [x] **双循环结构**（反思回写 2026-10-13）：外层循环 = 规划（拆需求/定 what·why·how、
   切 ticket，低频、事关方向）；内层循环 = 实现（一个 ticket 一轮：加载上下文 →
@@ -526,7 +527,7 @@
 - [x] **validation-first**（反思回写 2026-10-13）：实现计划先产出「验证清单」
   （单测/边界/lint/手动/视觉核对），agent 照着写、照着跑、照着改——对终点具体、
   对手段放权；验证清单复用既有评测门 + 视觉验证机制
-  （4 个流程型 Skill 正文均内嵌验证清单 + 失败时怎么停；fe-practices 为规范型，
+  （5 个流程型 Skill 正文均内嵌验证清单 + 失败时怎么停；fe-practices 为规范型，
   校验其按场景/规则/理由/反例组织）
 - [x] Skill 只写"何时加载、加载什么"，正文按需注入 system（机制已在）
 - [x] 工作流按状态机思路设计（反思回写 2026-10-13）：节点级可重试（沿用软停止语义）、
@@ -543,7 +544,7 @@
   go test 绿，go test 白名单自动放行、edit_file 走审批闸门；
   `go run . -demo visual-verify`：临时页面标题溢出 → serve_dir 起服务 →
   screenshot 移动端截屏 → 视觉核对（mock）→ 修复 → 再截屏（PNG 23KB→13KB 证明
-  生效）→ 停服务；配套 `TestRepoSkillsDiscoverable` 验证 5 个 Skill 可被宿主发现加载）
+  生效）→ 停服务；配套 `TestRepoSkillsDiscoverable` 验证 6 个 Skill 可被宿主发现加载）
 
 ---
 

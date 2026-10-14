@@ -136,7 +136,7 @@ func TestRepoSkillsDiscoverable(t *testing.T) {
 		got[m.Name] = m
 	}
 
-	want := []string{"fix-bug", "implement-feature", "run-tests-fix", "visual-verify"}
+	want := []string{"fix-bug", "implement-feature", "run-tests-fix", "visual-verify", "practices-ingest"}
 	for _, name := range want {
 		m, ok := got[name]
 		if !ok {
