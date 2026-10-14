@@ -28,6 +28,7 @@ import (
 	"mine-harness/internal/fsagent"
 	"mine-harness/internal/mcpserver"
 	"mine-harness/internal/memory"
+	"mine-harness/internal/reflection"
 	"mine-harness/internal/tree"
 	"mine-harness/internal/webagent"
 )
@@ -116,6 +117,8 @@ func main() {
 		runDemoDAGPlanner(*verbose)
 	case "dag-replan":
 		runDemoDAGReplan(*verbose)
+	case "reflection":
+		runDemoReflection(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -2999,4 +3002,110 @@ func runDemoDAGReplan(verbose bool) {
 	fmt.Println("• 只替换失败子图，不全盘重来")
 	fmt.Println("• Replan 上限 3 次——防止模型每次都规划错陷入死循环")
 	fmt.Println("• 这就是论文里说的'局部重规划'：改后半段，不推翻前半段")
+}
+
+// runDemoReflection 演示 Reflection：Agent 交付前的高标准自检。
+//
+// 不是"及格线检查"（空不空/太短），而是"任务级验收"：
+// 根据任务类型匹配对应的检查标准——SQL 查 SQL 的标准，Bug 修复查修复的标准。
+func runDemoReflection(verbose bool) {
+	fmt.Println("=== Reflection：Agent 交付前高标准自检演示 ===")
+	fmt.Println()
+
+	reflector := reflection.NewRuleReflector()
+
+	// ---- 场景 1：Bug 修复类任务 ----
+	fmt.Println("========================================")
+	fmt.Println("场景 1：Bug 修复类任务")
+	fmt.Println("========================================")
+
+	task1 := "修复登录接口偶尔超时的 bug"
+
+	// 有问题的回答——只说了现象，没说根因和修复
+	answer1Bad := "登录接口有时候会超时，可能是网络问题吧。"
+
+	fmt.Printf("\n任务：%s\n", task1)
+	fmt.Printf("回答（有问题版）：%s\n\n", answer1Bad)
+
+	result1Bad := reflector.Check(answer1Bad, task1, nil)
+	fmt.Printf("自检得分：%d/100（通过：%v）\n", result1Bad.Score, result1Bad.Passed)
+	fmt.Printf("检查项：%d 条，未达标：%d 条\n", result1Bad.TotalChecks, len(result1Bad.Issues))
+	for _, issue := range result1Bad.Issues {
+		fmt.Printf("  ❌ %s\n", issue.Standard)
+	}
+
+	// 好的回答——完整的修复流程
+	answer1Good := `## 复现
+在高并发场景下，连续调用登录接口 100 次，约 5% 的请求超时（>3s）。
+
+## 根因定位
+登录接口同步调用了 Redis 查 session + DB 查用户信息，两步串行加起来超过 2s。
+在高并发下，DB 连接池被占满，后续请求排队等待连接，导致超时。
+
+## 修复方案
+1. Redis 查 session 和 DB 查用户信息改成并行调用（Promise.all）
+2. DB 连接池从 10 调到 50
+3. 加一个 3s 超时降级，超时直接返回"系统繁忙"
+
+## 验证
+压测 1000 QPS，P99 从 4.2s 降到 800ms，超时率从 5% 降到 0。`
+
+	fmt.Printf("\n回答（高质量版）：\n%s\n\n", answer1Good)
+
+	result1Good := reflector.Check(answer1Good, task1, nil)
+	fmt.Printf("自检得分：%d/100（通过：%v）\n", result1Good.Score, result1Good.Passed)
+	fmt.Printf("检查项：%d 条，未达标：%d 条\n", result1Good.TotalChecks, len(result1Good.Issues))
+	for _, issue := range result1Good.Issues {
+		fmt.Printf("  ❌ [%s] %s\n", issue.Standard, issue.Standard)
+	}
+
+	// ---- 场景 2：SQL 类任务 ----
+	fmt.Println("\n\n========================================")
+	fmt.Println("场景 2：SQL 查询类任务")
+	fmt.Println("========================================")
+
+	task2 := "写一个 SQL，查最近 7 天每天的订单失败率"
+
+	answer2Bad := "SELECT * FROM orders"
+
+	fmt.Printf("\n任务：%s\n", task2)
+	fmt.Printf("回答（有问题版）：%s\n\n", answer2Bad)
+
+	result2Bad := reflector.Check(answer2Bad, task2, nil)
+	fmt.Printf("自检得分：%d/100（通过：%v）\n", result2Bad.Score, result2Bad.Passed)
+	for _, issue := range result2Bad.Issues {
+		fmt.Printf("  ❌ [%s] %s\n", issue.Standard, issue.Standard)
+	}
+
+	answer2Good := `-- 查最近 7 天每天的订单失败率
+SELECT
+  DATE(created_at) AS dt,
+  COUNT(*) AS total,
+  SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+  ROUND(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS fail_rate
+FROM orders
+WHERE created_at >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+GROUP BY DATE(created_at)
+ORDER BY dt DESC;
+
+-- 注意：一定要加 WHERE 条件，否则全表扫描会很慢`
+
+	fmt.Printf("\n回答（高质量版）：\n%s\n\n", answer2Good)
+
+	result2Good := reflector.Check(answer2Good, task2, nil)
+	fmt.Printf("自检得分：%d/100（通过：%v）\n", result2Good.Score, result2Good.Passed)
+	for _, issue := range result2Good.Issues {
+		fmt.Printf("  ❌ [%s] %s\n", issue.Standard, issue.Standard)
+	}
+
+	// ---- 总结 ----
+	fmt.Println("\n\n========================================")
+	fmt.Println("关键观察")
+	fmt.Println("========================================")
+	fmt.Println("• 不是及格线检查——是任务级高标准验收")
+	fmt.Println("• 检查标准分两类：必过项（缺了就不合格）+ 质量项（有更好）")
+	fmt.Println("• Bug 修复类：复现/根因/修复 是必过项，验证是质量项")
+	fmt.Println("• SQL 类：SELECT/WHERE 是必过项，时间范围/防全表扫描是质量项")
+	fmt.Println("• 必过项全过 + 质量项 >= 50% 才算合格——不是凑总分")
+	fmt.Println("• 这就是文章里说的\"Reflection 要有明确标准，不是让模型自嗨\"")
 }
