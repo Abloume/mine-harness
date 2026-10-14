@@ -174,13 +174,13 @@
 > Prompt、工具还是状态管理。
 
 **做什么**
-- [ ] 以取消契约的步骤账本（RunResult.Ledger / Compensations）为基础扩展为统一
+- [x] 以取消契约的步骤账本（RunResult.Ledger / Compensations）为基础扩展为统一
       轨迹事件流：步骤事件（工具选择/参数/结果/成败）+ 决策事件（为何选/不选
       某 skill，含候选清单）+ 审批事件（通过/拒绝/人工接管）+ 取消/补偿事件 +
       请求级元数据（Prompt 版本、模型、Token、缓存命中、首字延迟）
-- [ ] 轨迹 JSON 作为每次 demo / 评测的**默认产物**落盘（`traces/<run>.json`），
+- [x] 轨迹 JSON 作为每次 demo / 评测的**默认产物**落盘（`traces/<run>.json`），
       回放工具（第 8 步①）直接消费——监测能力先于功能补全，防"最后临时补"
-- [ ] 字段按监测清单预留：请求级 / 链路级 / 质量与成本
+- [x] 字段按监测清单预留：请求级 / 链路级 / 质量与成本
       （拒答率、单次任务成本、日预算告警、模型降级次数）
 
 **Go 练习点**
@@ -188,8 +188,10 @@
 - JSON 落盘复用既有原子写（temp + rename）模式
 
 **验证**
-- [ ] demo：一次普通 Run 产出可读轨迹 JSON，能回答「模型为何选/不选某 skill、
-      审批在哪一步通过/拒绝、Token 与延迟多少」
+- [x] demo：一次普通 Run 产出可读轨迹 JSON，能回答「模型为何选/不选某 skill、
+      审批在哪一步通过/拒绝、Token 与延迟多少」（`go run . -demo trace`，
+      落盘 `traces/trace-<时间戳>.json`；已实现 TraceLLM/TraceTool/TraceApproval/
+      TraceSkill/TraceCompact/TraceCancel 六类事件 + `trace_test.go` 单测覆盖）
 
 ### 增量 B · 仓库自用 AGENTS.md（dogfood）
 
@@ -197,8 +199,10 @@
 > 手册式长文会浪费 Token、把真正重要的约束冲淡。
 
 **做什么**
-- [ ] 仓库根写 AGENTS.md：Go 技术栈、目录职责（internal/* 分包含义）、
+- [x] 仓库根写 AGENTS.md：Go 技术栈、目录职责（internal/* 分包含义）、
       测试命令（`go test ./...` / `go run . -demo xxx`）、禁改禁读范围
+      （已落地：AGENTS.md + 第一个开发 Skill `skills/dev-add-demo/SKILL.md`，
+      含 demo 注册/单测/验证清单的完整流程）
       （`backup/` 备份目录、`.env` 密钥、memory / sessions 数据文件）
 - [ ] 与 README 分工：README 保留给人读的完整手册，AGENTS.md 只放
       「每次必守的底线约束」短清单——指令层与记忆层隔离（AGENTS.md

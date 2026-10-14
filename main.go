@@ -29,7 +29,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -92,6 +92,8 @@ func main() {
 		runDemoTree(*verbose)
 	case "memory-recall":
 		runDemoMemoryRecall(*verbose)
+	case "trace":
+		runDemoTrace(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -1908,4 +1910,116 @@ func riskLabel(l agent.RiskLevel) string {
 	default:
 		return "unknown"
 	}
+}
+
+// runDemoTrace 演示增量 A · 结构化轨迹导出：
+// 每次 Run 的事件流（llm / tool / approval / skill / compact / cancel）随
+// RunResult.Trace 暴露，落盘为 traces/<run>.json，可回答三个监测问题：
+//   - 模型为何选/不选某 skill？（agent.TraceSkill：loaded / rejected / not-found）
+//   - 审批在哪一步通过/拒绝？（agent.TraceApproval：approved / denied + 风险级别）
+//   - Token 与延迟多少？（agent.TraceLLM 请求级元数据：Model / Token / 延迟预留字段）
+//
+// 脚本（MockLLM 确定性驱动，真实 fs 工具）：
+//   加载存在的技能（loaded）→ 加载不存在的技能（rejected）→ 读文件（tool ok）
+//   → 编辑文件被审批拒绝（approval denied）→ 写入 traces/ 放行（approval approved
+//   + tool ok）→ 读不存在文件（tool failed）→ 最终回答。
+// 审批：edit_file/write_file 走闸门，演示拒绝与放行两条路径；读类自动放行。
+func runDemoTrace(verbose bool) {
+	root, err := filepath.Abs(".")
+	if err != nil {
+		fmt.Println("解析仓库根失败:", err)
+		return
+	}
+	reg := agent.NewRegistry()
+	for _, t := range fsagent.NewTools(root).All() {
+		reg.Register(t)
+	}
+
+	// 技能发现器（B 方案入口）：常驻清单拼进 load_skill 描述，模型按清单选
+	provider := newDirSkillProvider("skills")
+	loadSkillTool := agent.NewLoadSkillTool()
+	loadSkillTool.Description = agent.BuildLoadSkillDescription(provider.List())
+	reg.Register(loadSkillTool)
+	reg.Register(agent.NewReadSkillRefTool())
+
+	// 审批器：写类拒绝（演示 denied）、写 traces/ 下放行（演示 approved）
+	approver := agent.ApproverFunc(func(toolName, args string) bool {
+		if toolName == "edit_file" || toolName == "delete_file" {
+			fmt.Printf("[审批] %s(%s) → 拒绝（演示拒绝路径）\n", toolName, args)
+			return false
+		}
+		if toolName == "write_file" {
+			fmt.Printf("[审批] %s(%s) → 放行（演示放行路径）\n", toolName, args)
+			return true
+		}
+		return true
+	})
+
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: agent.LoadSkillToolName, ToolInput: `{"name":"file-ops-policy"}`}, // 存在 → loaded
+		{ToolName: agent.LoadSkillToolName, ToolInput: `{"name":"no-such-skill"}`},   // 不存在 → rejected
+		{ToolName: "read_file", ToolInput: `{"path":"AGENTS.md"}`},                   // 读类放行 → tool ok
+		{ToolName: "edit_file", ToolInput: `{"path":"AGENTS.md","old":"x","new":"y"}`}, // 被审批拒绝 → approval denied
+		{ToolName: "write_file", ToolInput: `{"path":"traces/demo-write.txt","content":"trace demo"}`}, // 放行 → approved + ok
+		{ToolName: "read_file", ToolInput: `{"path":"NO_SUCH_FILE.md"}`},             // 失败 → tool failed
+		{Content: "轨迹演示结束：可回答「为何选/不选某 skill（loaded/rejected）、审批在哪一步拒绝与放行（denied/approved）、Token 与延迟（llm 事件请求级元数据）」。"},
+	})
+
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(8),
+		agent.WithSkillProvider(provider),
+		agent.WithModel("mock/trace-demo"), // 请求级元数据：真实 demo 传模型 ID，这里标 mock
+		agent.WithApprover(approver),
+		agent.WithVerbose(verbose),
+	)
+	// 先建 traces/：write_file 步骤要写入该目录（fsagent 原子写在目标目录内
+	// 创建 temp 文件），同时它也是轨迹 JSON 的落盘目录。
+	if err := os.MkdirAll("traces", 0o755); err != nil {
+		fmt.Println("创建 traces/ 失败:", err)
+		return
+	}
+	res := a.Run("演示结构化轨迹：先加载 file-ops-policy 技能，再加载一个不存在的技能，读 AGENTS.md，尝试编辑（应被拒绝），写 traces/demo-write.txt（应放行），最后读一个不存在的文件")
+
+	// 落盘：traces/trace-<时间戳>.json（运行时产物目录，.gitignore 已忽略）
+	if err := os.MkdirAll("traces", 0o755); err == nil {
+		name := fmt.Sprintf("trace-%s.json", time.Now().Format("20060102-150405"))
+		if b, err := json.MarshalIndent(res.Trace, "", "  "); err == nil {
+			if err := os.WriteFile(filepath.Join("traces", name), b, 0o644); err == nil {
+				fmt.Printf("\n轨迹已落盘: traces/%s\n", name)
+			}
+		}
+	}
+
+	// 可读摘要：按类型统计 + 关键决策行
+	fmt.Printf("\n--- 轨迹摘要（共 %d 条事件）---\n", len(res.Trace))
+	byType := map[string]int{}
+	for _, ev := range res.Trace {
+		byType[ev.Type]++
+	}
+	for _, t := range []string{agent.TraceLLM, agent.TraceTool, agent.TraceApproval, agent.TraceSkill, agent.TraceCompact, agent.TraceCancel} {
+		if n := byType[t]; n > 0 {
+			fmt.Printf("%-9s %2d 条\n", t, n)
+		}
+	}
+	fmt.Println("\n关键决策点（按事件序）：")
+	for _, ev := range res.Trace {
+		switch ev.Type {
+		case agent.TraceLLM:
+			if ev.Outcome == agent.OutcomeFailed {
+				fmt.Printf("  [llm]    step %d 模型调用失败：%s\n", ev.Step, ev.Detail)
+			}
+		case agent.TraceSkill:
+			fmt.Printf("  [skill]   step %d load_skill(%s) → %s（%s）\n", ev.Step, ev.Name, ev.Outcome, ev.Detail)
+		case agent.TraceApproval:
+			fmt.Printf("  [approval] step %d %s(%s) → %s（%s）\n", ev.Step, ev.Name, ev.Input, ev.Outcome, ev.Detail)
+		case agent.TraceTool:
+			fmt.Printf("  [tool]    step %d %s → %s\n", ev.Step, ev.Name, ev.Outcome)
+		case agent.TraceCompact:
+			fmt.Printf("  [compact] step %d %s\n", ev.Step, ev.Detail)
+		case agent.TraceCancel:
+			fmt.Printf("  [cancel]  step %d %s\n", ev.Step, ev.Detail)
+		}
+	}
+	fmt.Println("\n请求级元数据（llm 事件）：", res.Trace[0].Model, "— 真实 API 接入后 Token/延迟在此字段填充")
+	showResult(res)
 }

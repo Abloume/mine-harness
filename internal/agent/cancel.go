@@ -64,6 +64,7 @@ type RunResult struct {
 	Reason        string             // 中止/取消原因（护栏触发 or 取消点描述）
 	Ledger        []StepRecord       // 步骤账本（缺口 D；含已执行工具调用的完整记录）
 	Compensations []CompensateRecord // 补偿执行记录（缺口 D；取消收尾产生）
+	Trace         []TraceEvent       // 结构化轨迹（增量 A；llm/tool/approval/skill/compact/cancel 事件流）
 }
 
 // checkCancel 检测外部取消信号（安全检查点共用判定）。
@@ -110,6 +111,13 @@ func (a *Agent) finishCancel(step int) RunResult {
 		status = StatusPartial // 不可逆已提交：如实告知"后续已停，但外部动作已发生"
 	}
 
+	// 增量 A：取消收尾进轨迹（Detail 含终态与收尾统计）——
+	// 监测清单"取消与补偿"闭环：canceled/partially_completed/needs_review
+	// 是调用方展示与人工接管的依据。
+	a.appendTrace(TraceEvent{Type: TraceCancel, Step: step, Outcome: status,
+		Detail: fmt.Sprintf("用户取消：已执行 %d 个工具调用，%d 个已补偿（终态 %s）",
+			len(a.ledger), len(a.compensations), status)})
+
 	return RunResult{
 		Steps:         step,
 		Status:        status,
@@ -117,6 +125,7 @@ func (a *Agent) finishCancel(step int) RunResult {
 			step, len(a.ledger), len(a.compensations)),
 		Ledger:        a.ledger,
 		Compensations: a.compensations,
+		Trace:         a.trace,
 	}
 }
 

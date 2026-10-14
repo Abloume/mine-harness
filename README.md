@@ -32,10 +32,11 @@
 - [x] 真实文件工具集（PLAN 第 1 步：`read_file` / `write_file` / `edit_file` / `glob` / `grep`，独立包 `internal/fsagent`，与内核解耦——机制归内核、工具归应用层）— 原子写入（同目录 temp + rename）、写前自动备份到 `backup/`（file-ops-policy 落地，备份失败即停止）、`filepath.IsLocal` 路径越界防护、edit 精确替换防幻觉（old 必须恰好出现一次）、glob/grep 跳过备份目录；读类 RiskNone 自动放行，写/编辑 RiskMedium 走审批闸门 — `-demo fs`
 - [x] 命令执行工具（PLAN 第 2 步：`run_cmd`，独立包 `internal/cmdagent`）— `context.WithTimeout` 超时 + **进程组杀灭**（Setpgid + kill(-pid)，实测踩坑见下）、输出截断保留头尾防爆上下文、**参数感知风险**（`RiskOfArgs`：白名单命令 go build/test/vet、git status/diff 等降 RiskLow 自动放行，rm/git push/curl/sudo 等危险模式升 RiskHigh 强制审批，未知命令 RiskMedium）— `-demo cmd`
 - [x] MCP 双向适配（PLAN 第 4 步：**Server 对外暴露** `internal/mcpserver/mcpserver.go`——Registry 工具映射为 MCP 工具，外部 Agent 可直接调用；**Client 对内接入** `internal/mcpserver/client.go`——外部 MCP server 的工具经 tools/list 发现、包装为普通工具注册进主循环，超时护栏 + 风险映射 + isError 转 error；**Streamable HTTP 传输** `internal/mcpserver/http.go` / `http_client.go`——POST JSON-RPC + GET SSE，对齐火山方舟 Remote MCP 接入形态，实现要点见下）— `-demo mcp` / `-demo mcp-client` / `-demo mcp-http`
+- [x] 结构化轨迹导出（增量 A · 可观测性前置）：每次 Run 的事件流随 `RunResult.Trace` 暴露——模型调用（请求级元数据：Model/Token/延迟预留字段）、工具结果（ok/failed/invalid/denied/guarded/retry-limit）、审批决策（approved/denied + 风险级别）、Skill 加载决策（loaded/rejected/already-loaded）、上下文压缩（触发原因 + 压缩前后估算）、取消收尾（终态）——落盘为 `traces/<run>.json`，回答「模型为何选/不选某 skill、审批在哪一步通过/拒绝、Token 与延迟多少」，为回放与评测门喂数据；轨迹（过程）与账本（事实）互补 — `internal/agent/trace.go`、`internal/agent/loop.go`、`-demo trace`
 
 ## 当前进度（2026-10-13）
 
-第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall` 二十八个场景分别演示
+第一版已跑通：`go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace` 二十九个场景分别演示
 「正常链路 / 循环检测中止 / 步数软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 真实文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / 自动决策计划 / 技术栈感知 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索 / 长期记忆关键召回」，
 前七个用 `MockLLM`（脚本化假模型）不依赖 API Key，真实场景可走智谱 GLM 或豆包（火山方舟）：
 

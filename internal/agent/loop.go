@@ -199,6 +199,11 @@ type Agent struct {
 	memoryRecallLimit int
 	sessionID         string
 
+	// 增量 A · 结构化轨迹：trace 是本次 Run 的事件流（llm/tool/approval/skill/
+	// compact/cancel），随 RunResult.Trace 暴露；model 是请求级元数据（WithModel）。
+	trace []TraceEvent
+	model string
+
 	history []Message
 }
 
@@ -346,6 +351,7 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 	defer func() {
 		res.Ledger = a.ledger
 		res.Compensations = a.compensations
+		res.Trace = a.trace // 增量 A：轨迹随结果暴露（默认产物，宿主可落盘为 JSON）
 		a.settleMemory(res.Status)
 	}()
 
@@ -398,7 +404,12 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 			if a.lastUsageTokens > 0 {
 				target = a.tokenBudget / 2
 			}
+			before := MessagesTokens(a.history)
 			a.history, _ = CompactContext(a.history, target, a.summarizer)
+			after := MessagesTokens(a.history)
+			// 增量 A：上下文压缩进轨迹（Detail 含触发原因与压缩前后估算）
+			a.appendTrace(TraceEvent{Type: TraceCompact, Step: step, Outcome: "compacted",
+				Detail: fmt.Sprintf("token=%d > 预算 %d → 压缩后估算 %d", before, a.tokenBudget, after)})
 			if a.verbose {
 				if a.lastUsageTokens > 0 {
 					log.Printf("[step %d] 上下文压缩：服务端 usage=%d > 预算 %d，压缩后估算 token=%d",
@@ -430,12 +441,28 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 		// 1. 调模型（把工具清单一起给它，对应 function calling 的 tools 参数）
 		resp, err := a.llm.Chat(a.history, a.registry.List())
 		if err != nil {
+			// 增量 A：调用失败也进轨迹（Outcome=failed），监测能看到"模型环节挂在哪一步"
+			a.appendTrace(TraceEvent{Type: TraceLLM, Step: step, Model: a.model,
+				Outcome: OutcomeFailed, Detail: fmt.Sprintf("模型调用失败: %v", err)})
 			return RunResult{Steps: step, Status: StatusAborted, Reason: fmt.Sprintf("模型调用失败: %v", err)}
 		}
 		// 记录服务端真实用量：下一轮循环用它判断是否压缩（真实模型才有效）
+		pt, ct, tt := 0, 0, 0
 		if resp.Usage != nil {
 			a.lastUsageTokens = resp.Usage.TotalTokens
+			pt, ct, tt = resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens
 		}
+		// 增量 A：每次模型响应记一条 llm 事件（请求级元数据：模型/Token，延迟与缓存字段预留）
+		detail := "模型返回最终回答"
+		if len(resp.ToolCalls) > 0 {
+			ns := make([]string, 0, len(resp.ToolCalls))
+			for _, tc := range resp.ToolCalls {
+				ns = append(ns, tc.Name)
+			}
+			detail = fmt.Sprintf("模型请求调用 %d 个工具: %s", len(resp.ToolCalls), strings.Join(ns, ", "))
+		}
+		a.appendTrace(TraceEvent{Type: TraceLLM, Step: step, Model: a.model,
+			PromptTokens: pt, CompletionTokens: ct, TotalTokens: tt, Detail: detail})
 
 		// 2a. 模型请求调用工具（一轮可并行多个，真实模型的多 tool_calls 行为）
 		if len(resp.ToolCalls) > 0 {
@@ -468,6 +495,8 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 					if a.verbose {
 						log.Printf("[step %d] ⚠ 循环检测命中（重复调用 %s），该调用被停止", step, tc.Name)
 					}
+					a.appendTrace(TraceEvent{Type: TraceTool, Step: step, Name: tc.Name,
+						Input: traceInput(tc.Input), Outcome: OutcomeGuarded, Detail: "循环检测命中（重复调用），警告后停止该调用"})
 					a.history = append(a.history,
 						Message{Role: roleSystem,
 							Content: fmt.Sprintf("检测到你重复调用工具 %s(%s) 且无进展。请换一种方式：改用其他工具、修改参数或直接给出最终回答。", tc.Name, tc.Input)},
@@ -479,6 +508,8 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 					if a.verbose {
 						log.Printf("[step %d] ✗ 循环检测二次命中，中止", step)
 					}
+					a.appendTrace(TraceEvent{Type: TraceTool, Step: step, Name: tc.Name,
+						Input: traceInput(tc.Input), Outcome: OutcomeGuarded, Detail: "循环检测二次命中，中止"})
 					return RunResult{Steps: step, Status: StatusAborted,
 						Reason: fmt.Sprintf("循环检测：重复调用 %s(%s) 且警告后无进展", tc.Name, tc.Input)}
 				}
@@ -500,10 +531,16 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 						if a.verbose {
 							log.Printf("[step %d] ⛔ 审批拒绝（风险 %s，连续 %d 次）：%s(%s)", step, risk, a.denials, tc.Name, tc.Input)
 						}
+							// 增量 A：审批决策进轨迹（监测清单"审批与人工接管"）
+							a.appendTrace(TraceEvent{Type: TraceApproval, Step: step, Name: tc.Name,
+								Input: traceInput(tc.Input), Outcome: "denied",
+								Detail: fmt.Sprintf("风险 %s，连续拒绝 %d 次", risk, a.denials)})
 						// 升级兜底：连续被拒说明模型在反复越权，停止并交还用户
 						// （对应 Claude Code auto mode 的"3 次连续拒绝 → 升级给人"）。
 						// 这是软停止不是 error，调用方可以展示进度并接手指挥。
 						if a.denials >= a.denialLimit {
+							a.appendTrace(TraceEvent{Type: TraceApproval, Step: step, Name: tc.Name,
+								Outcome: "denied", Detail: fmt.Sprintf("连续 %d 次拒绝，审批升级中止", a.denials)})
 							return RunResult{Steps: step, Status: StatusAborted,
 								Reason: fmt.Sprintf("审批升级：连续 %d 次高风险调用被拒绝，停止并交还人工", a.denials)}
 						}
@@ -523,6 +560,8 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 					a.denials = 0 // 审批通过：模型收敛了，清空拒绝计数
 					if a.verbose {
 						log.Printf("[step %d] ✅ 审批通过（风险 %s）：%s(%s)", step, risk, tc.Name, tc.Input)
+						a.appendTrace(TraceEvent{Type: TraceApproval, Step: step, Name: tc.Name,
+							Input: traceInput(tc.Input), Outcome: "approved", Detail: fmt.Sprintf("风险 %s", risk)})
 					}
 				} else {
 					a.denials = 0 // 低风险自动放行：模型已换路径，清空拒绝计数
@@ -572,12 +611,14 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 				for i, it := range items {
 					res := results[i]
 					ok := res.err == nil
+					outcome, detail := OutcomeOK, ""
 					if res.err != nil {
 						if a.guard.retryHit(it.name, it.input) {
 							return RunResult{Steps: step, Status: StatusAborted,
 								Reason: fmt.Sprintf("重试超预算：%s 连续失败超过 %d 次", it.name, a.guard.retryLimit)}
 						}
 						res.out = fmt.Sprintf("工具调用失败: %v", res.err)
+					outcome, detail = OutcomeFailed, res.err.Error()
 					} else if verr := a.registry.ValidateResult(it.name, res.out); verr != nil {
 						// 缺口 A：结果未通过 schema 校验——不进上下文原文，
 						// 回填明确错误并计入重试预算（防模型「以为成功了」）
@@ -587,10 +628,15 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 								Reason: fmt.Sprintf("重试超预算：%s 结果校验连续失败超过 %d 次", it.name, a.guard.retryLimit)}
 						}
 						res.out = fmt.Sprintf("工具返回结果未通过校验: %v", verr)
+				outcome, detail = OutcomeInvalid, verr.Error()
+					outcome, detail = OutcomeInvalid, verr.Error()
 					}
 					// 缺口 D：执行后立即记账（请求标识/结果/副作用类型）——
 					// 即使取消信号此刻到达，这一步已落账，收尾不会遗漏。
 					a.recordStep(step, it.name, it.input, ok)
+					// 增量 A：工具执行结果进轨迹（链路级：选择与结果可追溯）
+					a.appendTrace(TraceEvent{Type: TraceTool, Step: step, Name: it.name,
+						Input: traceInput(it.input), Outcome: outcome, Detail: detail})
 					if a.verbose {
 						log.Printf("[step %d] tool_result ← %s", step, res.out)
 					}
@@ -629,12 +675,14 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 				}
 				out, err := a.registry.Call(it.name, it.input)
 				ok := err == nil
+				outcome, detail := OutcomeOK, ""
 				if err != nil {
 					if a.guard.retryHit(it.name, it.input) {
 						return RunResult{Steps: step, Status: StatusAborted,
 							Reason: fmt.Sprintf("重试超预算：%s 连续失败超过 %d 次", it.name, a.guard.retryLimit)}
 					}
 					out = fmt.Sprintf("工具调用失败: %v", err)
+				outcome, detail = OutcomeFailed, err.Error()
 				} else if verr := a.registry.ValidateResult(it.name, out); verr != nil {
 					// 缺口 A：结果未通过 schema 校验（同上，顺序执行路径）
 					ok = false
@@ -647,6 +695,9 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 				// 缺口 D：执行后立即记账——"外部成功后本地落账前"的缝隙
 				// 由记账闭合：即使此刻取消，账本已有该步骤，收尾不会遗漏。
 				a.recordStep(step, it.name, it.input, ok)
+				// 增量 A：工具执行结果进轨迹（链路级：选择与结果可追溯）
+				a.appendTrace(TraceEvent{Type: TraceTool, Step: step, Name: it.name,
+					Input: traceInput(it.input), Outcome: outcome, Detail: detail})
 				if a.verbose {
 					log.Printf("[step %d] tool_result ← %s", step, out)
 				}
@@ -683,11 +734,17 @@ func (a *Agent) RunWithContext(ctx context.Context, task string) (res RunResult)
 //     满足真实 API "assistant 的 tool_calls 必须有对应 tool 结果"的要求。
 func (a *Agent) runLoadSkill(step int, tc ToolCall) {
 	if a.skillProvider == nil {
+		// 注意：name 变量此时尚未解析（nil 分支在 parseLoadSkillInput 之前），
+		// 事件只记"未配置"这个事实即可，Name 留空由 omitempty 省略。
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step,
+			Outcome: "rejected", Detail: "未配置技能加载器（宿主未调用 WithSkillProvider）"})
 		a.appendTool(tc.ID, "未配置技能加载器（未调用 WithSkillProvider），无法加载技能。")
 		return
 	}
 	name := parseLoadSkillInput(tc.Input)
 	if name == "" {
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step, Name: name,
+			Outcome: "rejected", Detail: `参数无效：应为 {"name":"技能名"} 或直接给技能名`})
 		a.appendTool(tc.ID, "load_skill 参数无效：应为 {\"name\":\"技能名\"} 或直接给技能名。")
 		return
 	}
@@ -704,21 +761,29 @@ func (a *Agent) runLoadSkill(step int, tc ToolCall) {
 			}
 		}
 		if meta == nil {
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step, Name: name,
+			Outcome: "rejected", Detail: "技能不在可用清单中"})
 			a.appendTool(tc.ID, fmt.Sprintf("技能 %s 不存在或不在可用清单中，请改用其他技能或直接完成任务。", name))
 			return
 		}
 		if !SkillAllowedForPath(*meta, a.contextPath) {
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step, Name: name,
+			Outcome: "rejected", Detail: "路径作用域不适用"})
 			a.appendTool(tc.ID, fmt.Sprintf("技能 %s 仅适用于目录范围 %v，当前上下文路径 %s 不在其内，请改用其他技能或直接完成任务。",
 				name, meta.Paths, a.contextPath))
 			return
 		}
 	}
 	if a.loadedSkills[name] {
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step, Name: name,
+			Outcome: "already-loaded", Detail: "技能已在上下文，去重未重复注入"})
 		a.appendTool(tc.ID, fmt.Sprintf("技能 %s 已加载过，其规范已在系统上下文中，无需重复加载。", name))
 		return
 	}
 	body, ok := a.skillProvider.LoadSkill(name)
 	if !ok {
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step, Name: name,
+			Outcome: "rejected", Detail: "技能正文加载失败"})
 		a.appendTool(tc.ID, fmt.Sprintf("技能 %s 不存在或无法加载，请改用其他技能或直接完成任务。", name))
 		return
 	}
@@ -731,6 +796,8 @@ func (a *Agent) runLoadSkill(step int, tc ToolCall) {
 		Role:    roleSystem,
 		Content: fmt.Sprintf("[已加载技能规范 %s]\n%s", name, body),
 	})
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step, Name: name,
+			Outcome: "loaded", Detail: fmt.Sprintf("正文 %d 字符注入 system", len(body))})
 	a.appendTool(tc.ID, fmt.Sprintf("技能 %s 已加载，规范已注入系统上下文，请严格按规范执行后续操作。", name))
 }
 
@@ -757,25 +824,36 @@ func (a *Agent) recordHistory(step int, name, input string, ok bool) {
 //  3. 协议闭合：成功/失败/重复都回填 tool 消息。
 func (a *Agent) runReadSkillRef(step int, tc ToolCall) {
 	if a.skillProvider == nil {
+		// skill/ref 变量尚未解析（nil 分支在 parseReadSkillRefInput 之前），Name 留空。
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step,
+			Outcome: "rejected", Detail: "未配置技能加载器"})
 		a.appendTool(tc.ID, "未配置技能加载器（未调用 WithSkillProvider），无法读取技能引用。")
 		return
 	}
 	skill, ref, ok := parseReadSkillRefInput(tc.Input)
 	if !ok {
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step, Name: skill,
+			Outcome: "rejected", Detail: `参数无效：应为 {"skill":"x","ref":"references/y.md"}`})
 		a.appendTool(tc.ID, "read_skill_ref 参数无效：应为 {\"skill\":\"技能名\",\"ref\":\"引用路径\"}。")
 		return
 	}
 	if !a.loadedSkills[skill] {
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step, Name: skill,
+			Outcome: "rejected", Detail: "顺序依赖：必须先加载技能正文再读引用"})
 		a.appendTool(tc.ID, fmt.Sprintf("技能 %s 尚未加载，请先调用 load_skill 加载其正文，再读取引用。", skill))
 		return
 	}
 	key := skill + "/" + ref
 	if a.loadedRefs[key] {
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step, Name: skill,
+			Outcome: "already-loaded", Detail: "引用已在上下文，去重未重复注入"})
 		a.appendTool(tc.ID, fmt.Sprintf("技能 %s 的引用 %s 已加载过，内容已在系统上下文中，无需重复读取。", skill, ref))
 		return
 	}
 	body, ok := a.skillProvider.LoadReference(skill, ref)
 	if !ok {
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step, Name: skill,
+			Outcome: "rejected", Detail: "引用不存在或无法加载"})
 		a.appendTool(tc.ID, fmt.Sprintf("技能 %s 的引用 %s 不存在或无法加载。", skill, ref))
 		return
 	}
@@ -787,6 +865,8 @@ func (a *Agent) runReadSkillRef(step int, tc ToolCall) {
 		Role:    roleSystem,
 		Content: fmt.Sprintf("[技能 %s 引用 %s]\n%s", skill, ref, body),
 	})
+		a.appendTrace(TraceEvent{Type: TraceSkill, Step: step, Name: skill,
+			Outcome: "loaded", Detail: fmt.Sprintf("引用 %s 注入 system（%d 字符）", ref, len(body))})
 	a.appendTool(tc.ID, fmt.Sprintf("已加载技能 %s 的引用 %s，内容已注入系统上下文，请按其中规则执行。", skill, ref))
 }
 
