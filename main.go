@@ -1,5 +1,5 @@
 // mine-harness 入口：三十四个演示场景，覆盖"正常链路 / 循环检测 / 软停止 / 摘要压缩 / 生成式 LLM 摘要 / 审批点 / 真实模型 / 真实审批 / 评测门 / Skill 加载(A) / 真渐进式 Skill(B) / 多 tool_call 并发 / 豆包真实链路 / 豆包真实审批 / 文件工具集 / 命令执行 / Figma 设计稿 / 前端预览截屏 / MCP 双向适配（Server 暴露 + Client 接入）/ Streamable HTTP（SSE）传输 / 工具结果 schema 校验 / Skill History 短期工作记忆 / Skill 路径作用域 / 会话持久化断点续跑 / 协作式取消契约 / 树索引推理检索 / 长期记忆关键召回 / 结构化轨迹导出 / 开发工作流 Skill / 前端视觉验证 / 压缩保真度抽查 + 硬约束保护层 / 任务系统 + 依赖图 / 意图路由（多意图并行分流）"。
-// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity | task-graph | intent-route
+// 用法：go run . -demo normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity | task-graph | intent-route | self-evolve
 package main
 
 import (
@@ -22,6 +22,7 @@ import (
 	"mine-harness/internal/agent"
 	"mine-harness/internal/cmdagent"
 	"mine-harness/internal/eval"
+	"mine-harness/internal/evolve"
 	"mine-harness/internal/figmaagent"
 	"mine-harness/internal/fsagent"
 	"mine-harness/internal/mcpserver"
@@ -31,7 +32,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity | task-graph | intent-route")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify | compact-fidelity | task-graph | intent-route | self-evolve")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -106,6 +107,8 @@ func main() {
 		runDemoTaskGraph(*verbose)
 	case "intent-route":
 		runDemoIntentRoute(*verbose)
+	case "self-evolve":
+		runDemoSelfEvolve(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -2472,4 +2475,155 @@ func runDemoIntentRoute(verbose bool) {
 	c := cls.Classify("你好")
 	fmt.Printf("    → %s（conf=%.2f）→ 路由 %s：不调工具，直接回答\n", c.Intent, c.Confidence, c.Route)
 	fmt.Println("    回答：你好！有什么可以帮你？（如需查项目内容/改代码，请直接说）")
+}
+
+// runDemoSelfEvolve 演示"自进化 Skill"闭环：
+// 从评测失败（Bad Case）→ 四维归因 → 诊断 Skill 缺陷 → 自动改写 Skill 文本。
+//
+// 对应 SkillForge 论文（arXiv:2604.08618）的最小切片：
+//   - v0：一个"有缺陷"的 fix-bug Skill（缺工具调用指引），Agent 跑完不调测试工具
+//   - 跑评测 → 收集失败 → evolve.Evolve → 产出 v1 Skill 草稿
+//   - v1：Agent 补上了工具调用（模拟 Skill 进化后的行为）
+//   - 再跑评测 → 对比 v0 vs v1 通过率
+//
+// JS/TS ↔ Go 差异：TS 里闭包捕获外部变量直接用 let；
+// Go 里闭包同样捕获，但要注意变量作用域——这里用 skillVersion 变量
+// 控制 mock 脚本行为，模拟"Skill 内容变化导致 Agent 行为变化"。
+func runDemoSelfEvolve(verbose bool) {
+	fmt.Println("== 自进化 Skill 演示：从 Bad Case 到新 Skill ==")
+
+	// v0：有缺陷的 Skill——缺"修完必须跑测试"的工具调用指引
+	v0Skill := `# 修复 bug
+
+## 何时加载
+任务描述指向既有代码行为错误时加载。
+
+## 流程
+1. 复现：读相关测试与源码，跑复现命令
+2. 定位根因：用 grep / read_file 顺失败栈找源头
+3. 修改：edit_file 精确替换
+`
+
+	// skillVersion 控制 mock 脚本行为：
+	//   0 = v0（不调 run_tests，模拟 Skill 缺指引）
+	//   1 = v1（调 run_tests，模拟 Skill 进化后补上了指引）
+	skillVersion := 0
+
+	mkFixBugAgent := func() *agent.Agent {
+		reg := agent.NewRegistry()
+		reg.Register(agent.Tool{
+			Name:     "read_file",
+			BaseRisk: agent.RiskNone,
+			Execute:  func(input string) (string, error) { return "package main\n\nfunc add(a, b int) int { return a - b }", nil },
+		})
+		reg.Register(agent.Tool{
+			Name:     "edit_file",
+			BaseRisk: agent.RiskLow,
+			Execute:  func(input string) (string, error) { return "file updated", nil },
+		})
+		reg.Register(agent.Tool{
+			Name:     "run_tests",
+			BaseRisk: agent.RiskNone,
+			Execute:  func(input string) (string, error) { return "ok  \tcoverage: 85%", nil },
+		})
+
+		var decisions []agent.MockDecision
+		if skillVersion == 0 {
+			// v0：修完就直接回答，不跑测试（Skill 里没指引要跑测试）
+			decisions = []agent.MockDecision{
+				{ToolName: "read_file", ToolInput: `{"path":"main.go"}`},
+				{ToolName: "edit_file", ToolInput: `{"path":"main.go","action":"replace"}`},
+				{Content: "已修复 add 函数的减法 bug，现在返回 a+b。"},
+			}
+		} else {
+			// v1：修完主动跑测试验证（Skill 进化后补上了工具调用指引）
+			decisions = []agent.MockDecision{
+				{ToolName: "read_file", ToolInput: `{"path":"main.go"}`},
+				{ToolName: "edit_file", ToolInput: `{"path":"main.go","action":"replace"}`},
+				{ToolName: "run_tests", ToolInput: `{"cmd":"go test ./..."}`},
+				{Content: "已修复 add 函数的减法 bug，测试全部通过（coverage 85%）。"},
+			}
+		}
+
+		llm := agent.NewMockLLM(decisions)
+		return agent.NewAgent(llm, reg, agent.WithMaxSteps(6))
+	}
+
+	// 评测套件：3 个用例，都要求 Agent 修完必须跑测试（RequireTools: run_tests）
+	suite := []eval.BenchCase{
+		{
+			ID:    "fix-add",
+			Task:  "修复 main.go 里 add 函数的 bug（现在返回 a-b，应该返回 a+b）",
+			BuildAgent: mkFixBugAgent,
+			Judge: eval.RuleJudge{
+				RequireTools:  []string{"read_file", "edit_file", "run_tests"},
+				RequireAnswer: []string{"修复"},
+			},
+		},
+		{
+			ID:    "fix-multiply",
+			Task:  "修复 main.go 里 multiply 函数的 bug",
+			BuildAgent: mkFixBugAgent,
+			Judge: eval.RuleJudge{
+				RequireTools:  []string{"read_file", "edit_file", "run_tests"},
+				RequireAnswer: []string{"修复"},
+			},
+		},
+		{
+			ID:    "fix-divide",
+			Task:  "修复 main.go 里 divide 函数除零的 bug",
+			BuildAgent: mkFixBugAgent,
+			Judge: eval.RuleJudge{
+				RequireTools:  []string{"read_file", "edit_file", "run_tests"},
+				RequireAnswer: []string{"修复"},
+			},
+		},
+	}
+
+	// ---- 第一轮：v0 评测 ----
+	fmt.Println("\n--- 第 1 轮：v0（有缺陷的 Skill）---")
+	report0 := eval.RunSuite(suite)
+	fmt.Printf("通过率：%.0f%%（%d/%d）\n", report0.PassRate(), report0.PositivePassed, report0.PositiveTotal)
+	for _, r := range report0.Results {
+		if !r.Pass {
+			fmt.Printf("  ✗ %s: %s\n", r.ID, r.Reason)
+		}
+	}
+
+	// ---- 自进化：从失败到新 Skill ----
+	fmt.Println("\n--- 自进化分析 ---")
+	evo := evolve.Evolve(report0, v0Skill)
+
+	fmt.Printf("识别到 %d 条失败记录：\n", len(evo.Failures))
+	for _, f := range evo.Failures {
+		fmt.Printf("  · [%s/%s] %s: %s\n", f.Category, f.Severity, f.CaseID, f.Detail)
+	}
+
+	fmt.Printf("\n诊断出 %d 条改写建议：\n", len(evo.Suggestions))
+	for i, s := range evo.Suggestions {
+		fmt.Printf("  %d. [%s]\n", i+1, s.Section)
+	}
+
+	// ---- 第二轮：v1 评测（模拟 Skill 进化后的行为）----
+	fmt.Println("\n--- 第 2 轮：v1（进化后的 Skill）---")
+	skillVersion = 1 // 切换到 v1 行为
+	report1 := eval.RunSuite(suite)
+	fmt.Printf("通过率：%.0f%%（%d/%d）\n", report1.PassRate(), report1.PositivePassed, report1.PositiveTotal)
+	for _, r := range report1.Results {
+		status := "✓"
+		if !r.Pass {
+			status = "✗"
+		}
+		fmt.Printf("  %s %s\n", status, r.ID)
+	}
+
+	// ---- 对比总结 ----
+	fmt.Println("\n--- 进化对比 ---")
+	fmt.Printf("v0 通过率：%.0f%% → v1 通过率：%.0f%%（提升 %.0f pp）\n",
+		report0.PassRate(), report1.PassRate(), report1.PassRate()-report0.PassRate())
+
+	fmt.Println("\nv1 Skill 全文（自进化后追加的部分已标记）：")
+	fmt.Println(strings.Repeat("─", 50))
+	fmt.Println(evo.NewSkillBody)
+	fmt.Println(strings.Repeat("─", 50))
 }
