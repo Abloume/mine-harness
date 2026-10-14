@@ -388,26 +388,37 @@
 ## 第 6 步 · 开发工作流 Skill（个人 Agent 落地）
 
 **做什么**
-- 把日常开发流程封装为 Skill（复用第 1/2/3 步真实工具 + 既有 `load_skill` 渐进加载）：
+- [x] 把日常开发流程封装为 Skill（复用第 1/2/3 步真实工具 + 既有 `load_skill` 渐进加载）：
   修复 bug / 改功能 / 跑测试修失败 / **前端视觉验证**（起服务 → 截屏 → 给视觉模型核对），
   流程 = 复现 → 定位 → 修改 → 验证
-- **双循环结构**（反思回写 2026-10-13）：外层循环 = 规划（拆需求/定 what·why·how、
+  （已落地 4 个 Skill：`skills/fix-bug` / `skills/implement-feature` /
+  `skills/run-tests-fix` / `skills/visual-verify`，均含触发条件、流程骨架、
+  验证清单、失败回滚路径）
+- [x] **双循环结构**（反思回写 2026-10-13）：外层循环 = 规划（拆需求/定 what·why·how、
   切 ticket，低频、事关方向）；内层循环 = 实现（一个 ticket 一轮：加载上下文 →
   规划实现 → 写码 → 验证 → 复核，高频、占满日常）——内层产物即第 7 步的
   TaskEnvelope 切片，两层频率与职责分离
-- **validation-first**（反思回写 2026-10-13）：实现计划先产出「验证清单」
+  （已落进 implement-feature 流程：一次一个 ticket 小闭环，产物即任务切片）
+- [x] **validation-first**（反思回写 2026-10-13）：实现计划先产出「验证清单」
   （单测/边界/lint/手动/视觉核对），agent 照着写、照着跑、照着改——对终点具体、
   对手段放权；验证清单复用既有评测门 + 视觉验证机制
-- Skill 只写"何时加载、加载什么"，正文按需注入 system（机制已在）
-- 工作流按状态机思路设计（反思回写 2026-10-13）：节点级可重试（沿用软停止语义）、
+  （4 个 Skill 正文均内嵌验证清单 + 失败时怎么停）
+- [x] Skill 只写"何时加载、加载什么"，正文按需注入 system（机制已在）
+- [x] 工作流按状态机思路设计（反思回写 2026-10-13）：节点级可重试（沿用软停止语义）、
   分支失败有回滚路径，不做成线性 Chain——防单点失败拖垮整条链路
 
 **Go 练习点**
 - 复用既有 Skill 机制，把领域流程沉淀为可复用技能（学习重点是"机制边界划分"）
 
 **验证**
-- 端到端 demo：真实仓库一个小 bug，Agent 按 Skill 流程完成修复并跑测试确认；
+- [x] 端到端 demo：真实仓库一个小 bug，Agent 按 Skill 流程完成修复并跑测试确认；
   前端场景走"视觉验证 Skill"端到端（起服务 → 截屏 → 核对）
+  （`go run . -demo workflow`：临时 Go 项目 Double 乘 3 的 bug，load_skill fix-bug
+  注入流程 → go test 红（Double(2)=6 期望 4）→ 定位 → edit_file 最小修改 →
+  go test 绿，go test 白名单自动放行、edit_file 走审批闸门；
+  `go run . -demo visual-verify`：临时页面标题溢出 → serve_dir 起服务 →
+  screenshot 移动端截屏 → 视觉核对（mock）→ 修复 → 再截屏（PNG 23KB→13KB 证明
+  生效）→ 停服务；配套 `TestRepoSkillsDiscoverable` 验证 4 个 Skill 可被宿主发现加载）
 
 ---
 

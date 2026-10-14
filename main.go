@@ -29,7 +29,7 @@ import (
 )
 
 func main() {
-	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace")
+	demo := flag.String("demo", "normal", "演示场景: normal | loop | soft | compact | approval | real | real-approval | eval | skill | skill-b | parallel | llm-compact | doubao | doubao-approval | fs | cmd | figma | web | plan | stack | mcp | mcp-client | mcp-http | validate | skill-history | skill-path | session | cancel | tree | memory-recall | trace | workflow | visual-verify")
 	verbose := flag.Bool("v", true, "打印每步 trace")
 	flag.Parse()
 
@@ -94,6 +94,10 @@ func main() {
 		runDemoMemoryRecall(*verbose)
 	case "trace":
 		runDemoTrace(*verbose)
+	case "workflow":
+		runDemoWorkflow(*verbose)
+	case "visual-verify":
+		runDemoVisualVerify(*verbose)
 	default:
 		runDemoNormal(*verbose)
 	}
@@ -904,11 +908,12 @@ func lastAssistantAnswer(msgs []agent.Message) string {
 // 外部取消信号（context）→ cancel_requested → 任务在安全检查点停止 →
 // 按执行日志逆序补偿可补偿步骤 → 状态如实分级。
 // 三个场景覆盖副作用三分类 + 两种尴尬时刻：
-//   场景1 可补偿：请求发出后响应返回前取消（read_order 内触发）→
-//     reserve_stock 已执行并记账 → 取消收尾逆序释放 → canceled
-//   场景2 不可逆：外部成功后本地落账前取消（create_refund 内触发）→
-//     退款单已创建 → 状态如实 partially_completed（不假装回滚）
-//   场景3 补偿失败：补偿动作本身失败 → needs_review（人工接管入口）
+//
+//	场景1 可补偿：请求发出后响应返回前取消（read_order 内触发）→
+//	  reserve_stock 已执行并记账 → 取消收尾逆序释放 → canceled
+//	场景2 不可逆：外部成功后本地落账前取消（create_refund 内触发）→
+//	  退款单已创建 → 状态如实 partially_completed（不假装回滚）
+//	场景3 补偿失败：补偿动作本身失败 → needs_review（人工接管入口）
 func runDemoCancel(verbose bool) {
 	// 场景1：可补偿逆序收尾
 	{
@@ -1165,6 +1170,7 @@ func parseTreePath(input string) (string, error) {
 //   - 会话2（s2）：**新 Agent 实例、不带完整历史** → Run 开始按任务召回
 //     相关记忆条目注入 system（【记忆召回】）→ 模型直接作答；
 //     命中条目回写 UsageCount（反馈闭环，改进二）。
+//
 // 与阶段一（-demo session）对照：整历史恢复 vs 关键记忆召回——
 // 召回成本与历史长度无关（只召回 limit 条），token 更省。
 func runDemoMemoryRecall(verbose bool) {
@@ -1920,9 +1926,11 @@ func riskLabel(l agent.RiskLevel) string {
 //   - Token 与延迟多少？（agent.TraceLLM 请求级元数据：Model / Token / 延迟预留字段）
 //
 // 脚本（MockLLM 确定性驱动，真实 fs 工具）：
-//   加载存在的技能（loaded）→ 加载不存在的技能（rejected）→ 读文件（tool ok）
-//   → 编辑文件被审批拒绝（approval denied）→ 写入 traces/ 放行（approval approved
-//   + tool ok）→ 读不存在文件（tool failed）→ 最终回答。
+//
+//	加载存在的技能（loaded）→ 加载不存在的技能（rejected）→ 读文件（tool ok）
+//	→ 编辑文件被审批拒绝（approval denied）→ 写入 traces/ 放行（approval approved
+//	+ tool ok）→ 读不存在文件（tool failed）→ 最终回答。
+//
 // 审批：edit_file/write_file 走闸门，演示拒绝与放行两条路径；读类自动放行。
 func runDemoTrace(verbose bool) {
 	root, err := filepath.Abs(".")
@@ -1956,12 +1964,12 @@ func runDemoTrace(verbose bool) {
 	})
 
 	llm := agent.NewMockLLM([]agent.MockDecision{
-		{ToolName: agent.LoadSkillToolName, ToolInput: `{"name":"file-ops-policy"}`}, // 存在 → loaded
-		{ToolName: agent.LoadSkillToolName, ToolInput: `{"name":"no-such-skill"}`},   // 不存在 → rejected
-		{ToolName: "read_file", ToolInput: `{"path":"AGENTS.md"}`},                   // 读类放行 → tool ok
-		{ToolName: "edit_file", ToolInput: `{"path":"AGENTS.md","old":"x","new":"y"}`}, // 被审批拒绝 → approval denied
+		{ToolName: agent.LoadSkillToolName, ToolInput: `{"name":"file-ops-policy"}`},                   // 存在 → loaded
+		{ToolName: agent.LoadSkillToolName, ToolInput: `{"name":"no-such-skill"}`},                     // 不存在 → rejected
+		{ToolName: "read_file", ToolInput: `{"path":"AGENTS.md"}`},                                     // 读类放行 → tool ok
+		{ToolName: "edit_file", ToolInput: `{"path":"AGENTS.md","old":"x","new":"y"}`},                 // 被审批拒绝 → approval denied
 		{ToolName: "write_file", ToolInput: `{"path":"traces/demo-write.txt","content":"trace demo"}`}, // 放行 → approved + ok
-		{ToolName: "read_file", ToolInput: `{"path":"NO_SUCH_FILE.md"}`},             // 失败 → tool failed
+		{ToolName: "read_file", ToolInput: `{"path":"NO_SUCH_FILE.md"}`},                               // 失败 → tool failed
 		{Content: "轨迹演示结束：可回答「为何选/不选某 skill（loaded/rejected）、审批在哪一步拒绝与放行（denied/approved）、Token 与延迟（llm 事件请求级元数据）」。"},
 	})
 
@@ -2022,4 +2030,128 @@ func runDemoTrace(verbose bool) {
 	}
 	fmt.Println("\n请求级元数据（llm 事件）：", res.Trace[0].Model, "— 真实 API 接入后 Token/延迟在此字段填充")
 	showResult(res)
+}
+
+// runDemoWorkflow 演示第 6 步 · 开发工作流 Skill 端到端（fix-bug 分支）：
+// 在临时迷你 Go 项目里造一个真实 bug + 失败测试，Agent 按 fix-bug Skill 流程
+// 完成「加载流程规范 → 复现（go test 红）→ 定位 → 最小修改 → 验证（go test 绿）」。
+// 展示点：
+//   - Skill 只写"何时加载、加载什么"：load_skill fix-bug 注入流程规范，正文按需进 system
+//   - 流程闭环：复现命令输出从红到绿（前后对比），不凭感觉"改好了"
+//   - 复用第 1/2 步真实工具：fsagent（read/edit）+ cmdagent（run_cmd go test 白名单自动放行）
+//   - 写类动作照常走审批闸门（edit_file RiskMedium → 放行）
+func runDemoWorkflow(verbose bool) {
+	// 临时迷你 Go 项目：Double 乘 3（应为乘 2）+ 断言失败的测试
+	root, err := os.MkdirTemp("", "mine-harness-fix-*")
+	if err != nil {
+		fmt.Println("创建临时项目失败:", err)
+		return
+	}
+	defer os.RemoveAll(root)
+	os.WriteFile(filepath.Join(root, "go.mod"), []byte("module fixdemo\n\ngo 1.27.1\n"), 0o644)
+	os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n\n// Double 把输入翻倍。\nfunc Double(n int) int {\n\treturn n * 3 // bug：乘 3 应为乘 2\n}\n\nfunc main() {}\n"), 0o644)
+	os.WriteFile(filepath.Join(root, "main_test.go"), []byte("package main\n\nimport \"testing\"\n\nfunc TestDouble(t *testing.T) {\n\tif got := Double(2); got != 4 {\n\t\tt.Fatalf(\"Double(2) = %d, want 4\", got)\n\t}\n}\n"), 0o644)
+
+	reg := agent.NewRegistry()
+	for _, t := range fsagent.NewTools(root).All() {
+		reg.Register(t)
+	}
+	for _, t := range cmdagent.NewTools(root).All() {
+		reg.Register(t)
+	}
+	// Skill 入口：常驻清单（fix-bug / implement-feature / run-tests-fix / visual-verify）
+	provider := newDirSkillProvider("skills")
+	loadSkillTool := agent.NewLoadSkillTool()
+	loadSkillTool.Description = agent.BuildLoadSkillDescription(provider.List())
+	reg.Register(loadSkillTool)
+	reg.Register(agent.NewReadSkillRefTool())
+
+	// 写类审批放行（演示闸门照常触发）
+	approver := agent.ApproverFunc(func(toolName, args string) bool {
+		fmt.Printf("[审批] %s(%s) → 放行（演示 Auto 放行）\n", toolName, args)
+		return true
+	})
+
+	// 脚本（fix-bug 流程，MockLLM 确定性驱动）：
+	// load_skill fix-bug → go test 红（复现）→ read main.go（定位）→
+	// edit_file 最小修改 → go test 绿（验证）→ 汇报
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: agent.LoadSkillToolName, ToolInput: `{"name":"fix-bug"}`},
+		{ToolName: "run_cmd", ToolInput: `{"cmd":"go test ./..."}`},
+		{ToolName: "read_file", ToolInput: `{"path":"main.go"}`},
+		{ToolName: "edit_file", ToolInput: `{"path":"main.go","old":"return n * 3 // bug：乘 3 应为乘 2","new":"return n * 2"}`},
+		{ToolName: "run_cmd", ToolInput: `{"cmd":"go test ./..."}`},
+		{Content: "按 fix-bug 流程完成：复现（go test 红：Double(2)=6 期望 4）→ 定位（main.go Double 乘 3）→ 最小修改（乘 2）→ 验证（go test 绿）。"},
+	})
+
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(8),
+		agent.WithSkillProvider(provider),
+		agent.WithModel("mock/workflow-demo"),
+		// 参数感知风险：go test 白名单 → 自动放行（不打扰）；edit_file 保持
+		// RiskMedium → 走审批闸门（演示"写类动作照常审批"）
+		agent.WithRiskEvaluator(agent.FuncRiskEvaluator(func(toolName, args string, base agent.RiskLevel) agent.RiskLevel {
+			if toolName == "run_cmd" {
+				return cmdagent.RiskOfArgs(args)
+			}
+			return base
+		})),
+		agent.WithApprover(approver),
+		agent.WithVerbose(verbose),
+	)
+	showResult(a.Run("临时项目里 Double 函数算错了，请按 fix-bug 流程修复"))
+}
+
+// runDemoVisualVerify 演示第 6 步 · 前端视觉验证 Skill 端到端：
+// 临时页面（标题 nowrap 溢出移动端宽度）→ serve_dir 起服务 → screenshot 移动端截屏 →
+// 视觉核对（mock 视觉模型结论：标题溢出）→ edit_file 修复 → 再截屏核对 → 停服务。
+// 展示点：
+//   - 截图证据驱动：每个验收项（此处=窄屏无溢出）都有截图，修复后新旧对比
+//   - 复用第 3 步真实工具：serve_dir（net/http）+ screenshot（无头 Chrome）
+//   - 闭环到问题清单清空，服务用完即停（不留常驻进程）
+func runDemoVisualVerify(verbose bool) {
+	root, err := os.MkdirTemp("", "mine-harness-vv-*")
+	if err != nil {
+		fmt.Println("创建临时页面失败:", err)
+		return
+	}
+	defer os.RemoveAll(root)
+	page := "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>视觉验证演示</title>" +
+		"<style>body{margin:0;font-family:sans-serif}.title{font-size:48px;white-space:nowrap;padding:16px;background:#eee}</style>" +
+		"</head><body><div class=\"title\">这个标题非常长而且不允许换行会溢出屏幕宽度</div></body></html>"
+	os.WriteFile(filepath.Join(root, "index.html"), []byte(page), 0o644)
+
+	reg := agent.NewRegistry()
+	for _, t := range webagent.NewTools(root).All() {
+		reg.Register(t)
+	}
+	for _, t := range fsagent.NewTools(root).All() {
+		reg.Register(t)
+	}
+
+	// 写类审批放行
+	approver := agent.ApproverFunc(func(toolName, args string) bool {
+		fmt.Printf("[审批] %s(%s) → 放行（演示 Auto 放行）\n", toolName, args)
+		return true
+	})
+
+	// 固定端口 8322（演示脚本需预知 URL；真实 Agent 用 serve_dir 返回端口拼 URL）
+	const port = 8322
+	llm := agent.NewMockLLM([]agent.MockDecision{
+		{ToolName: "serve_dir", ToolInput: fmt.Sprintf(`{"dir":".","port":%d}`, port)},
+		{ToolName: "screenshot", ToolInput: fmt.Sprintf(`{"url":"http://127.0.0.1:%d/","out":"shots/page.png","width":375}`, port)},
+		// 视觉核对（mock 视觉模型结论）：375 宽度下标题溢出
+		{ToolName: "edit_file", ToolInput: `{"path":"index.html","old":".title{font-size:48px;white-space:nowrap;padding:16px;background:#eee}","new":".title{font-size:24px;padding:16px;background:#eee}"}`},
+		{ToolName: "screenshot", ToolInput: fmt.Sprintf(`{"url":"http://127.0.0.1:%d/","out":"shots/page2.png","width":375}`, port)},
+		{ToolName: "serve_dir", ToolInput: `{"action":"stop","port":8322}`},
+		{Content: "视觉验证完成：起服务 → 移动端截屏发现标题溢出 → 缩小字号修复（nowrap 保留）→ 再截屏确认无溢出 → 停止服务。每个验收项都有截图证据。"},
+	})
+
+	a := agent.NewAgent(llm, reg,
+		agent.WithMaxSteps(8),
+		agent.WithModel("mock/visual-verify-demo"),
+		agent.WithApprover(approver),
+		agent.WithVerbose(verbose),
+	)
+	showResult(a.Run("按 visual-verify 流程验证临时页面的移动端渲染：起服务、截屏、核对、修复、再验证"))
 }

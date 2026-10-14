@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"mine-harness/internal/agent"
 )
 
 // writeSkillFile 在 root/<dir>/SKILL.md 写入内容并返回 root。
@@ -56,8 +58,7 @@ tags: [files, safety]
 }
 
 // TestSplitTags 验证三种 tags 写法统一解析。
-func TestSplitTags(t *testing.T) {
-	cases := []struct {
+func TestSplitTags(t *testing.T) {	cases := []struct {
 		in   string
 		want []string
 	}{
@@ -120,5 +121,41 @@ description: 安全规范
 	}
 	if _, ok := p.LoadReference("file-ops-policy", "references/nope.md"); ok {
 		t.Error("未知引用应返回 ok=false")
+	}
+}
+
+// TestRepoSkillsDiscoverable 第 6 步配套：仓库真实 skills/ 目录必须能发现
+// 4 个开发工作流 Skill（fix-bug / implement-feature / run-tests-fix /
+// visual-verify），且 LoadSkill 各能命中正文（流程骨架完整）。
+// 这是"新能力必须配 demo + 单测"的落地——Skill 文件本身可被宿主加载。
+func TestRepoSkillsDiscoverable(t *testing.T) {
+	p := newDirSkillProvider("skills")
+	metas := p.List()
+	got := map[string]agent.SkillMeta{}
+	for _, m := range metas {
+		got[m.Name] = m
+	}
+
+	want := []string{"fix-bug", "implement-feature", "run-tests-fix", "visual-verify"}
+	for _, name := range want {
+		m, ok := got[name]
+		if !ok {
+			t.Errorf("skills/ 应发现 %s（实际清单: %v）", name, got)
+			continue
+		}
+		if m.Description == "" {
+			t.Errorf("%s 的 description 不能为空", name)
+		}
+		body, ok := p.LoadSkill(name)
+		if !ok || body == "" {
+			t.Errorf("LoadSkill(%s) 应命中正文", name)
+			continue
+		}
+		// 每个工作流 Skill 必须包含：验证清单 + 失败回滚/停止路径
+		for _, kw := range []string{"验证清单", "失败时怎么停"} {
+			if !strings.Contains(body, kw) {
+				t.Errorf("%s 正文缺少「%s」小节（工作流 Skill 硬要求）", name, kw)
+			}
+		}
 	}
 }
